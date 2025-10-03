@@ -1,0 +1,65 @@
+{
+  "auto_install": {
+    "enabled": true,
+    "ask_permission": true,
+    "timeout_seconds": 120,
+    "preferred_methods": ["winget", "chocolatey", "manual"],
+    "python_libraries": {
+      "auto_install": true,
+      "background_install": true,
+      "required": [
+        "psutil",
+        "PyMuPDF", 
+        "openpyxl",
+        "python-docx",
+        "chardet"
+      ],
+      "optional": [
+        "Pillow",
+        "pytesseract", 
+        "opencv-python",
+        "numpy"
+      ]
+    },
+    "tesseract_ocr": {
+      "auto_install": true,
+      "ask_permission": true,
+      "install_japanese": true,
+      "install_methods": {
+        "winget": {
+          "package_id": "UB-Mannheim.TesseractOCR",
+          "silent": true
+        },
+        "chocolatey": {
+          "package_name": "tesseract",
+          "auto_confirm": true
+        }
+      }
+    }
+  },
+  "ocr_settings": {
+    "default_language": "jpn+eng",
+    "fallback_languages": ["eng", "auto"],
+    "cpu_optimization": {
+      "max_threads": 4,
+      "processing_delay": 0.1,
+      "batch_size": 5,
+      "max_image_size_mb": 50,
+      "max_pixels": 2000000,
+      "enable_preprocessing": true
+    },
+    "image_preprocessing": {
+      "enabled": true,
+      "use_opencv": true,
+      "resize_large_images": true,
+      "grayscale": true,
+      "noise_reduction": true,
+      "contrast_enhancement": false
+    }
+  },
+  "startup_behavior": {
+    "show_install_progress": true,
+    "continue_without_ocr": true,
+    "remember_user_choice": true
+  }
+}

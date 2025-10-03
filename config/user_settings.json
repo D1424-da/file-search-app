@@ -1,0 +1,36 @@
+{
+  "search": {
+    "max_results": 1000,
+    "search_timeout": 30,
+    "case_sensitive": false,
+    "whole_word": false
+  },
+  "indexing": {
+    "auto_index": true,
+    "index_interval": 3600,
+    "max_file_size": 10485760,
+    "index_folder": "index_data",
+    "supported_extensions": [
+      ".txt",
+      ".docx",
+      ".xlsx",
+      ".pdf",
+      ".xml",
+      ".tif",
+      ".tiff"
+    ]
+  },
+  "ui": {
+    "theme": "light",
+    "language": "ja",
+    "window_width": 1920,
+    "window_height": 1027,
+    "window_x": 1920,
+    "window_y": 25
+  },
+  "logging": {
+    "level": "INFO",
+    "max_file_size": 10485760,
+    "backup_count": 5
+  }
+}

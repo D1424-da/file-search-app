@@ -1,0 +1,18 @@
+﻿# データベースファイル
+*.db
+*.db-journal
+
+# ログファイル
+*.log
+
+# キャッシュ
+cache/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.vscode/
+.idea/

@@ -16,6 +16,7 @@ import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import sqlite3
+
 import hashlib
 import json
 import logging
@@ -5036,7 +5037,7 @@ class UltraFastCompliantUI:
         self.complete_label.pack()
 
         # 結果表示フレーム
-        results_frame = ttk.LabelFrame(main_frame, text="📋 検索結果", padding=10)
+        results_frame = ttk.LabelFrame(main_frame, text="📋 検索結果（※ファイルが開かないときは右クリックをお試しください）", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
 
         # 結果ツリービュー

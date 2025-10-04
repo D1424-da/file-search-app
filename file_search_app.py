@@ -788,7 +788,7 @@ def setup_debug_logger():
     logger.setLevel(logging.DEBUG)
 
     # ファイルハンドラー（上書きモード）
-    file_handler = logging.FileHandler('ultra_fast_app_debug.log', mode='w', encoding='utf-8')
+    file_handler = logging.FileHandler('file_search_app.log', mode='w', encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
 
     # フォーマッター（シンプル版）
@@ -6919,7 +6919,7 @@ class UltraFastCompliantUI:
     def _update_debug_log_display(self, text_widget):
         """デバッグログ表示更新"""
         try:
-            log_file = "ultra_fast_app_debug.log"
+            log_file = "file_search_app.log"
             if os.path.exists(log_file):
                 with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
                     log_content = f.read()
@@ -6937,7 +6937,7 @@ class UltraFastCompliantUI:
     def _clear_debug_log(self, text_widget):
         """デバッグログクリア"""
         try:
-            log_file = "ultra_fast_app_debug.log"
+            log_file = "file_search_app.log"
             if os.path.exists(log_file):
                 with open(log_file, 'w', encoding='utf-8') as f:
                     f.write("")
@@ -6959,7 +6959,7 @@ class UltraFastCompliantUI:
                                                      initialfile=f"debug_log_{timestamp}.log")
 
             if save_path:
-                log_file = "ultra_fast_app_debug.log"
+                log_file = "file_search_app.log"
                 if os.path.exists(log_file):
                     import shutil
                     shutil.copy2(log_file, save_path)

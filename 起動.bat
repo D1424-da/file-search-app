@@ -71,11 +71,11 @@ if %ERRORLEVEL% neq 0 (
     echo    1. Python 3.7以上がインストールされているか確認
     echo    2. 必要なライブラリが不足している場合は自動インストールされます
     echo    3. インターネット接続を確認（初回起動時）
-    echo    4. ログファイルを確認: ultra_fast_app_debug.log
+    echo    4. ログファイルを確認: file_search_app.log
     echo.
     echo 📋 デバッグ情報:
     echo    - 設定ファイル: config/user_settings.json
-    echo    - ログファイル: ultra_fast_app_debug.log
+    echo    - ログファイル: file_search_app.log
     echo.
     pause
 ) else (

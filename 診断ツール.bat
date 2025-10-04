@@ -72,17 +72,17 @@ echo.
 
 REM 5. ログファイル確認
 echo [5/7] ログファイル確認中...
-if exist "ultra_fast_app_debug.log" (
+if exist "file_search_app.log" (
     echo ✅ ログファイル: 存在
-    for /f %%a in ('dir /b ultra_fast_app_debug.log') do (
-        for /f "tokens=1,2" %%b in ('dir /-c ultra_fast_app_debug.log ^| find "%%a"') do (
+    for /f %%a in ('dir /b file_search_app.log') do (
+        for /f "tokens=1,2" %%b in ('dir /-c file_search_app.log ^| find "%%a"') do (
             echo    最終更新: %%b %%c
         )
     )
     echo.
     echo 📄 最新ログエントリ（最後の5行）:
     echo ------------------------------------
-    for /f "skip=1 delims=" %%i in ('powershell -command "Get-Content 'ultra_fast_app_debug.log' | Select-Object -Last 5"') do echo    %%i
+    for /f "skip=1 delims=" %%i in ('powershell -command "Get-Content 'file_search_app.log' | Select-Object -Last 5"') do echo    %%i
     echo ------------------------------------
 ) else (
     echo ⚠️ ログファイル: 未存在（初回起動前）

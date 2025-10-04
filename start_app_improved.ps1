@@ -80,7 +80,7 @@ try {
         Write-Host "   1. Python 3.7以上がインストールされているか確認" -ForegroundColor White
         Write-Host "   2. 必要なライブラリが不足している場合は自動インストールされます" -ForegroundColor White
         Write-Host "   3. インターネット接続を確認（初回起動時）" -ForegroundColor White
-        Write-Host "   4. ログファイルを確認: ultra_fast_app_debug.log" -ForegroundColor White
+        Write-Host "   4. ログファイルを確認: file_search_app.log" -ForegroundColor White
     }
 } catch {
     Write-Host "❌ アプリケーションの起動に失敗しました: $($_.Exception.Message)" -ForegroundColor Red
@@ -94,7 +94,7 @@ try {
 
 Write-Host ""
 Write-Host "📋 デバッグ情報:" -ForegroundColor Cyan
-Write-Host "   - ログファイル: ultra_fast_app_debug.log" -ForegroundColor White
+Write-Host "   - ログファイル: file_search_app.log" -ForegroundColor White
 Write-Host "   - 設定ファイル: config/user_settings.json" -ForegroundColor White
 Write-Host ""
 

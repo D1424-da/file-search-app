@@ -108,7 +108,7 @@ pip install PyMuPDF openpyxl python-docx chardet psutil xlrd docx2txt pytesserac
 
 ```
 📁 プロジェクトフォルダ/
-├── 📄 ultra_fast_100_percent_compliant_app.py     # 🎯 メインアプリケーション
+├── 📄 file_search_app.py     # 🎯 メインアプリケーション
 ├── 📄 README.md                                    # プロジェクト説明
 ├── 📄 PORTABLE_GUIDE.md                           # ポータブル版ガイド
 ├── 📄 requirements.txt                            # 依存関係情報
@@ -145,17 +145,17 @@ start_app_improved.ps1
 start_app.ps1
 
 # 直接実行
-python ultra_fast_100_percent_compliant_app.py
+python file_search_app.py
 ```
 
 ### macOS / Linux
 ```bash
 # 直接実行
-python3 ultra_fast_100_percent_compliant_app.py
+python3 file_search_app.py
 
 # 仮想環境使用時
 source .venv/bin/activate
-python ultra_fast_100_percent_compliant_app.py
+python file_search_app.py
 ```
 
 ### 🔧 初回起動時の自動セットアップ

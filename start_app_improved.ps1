@@ -64,7 +64,7 @@ Write-Host "================================" -ForegroundColor Cyan
 Write-Host ""
 
 try {
-    python "fulltext_search_app\ultra_fast_100_percent_compliant_app.py"
+    python "file_search_app.py"
     
     Write-Host ""
     Write-Host "================================" -ForegroundColor Cyan

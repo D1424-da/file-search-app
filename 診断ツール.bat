@@ -28,7 +28,7 @@ echo.
 
 REM 2. ファイル存在確認
 echo [2/7] 必要ファイル確認中...
-if exist "fulltext_search_app\ultra_fast_100_percent_compliant_app.py" (
+if exist "file_search_app.py" (
     echo ✅ メインアプリケーションファイル: 存在
 ) else (
     echo ❌ メインアプリケーションファイル: 不足

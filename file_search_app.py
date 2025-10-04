@@ -6535,7 +6535,7 @@ class UltraFastCompliantUI:
 
         # システム情報
         stats_text += "🔧 システム情報:\n"
-        stats_text += f"  アプリケーション: ultra_fast_100_percent_compliant_app\n"
+        stats_text += f"  アプリケーション: file_search_app\n"
         stats_text += f"  仕様適合率: 100%\n"
         stats_text += f"  データベース: SQLite FTS5 (trigram tokenizer)\n"
         stats_text += f"  アーキテクチャ: 3層レイヤー構造\n"

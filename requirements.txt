@@ -20,7 +20,7 @@ Pillow>=8.0.0            # 画像処理用 (.tif/.tiff/.png/.jpg等)
 # zipfile - 標準ライブラリ（追加インストール不要）
 
 # 🚀 使用方法:
-# 1. python ultra_fast_100_percent_compliant_app.py を実行
+# 1. python file_search_app.py を実行
 # 2. 初回起動時に必要ライブラリが自動インストールされます
 # 3. OCR機能にはTesseractエンジンの別途インストールが必要（自動インストール対応）
 

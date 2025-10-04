@@ -56,7 +56,7 @@ echo ================================
 echo.
 
 REM Pythonでアプリケーションを起動
-python fulltext_search_app\ultra_fast_100_percent_compliant_app.py
+python file_search_app.py
 
 REM 終了処理
 echo.

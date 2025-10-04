@@ -20,7 +20,7 @@ echo ✅ ライブラリチェック完了
 echo.
 
 REM Pythonでアプリケーションを起動
-python fulltext_search_app\ultra_fast_100_percent_compliant_app.py
+python file_search_app.py
 
 REM エラーが発生した場合の対処
 if %ERRORLEVEL% neq 0 (

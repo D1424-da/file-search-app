@@ -31,7 +31,7 @@ try {
 Write-Host "🎯 アプリケーションを起動します..." -ForegroundColor Cyan
 
 try {
-    python "fulltext_search_app\ultra_fast_100_percent_compliant_app.py"
+    python "file_search_app.py"
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✅ アプリケーションが正常に終了しました" -ForegroundColor Green

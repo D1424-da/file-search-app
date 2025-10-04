@@ -2,13 +2,94 @@
 
 **100%仕様適合度達成** - キャンセル機能付き • 超高速並列処理 • マルチファイル対応 • OCR搭載
 
-Word・Excel・PDF・テキスト・画像(OCR## 🏆 完成度
+Word・Excel・PDF・テキスト・画像(OCR)・ZIPファイルの全文検索機能を持つ高性能デスクトップアプリケーション
 
-- **✅ 100%仕様適合**: すべての要求仕様を実装
-- **✅ 超高速処理**: 2000ファイル/秒の並列処理対応
-- **✅ 安定性**: 徹底したエラーハンドリングとキャンセル機能
-- **✅ 使いやすさ**: 直感的なGUI・自動セットアップ
-- **✅ 拡張性**: プラガブル設計・設定ファイル対応
+## ✨ 主要機能
+
+- **⚡ 超│   `│   └── 📄 auto_install_settings.json            # 自動インストール設定
+├── 📁 cache/                                     # キャッシュディレクトリ（実行時作成）
+│   ├── 💾 hot_cache.json                        # 高速層キャッシュ
+│   └── 🌐 network_indexes/                      # ネットワークインデックス
+└── 📁 data_storage/                              # データベースディレクトリ（実行時作成）
+    └── 📄 complete_search_db_*.db                # 分割データベース
+```ta_storage/                              # データベースディレクトリ（実行時作成）
+    └── 📄 complete_search_db_*.db                # 分割データベース📁 data_storage/                              # データベースディレクトリ
+    └── 📄 complete_search_db_*.db                # 分割データベース📁 data_storage/                              # データベースディレクトリ
+    └── 📄 complete_search_db_*.db                # 分割データベースata_storage/                              # データベースディレクトリ
+    └── 📄 complete_search_db_*.db                # 分割データベース💾 hot_cache.json                        # 高速層キャッシュ
+│   └── 🌐 network_indexes/                      # ネットワークインデックス
+└── 📁 data_storage/                              # データベースディレクトリ
+    └── 📄 complete_search_db_*.db                # 分割データベース理**: 2000ファイル/秒対応・マルチスレッド最適化
+- **🛑 キャンセル機能**: インデックス処理中の安全な中断機能付き
+- **📁 全文検索対応**: ファイル名・ファイル内容の完全検索（5500件まで表示）
+- **🌏 多言語対応**: 日本語（ひらがな・カタカナ・漢字）・半角全角自動対応
+- **📊 大規模対応**: 数十万ファイルを瞬時に検索・分割データベース構造
+- **🎯 多形式対応**: Word(.docx/.doc)・Excel(.xlsx/.xls)・PDF・テキスト・画像(OCR)・ZIP
+- **🖼️ OCR機能**: .tif/.tiff画像内テキストの検索対応（Tesseract自動インストール）
+- **🔧 自動最適化**: 必要ライブラリの自動インストール・システム最適化
+
+## 🛠️ 技術スタック
+
+### 📋 標準ライブラリ (組み込み)
+- **Python**: 3.7以上
+- **GUI**: tkinter (標準)
+- **データベース**: SQLite3 FTS5 (標準)
+- **並列処理**: concurrent.futures・threading (標準)
+- **ファイル処理**: zipfile・pathlib (標準)
+
+### 📦 外部ライブラリ (自動インストール)
+- **PDF処理**: PyMuPDF (fitz)
+- **Word処理**: python-docx (.docx), docx2txt (.doc)
+- **Excel処理**: openpyxl (.xlsx/.xlsm), xlrd (.xls)
+- **文字検出**: chardet (自動エンコード検出)
+- **システム監視**: psutil (最適化用)
+- **OCR機能**: pytesseract + Pillow (画像処理)
+- **OCRエンジン**: Tesseract (自動インストール対応)
+
+## 🗂️ プロジェクト構成
+
+```
+📁 プロジェクトフォルダ/
+├── 📄 file_search_app.py                         # 🎯 メインアプリケーション
+├── 📄 README.md                                  # プロジェクト説明
+├── 📄 requirements.txt                           # 依存関係情報
+├── 📄 start_app_improved.ps1                     # PowerShell起動スクリプト
+├── 📄 起動_改良版.bat                            # Windows起動スクリプト
+├── 📄 診断ツール.bat                             # システム診断ツール
+├── 📁 config/                                    # 設定ディレクトリ
+│   ├── 📄 default_settings.json                 # デフォルト設定
+│   ├── 📄 user_settings.json                    # ユーザー設定
+│   └── 📄 auto_install_settings.json            # 自動インストール設定
+├── 📁 cache/                                     # キャッシュディレクトリ（実行時作成）
+│   ├── 💾 hot_cache.json                        # 高速層キャッシュ
+│   └── 🌐 network_indexes/                      # ネットワークインデックス
+└── 📁 data_storage/                              # データベースディレクトリ（実行時作成）
+    └── 📄 complete_search_db_*.db                # 分割データベース
+```
+
+## 🚀 起動方法
+
+### Windows
+```batch
+# 🎯 推奨起動方法
+起動_改良版.bat
+
+# または PowerShell
+start_app_improved.ps1
+
+# 直接実行
+python file_search_app.py
+```
+
+### macOS / Linux
+```bash
+# 直接実行
+python3 file_search_app.py
+
+# 仮想環境使用時
+source .venv/bin/activate
+python file_search_app.py
+```
 
 ## 🎮 使用方法
 
@@ -108,9 +189,9 @@ pip install PyMuPDF openpyxl python-docx chardet psutil xlrd docx2txt pytesserac
 
 ```
 📁 プロジェクトフォルダ/
-├── 📄 file_search_app.py     # 🎯 メインアプリケーション
-├── 📄 README.md                                    # プロジェクト説明
-├── 📄 requirements.txt                            # 依存関係情報
+├── 📄 file_search_app.py                         # 🎯 メインアプリケーション
+├── 📄 README.md                                  # プロジェクト説明
+├── 📄 requirements.txt                           # 依存関係情報
 ├── 📄 start_app_improved.ps1                     # PowerShell起動スクリプト
 ├── 📄 起動_改良版.bat                            # Windows起動スクリプト
 ├── 📄 診断ツール.bat                             # システム診断ツール
@@ -121,7 +202,7 @@ pip install PyMuPDF openpyxl python-docx chardet psutil xlrd docx2txt pytesserac
 ├── 📁 cache/                                     # キャッシュディレクトリ
 │   ├── � hot_cache.json                        # 高速層キャッシュ
 │   └── � network_indexes/                      # ネットワークインデックス
-└── 📁 fulltext_search_app/                       # データベースディレクトリ
+└── 📁 data_storage/                             # データベースディレクトリ
     ├── 📄 complete_search_db_0.db ~ _20.db       # 21分割データベース
     └── � __pycache__/                           # Pythonキャッシュ
 ```

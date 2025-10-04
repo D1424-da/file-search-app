@@ -1,4 +1,4 @@
-# 🚀 Ultra Fast 100% Compliant Search App V3.2
+# 🚀 file_search_appV3.2
 
 **100%仕様適合度達成** - キャンセル機能付き • 超高速並列処理 • マルチファイル対応 • OCR搭載
 
@@ -141,7 +141,7 @@ pip install PyMuPDF openpyxl python-docx chardet psutil xlrd docx2txt pytesserac
 
 ---
 
-**🚀 Ultra Fast 100% Compliant Search App V3.2** - 高速・安定・多機能な全文検索ソリューションイルの全文検索機能を持つ高性能デスクトップアプリケーション
+**🚀 file_search_appV3.2** - 高速・安定・多機能な全文検索ソリューションイルの全文検索機能を持つ高性能デスクトップアプリケーション
 
 ## ✨ 主要機能
 

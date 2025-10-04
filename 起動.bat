@@ -1,8 +1,8 @@
 @echo off
 chcp 65001 >nul
-REM Ultra Fast 100% Compliant Search App - 改良版起動スクリプト
+REM file_search_app- 改良版起動スクリプト
 echo.
-echo 🚀 Ultra Fast 100%% Compliant Search App 起動中...
+echo 🚀 file_search_app 起動中...
 echo ================================
 
 REM カレントディレクトリをスクリプトの場所に設定

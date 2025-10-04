@@ -1,4 +1,4 @@
-# Ultra Fast 100% Compliant Search App - 改良版PowerShell起動スクリプト
+# file_search_app- 改良版PowerShell起動スクリプト
 
 # 文字エンコーディングを設定
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -6,7 +6,7 @@ $host.UI.RawUI.OutputEncoding = [System.Text.Encoding]::UTF8
 
 # 色付きメッセージの表示
 Write-Host ""
-Write-Host "🚀 Ultra Fast 100% Compliant Search App 起動中..." -ForegroundColor Green
+Write-Host "🚀 file_search_app起動中..." -ForegroundColor Green
 Write-Host "================================" -ForegroundColor Cyan
 Write-Host ""
 

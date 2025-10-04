@@ -3,7 +3,7 @@ chcp 65001 >nul
 REM 診断スクリプト - アプリケーション起動問題の診断
 
 echo.
-echo 🔍 Ultra Fast Search App 診断ツール
+echo 🔍 file_search_app 診断ツール
 echo ================================
 echo.
 

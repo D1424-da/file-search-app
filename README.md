@@ -110,14 +110,10 @@ pip install PyMuPDF openpyxl python-docx chardet psutil xlrd docx2txt pytesserac
 📁 プロジェクトフォルダ/
 ├── 📄 file_search_app.py     # 🎯 メインアプリケーション
 ├── 📄 README.md                                    # プロジェクト説明
-├── 📄 PORTABLE_GUIDE.md                           # ポータブル版ガイド
 ├── 📄 requirements.txt                            # 依存関係情報
-├── 📄 start_app.ps1                              # PowerShell起動スクリプト
-├── 📄 start_app_improved.ps1                     # 改良版PowerShell起動
-├── 📄 起動.bat                                   # Windows起動スクリプト
-├── 📄 起動_改良版.bat                            # 改良版Windows起動
+├── 📄 start_app_improved.ps1                     # PowerShell起動スクリプト
+├── 📄 起動_改良版.bat                            # Windows起動スクリプト
 ├── 📄 診断ツール.bat                             # システム診断ツール
-├── 📄 ultra_fast_app_debug.log                   # デバッグログ
 ├── 📁 config/                                    # 設定ディレクトリ
 │   ├── 📄 default_settings.json                 # デフォルト設定
 │   ├── 📄 user_settings.json                    # ユーザー設定
@@ -139,10 +135,6 @@ pip install PyMuPDF openpyxl python-docx chardet psutil xlrd docx2txt pytesserac
 
 # または PowerShell
 start_app_improved.ps1
-
-# 従来方法
-起動.bat
-start_app.ps1
 
 # 直接実行
 python file_search_app.py

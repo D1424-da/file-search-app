@@ -6,20 +6,7 @@ Word・Excel・PDF・テキスト・画像(OCR)・ZIPファイルの全文検索
 
 ## ✨ 主要機能
 
-- **⚡ 超│   `│   └── 📄 auto_install_settings.json            # 自動インストール設定
-├── 📁 cache/                                     # キャッシュディレクトリ（実行時作成）
-│   ├── 💾 hot_cache.json                        # 高速層キャッシュ
-│   └── 🌐 network_indexes/                      # ネットワークインデックス
-└── 📁 data_storage/                              # データベースディレクトリ（実行時作成）
-    └── 📄 complete_search_db_*.db                # 分割データベース
-```ta_storage/                              # データベースディレクトリ（実行時作成）
-    └── 📄 complete_search_db_*.db                # 分割データベース📁 data_storage/                              # データベースディレクトリ
-    └── 📄 complete_search_db_*.db                # 分割データベース📁 data_storage/                              # データベースディレクトリ
-    └── 📄 complete_search_db_*.db                # 分割データベースata_storage/                              # データベースディレクトリ
-    └── 📄 complete_search_db_*.db                # 分割データベース💾 hot_cache.json                        # 高速層キャッシュ
-│   └── 🌐 network_indexes/                      # ネットワークインデックス
-└── 📁 data_storage/                              # データベースディレクトリ
-    └── 📄 complete_search_db_*.db                # 分割データベース理**: 2000ファイル/秒対応・マルチスレッド最適化
+- **⚡ 超高速並列処理**: 2000ファイル/秒対応・マルチスレッド最適化
 - **🛑 キャンセル機能**: インデックス処理中の安全な中断機能付き
 - **📁 全文検索対応**: ファイル名・ファイル内容の完全検索（5500件まで表示）
 - **🌏 多言語対応**: 日本語（ひらがな・カタカナ・漢字）・半角全角自動対応
@@ -63,7 +50,7 @@ Word・Excel・PDF・テキスト・画像(OCR)・ZIPファイルの全文検索
 ├── 📁 cache/                                     # キャッシュディレクトリ（実行時作成）
 │   ├── 💾 hot_cache.json                        # 高速層キャッシュ
 │   └── 🌐 network_indexes/                      # ネットワークインデックス
-└── 📁 data_storage/                              # データベースディレクトリ（実行時作成）
+└── 📁 fulltext_search_app/                       # データベースディレクトリ（実行時作成）
     └── 📄 complete_search_db_*.db                # 分割データベース
 ```
 
@@ -202,7 +189,7 @@ pip install PyMuPDF openpyxl python-docx chardet psutil xlrd docx2txt pytesserac
 ├── 📁 cache/                                     # キャッシュディレクトリ
 │   ├── � hot_cache.json                        # 高速層キャッシュ
 │   └── � network_indexes/                      # ネットワークインデックス
-└── 📁 data_storage/                             # データベースディレクトリ
+└── 📁 fulltext_search_app/                       # データベースディレクトリ
     ├── 📄 complete_search_db_0.db ~ _20.db       # 21分割データベース
     └── � __pycache__/                           # Pythonキャッシュ
 ```

@@ -1053,7 +1053,7 @@ class UltraFastFullCompliantSearchSystem:
         # まず既存のDBファイル数をチェック
         existing_db_count = 0
         for i in range(48):  # 最大48まで確認
-            complete_db_path = self.project_root / "data_storage" / f"complete_search_db_{i}.db"
+            complete_db_path = self.project_root / "fulltext_search_app" / f"complete_search_db_{i}.db"
             if complete_db_path.exists() and complete_db_path.stat().st_size > 100000:  # 100KB以上=データあり
                 existing_db_count += 1
             elif not complete_db_path.exists():
@@ -1070,9 +1070,9 @@ class UltraFastFullCompliantSearchSystem:
         self.db_paths = []
         self.complete_db_paths = []
         for i in range(self.db_count):
-            # データベースファイルはdata_storageディレクトリ内に配置
-            db_path = self.project_root / "data_storage" / f"ultra_fast_search_db_{i}.db"
-            complete_db_path = self.project_root / "data_storage" / f"complete_search_db_{i}.db"
+            # データベースファイルはfulltext_search_appディレクトリ内に配置
+            db_path = self.project_root / "fulltext_search_app" / f"ultra_fast_search_db_{i}.db"
+            complete_db_path = self.project_root / "fulltext_search_app" / f"complete_search_db_{i}.db"
             self.db_paths.append(db_path)
             self.complete_db_paths.append(complete_db_path)
         
@@ -1426,13 +1426,13 @@ class UltraFastFullCompliantSearchSystem:
             total_size_mb = 0
             
             # complete_search_db_*.db ファイルのサイズ集計
-            complete_dbs = list(self.project_root.glob("data_storage/complete_search_db_*.db"))
+            complete_dbs = list(self.project_root.glob("fulltext_search_app/complete_search_db_*.db"))
             for db_file in complete_dbs:
                 if db_file.exists():
                     total_size_mb += db_file.stat().st_size / (1024 * 1024)
             
             # image_search_db_*.db ファイルのサイズ集計
-            image_dbs = list(self.project_root.glob("data_storage/image_search_db_*.db"))
+            image_dbs = list(self.project_root.glob("fulltext_search_app/image_search_db_*.db"))
             for db_file in image_dbs:
                 if db_file.exists():
                     total_size_mb += db_file.stat().st_size / (1024 * 1024)
@@ -1472,7 +1472,7 @@ class UltraFastFullCompliantSearchSystem:
         
         try:
             # データベースディレクトリの確実な作成
-            db_dir = self.project_root / "data_storage"
+            db_dir = self.project_root / "fulltext_search_app"
             db_dir.mkdir(parents=True, exist_ok=True)
             debug_logger.info(f"データベースディレクトリ確認/作成: {db_dir}")
             

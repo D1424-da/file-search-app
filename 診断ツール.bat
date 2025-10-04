@@ -107,7 +107,7 @@ echo.
 REM 7. データベース確認
 echo [7/7] データベース確認中...
 set db_count=0
-for %%f in (data_storage\complete_search_db_*.db) do (
+for %%f in (fulltext_search_app\complete_search_db_*.db) do (
     set /a db_count+=1
 )
 if %db_count% gtr 0 (

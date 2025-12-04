@@ -3734,8 +3734,16 @@ class UltraFastFullCompliantSearchSystem:
                 width, height = image.size
                 total_pixels = width * height
                 
-                # 🔥 超高速処理用画像サイズ制限（より厳格）
-                max_pixels = 1000000  # 100万画素に削減（処理速度2倍向上）
+                # 🔥 動的解像度調整: ファイルサイズに応じて最適な画素数を選択
+                # 小さいファイル: 高解像度でOCR精度向上
+                # 大きいファイル: 低解像度で処理速度優先
+                if file_size < 2 * 1024 * 1024:  # 2MB未満
+                    max_pixels = 1500000  # 150万画素（精度優先）
+                elif file_size < 5 * 1024 * 1024:  # 5MB未満
+                    max_pixels = 1000000  # 100万画素（バランス）
+                else:  # 5MB以上
+                    max_pixels = 600000   # 60万画素（速度優先）
+                
                 if total_pixels > max_pixels:
                     scale_factor = (max_pixels / total_pixels) ** 0.5
                     new_width = int(width * scale_factor)
@@ -3743,7 +3751,7 @@ class UltraFastFullCompliantSearchSystem:
                     # 高速リサイズアルゴリズム使用
                     image = image.resize((new_width, new_height), Image.Resampling.BILINEAR)
                     total_pixels = new_width * new_height
-                    print(f"🔧 超高速リサイズ ({os.path.basename(file_path)}): {width}x{height} -> {new_width}x{new_height}")
+                    debug_logger.debug(f"動的リサイズ ({os.path.basename(file_path)}): {width}x{height} -> {new_width}x{new_height}")
                 
                 # 小さすぎる画像はスキップ
                 if total_pixels < 10000:  # 100x100未満はスキップ
@@ -3756,34 +3764,54 @@ class UltraFastFullCompliantSearchSystem:
             # 🚀 超高速OCR設定（速度最優先）
             ultra_fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん'  # 文字制限で高速化
             
-            # 🔥 前処理の大幅簡略化（処理時間50%削減）
+            # 🔥 適応型前処理: 画像特性に応じて最適な前処理を選択
             processed_image = image
-            if CV2_AVAILABLE and total_pixels < 500000:  # 50万画素未満のみ軽量前処理
+            
+            # 前処理が必要な条件: カラー画像かつ中規模サイズ
+            needs_preprocessing = (image.mode != 'L' and 
+                                  total_pixels < 500000 and 
+                                  file_size > 500 * 1024)  # 500KB以上
+            
+            if CV2_AVAILABLE and needs_preprocessing:
                 try:
                     import numpy as np
-                    # グレースケール変換のみ（他の重い処理を削除）
-                    if image.mode != 'L':
-                        image_array = np.array(image)
-                        if len(image_array.shape) == 3:
-                            gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-                            processed_image = Image.fromarray(gray)
+                    image_array = np.array(image)
+                    
+                    # グレースケール変換（最も効果的な前処理）
+                    if len(image_array.shape) == 3:
+                        gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+                        
+                        # 小さいファイルのみ二値化を追加（OCR精度向上）
+                        if file_size < 2 * 1024 * 1024:
+                            # 適応的二値化: 照明ムラに強い
+                            gray = cv2.adaptiveThreshold(
+                                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 11, 2)
+                        
+                        processed_image = Image.fromarray(gray)
                 except Exception:
                     processed_image = image
             
-            # 🚀 超高速OCR実行（段階的最適化）
+            # 🚀 超高速OCR実行（段階的最適化 + 言語検出）
             text = ""
+            
+            # ファイル名から言語をヒント取得（処理の最適化）
+            filename_lower = os.path.basename(file_path).lower()
+            likely_japanese = any(hint in filename_lower for hint in ['日本語', 'japanese', 'jpn', '図面', '設計'])
             
             # Phase 1: 超高速英数字のみ（最も高速）
             try:
-                fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-                text = pytesseract.image_to_string(processed_image, lang='eng', config=fast_config).strip()
+                if not likely_japanese:  # 日本語の可能性が低い場合のみ
+                    fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+                    text = pytesseract.image_to_string(processed_image, lang='eng', config=fast_config).strip()
                 
                 # Phase 2: 結果が不十分な場合のみ通常英語OCR
                 if len(text) < 5:
                     text = pytesseract.image_to_string(processed_image, lang='eng', config='--oem 1 --psm 6').strip()
                 
                 # Phase 3: 最後の手段として日本語（処理時間が増加）
-                if len(text) < 3 and file_size < 5 * 1024 * 1024:  # 5MB未満のみ日本語試行
+                # 小さいファイルまたは日本語の可能性が高い場合のみ試行
+                if (len(text) < 3 and file_size < 5 * 1024 * 1024) or likely_japanese:
                     try:
                         jp_text = pytesseract.image_to_string(processed_image, lang='jpn', config='--oem 1 --psm 6').strip()
                         if len(jp_text) > len(text):

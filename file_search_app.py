@@ -2717,6 +2717,8 @@ class UltraFastFullCompliantSearchSystem:
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("PRAGMA cache_size=50000")
                 conn.execute("PRAGMA temp_store=MEMORY")
+                conn.execute("PRAGMA busy_timeout=300000")  # 5分待機（大幅延長）
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
                 
                 cursor = conn.cursor()
                 
@@ -2794,6 +2796,9 @@ class UltraFastFullCompliantSearchSystem:
                 print(f"✅ DB{db_index}バルク完全層移行完了: {len(group_data)}件")
                 
                 conn.close()
+                
+                # 🚀 DB書き込み後の短い待機（競合回避）
+                time.sleep(0.01)  # 10ms待機で次の書き込みをスムーズに
                 
             except Exception as e:
                 error_count += len(group_data)
@@ -2883,8 +2888,8 @@ class UltraFastFullCompliantSearchSystem:
             print(f"❌ DB{db_index}アクセス権限エラー: {complete_db_path.name}")
             return
         
-        max_retries = 8  # リトライ回数を増加
-        retry_delay = 0.05  # 初期遅延を短縮
+        max_retries = 20  # リトライ回数を大幅増加
+        retry_delay = 0.02  # 初期遅延を短縮
 
         for attempt in range(max_retries):
             debug_logger.debug(f"完全層追加試行 {attempt + 1}/{max_retries}: {file_path} (DB{db_index})")
@@ -2910,7 +2915,7 @@ class UltraFastFullCompliantSearchSystem:
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("PRAGMA cache_size=20000")  # キャッシュサイズ増加
                 conn.execute("PRAGMA temp_store=MEMORY")
-                conn.execute("PRAGMA busy_timeout=120000")  # 120秒待機
+                conn.execute("PRAGMA busy_timeout=300000")  # 5分待機（大幅延長）
                 conn.execute("PRAGMA wal_autocheckpoint=1000")  # WAL自動チェックポイント
                 conn.execute("PRAGMA optimize")  # 最適化実行
                 

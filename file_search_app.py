@@ -2490,8 +2490,8 @@ class UltraFastFullCompliantSearchSystem:
                 debug_logger.warning(f"超大容量ファイルをスキップ: {file_path} ({file_size/(1024*1024):.1f}MB)")
                 return False
             
-            # 🚀 10MB以上のファイルはファイル名のみインデックス（高速処理）
-            if file_size >= 10 * 1024 * 1024:
+            # 🚀 3MB以上のファイルはファイル名のみインデックス（超高速処理）
+            if file_size >= 3 * 1024 * 1024:
                 debug_logger.info(f"大容量ファイル - ファイル名のみインデックス: {file_path} ({file_size/(1024*1024):.1f}MB)")
                 # ファイル名とメタデータのみインデックス
                 content = file_path_obj.name  # ファイル名のみ
@@ -4456,8 +4456,8 @@ class UltraFastFullCompliantSearchSystem:
         
         # 🚀 動的スレッド数調整: ファイル数とサイズに応じて最適化
         # 小さいファイルが多い場合はスレッド数を増やす
-        small_file_ratio = sum(1 for _, size in sorted_files if size < 5*1024*1024) / max(len(sorted_files), 1)
-        if small_file_ratio > 0.7:  # 70%以上が小ファイル
+        small_file_ratio = sum(1 for _, size in sorted_files if size < 3*1024*1024) / max(len(sorted_files), 1)
+        if small_file_ratio > 0.7:  # 70%以上が小ファイル（3MB未満）
             dynamic_workers = min(self.optimal_threads * 4, len(batch_files), 128)  # 最大128並列
         else:
             dynamic_workers = min(self.optimal_threads * 2, len(batch_files), 64)  # 最大64並列
@@ -4475,12 +4475,12 @@ class UltraFastFullCompliantSearchSystem:
                 try:
                     # 🔥 ファイルサイズに応じた動的タイムアウト
                     file_size = file_path.stat().st_size if file_path.exists() else 0
-                    if file_size >= 10 * 1024 * 1024:  # 10MB以上（タイトルのみ）
-                        timeout = 5  # 超高速
-                    elif file_size < 5 * 1024 * 1024:  # 5MB未満
+                    if file_size >= 3 * 1024 * 1024:  # 3MB以上（タイトルのみ）
+                        timeout = 3  # 超高速
+                    elif file_size < 1 * 1024 * 1024:  # 1MB未満
+                        timeout = 5
+                    else:  # 1-3MB
                         timeout = 10
-                    else:  # 5-10MB
-                        timeout = 20
                     
                     result = future.result(timeout=timeout)
                     if result:
@@ -4522,12 +4522,12 @@ class UltraFastFullCompliantSearchSystem:
                     debug_logger.info(f"超大容量ファイルをスキップ: {file_path.name} ({size/(1024*1024):.1f}MB)")
                     return True  # スキップは成功として扱う
                 
-                # ファイルカテゴリ判定（10MB以上はタイトルのみ）
-                if size >= 10 * 1024 * 1024:  # 10MB以上
+                # ファイルカテゴリ判定（3MB以上はタイトルのみ）
+                if size >= 3 * 1024 * 1024:  # 3MB以上
                     category = "title_only"
-                elif size < 5 * 1024 * 1024:  # 5MB未満
+                elif size < 1 * 1024 * 1024:  # 1MB未満
                     category = "light"
-                else:  # 5-10MB
+                else:  # 1-3MB
                     category = "medium"
             except:
                 category = "light"

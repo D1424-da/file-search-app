@@ -2474,6 +2474,12 @@ class UltraFastFullCompliantSearchSystem:
                 debug_logger.debug(f"システムファイルをスキップ: {file_path_obj.name}")
                 return False
 
+            # 画像ファイルをスキップ（検索対象外）
+            image_extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+            if file_path_obj.suffix.lower() in image_extensions:
+                debug_logger.debug(f"画像ファイルをスキップ: {file_path_obj.name}")
+                return False
+
             if not file_path_obj.exists():
                 debug_logger.warning(f"ファイルが存在しません: {file_path}")
                 return False

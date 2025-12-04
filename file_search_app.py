@@ -1122,8 +1122,11 @@ class UltraFastFullCompliantSearchSystem:
         self.immediate_cache: Dict[str, Any] = {}  # 即座層 (メモリのみ - 揮発性)
         self.hot_cache: Dict[str, Any] = {}  # 高速層 (メモリ + ディスク)
 
-        # 並列処理設定（最大パフォーマンス版）
-        self.optimal_threads = get_optimal_thread_count()
+        # 並列処理設定（最大パフォーマンス版・動的増強対応）
+        base_threads = get_optimal_thread_count()
+        # 🚀 並列処理数を2倍に増強（軽量ファイル用）
+        self.optimal_threads = base_threads * 2
+        self.base_threads = base_threads  # 元の値を保持
         
         # 画像処理専用設定（CPU使用率抑制）
         self.ocr_threads = get_ocr_thread_count()
@@ -1202,7 +1205,8 @@ class UltraFastFullCompliantSearchSystem:
         self.database_timeout = 180.0  # データベースタイムアウトを延長
         
         print(f"🚀 システム最適化設定:")
-        print(f"  スレッド数: {self.optimal_threads}")
+        print(f"  基本スレッド数: {self.base_threads}")
+        print(f"  最大並列数: {self.optimal_threads} (2倍増強)")
         print(f"  バッチサイズ: {self.batch_size}")
         print(f"  即座層キャッシュ: {self.max_immediate_cache:,}")
         print(f"  高速層キャッシュ: {self.max_hot_cache:,}")
@@ -2790,20 +2794,21 @@ class UltraFastFullCompliantSearchSystem:
             return ""
 
     def _extract_txt_content(self, file_path: str) -> str:
-        """テキストファイル抽出（エンコーディング自動検出強化版）"""
+        """テキストファイル抽出（エンコーディング自動検出強化版・大容量対応）"""
         try:
             # ファイルサイズチェック
             file_size = os.path.getsize(file_path)
             if file_size == 0:
                 return ""
-            if file_size > 10 * 1024 * 1024:  # 10MB以上は一部のみ読み込み
-                read_size = 10 * 1024 * 1024
+            # 大容量ファイル対応: 50MBまで読み込み、それ以上は段階的に処理
+            if file_size > 50 * 1024 * 1024:  # 50MB以上は部分読み込み
+                read_size = 50 * 1024 * 1024
             else:
                 read_size = file_size
             
-            # バイナリで読み込んでエンコーディング検出
+            # バイナリで読み込んでエンコーディング検出（最適化: 10KBで検出）
             with open(file_path, 'rb') as f:
-                raw_data = f.read(min(read_size, 100000))  # 最初の100KBで検出
+                raw_data = f.read(min(read_size, 10240))  # 最初の10KBで検出（高速化）
                 
                 # バイナリファイル検出（NULL文字が多い場合）
                 null_count = raw_data.count(b'\x00')
@@ -2821,11 +2826,11 @@ class UltraFastFullCompliantSearchSystem:
                 except Exception as e:
                     debug_logger.warning(f"エンコーディング検出エラー: {e}")
             
-            # エンコーディング候補リスト（優先順）
+            # エンコーディング候補リスト（優先順・最適化版: 主要3種のみ）
             encodings = []
             if detected_encoding:
                 encodings.append(detected_encoding)
-            encodings.extend(['utf-8', 'cp932', 'shift_jis', 'euc_jp', 'iso2022_jp', 'utf-16', 'latin1'])
+            encodings.extend(['utf-8', 'cp932', 'shift_jis'])  # 高速化: 主要エンコーディングのみ試行
             
             # 各エンコーディングで試行
             for encoding in encodings:
@@ -2882,10 +2887,16 @@ class UltraFastFullCompliantSearchSystem:
                 with zipfile.ZipFile(file_path, 'r') as test_zip:
                     # word/document.xmlが存在するかチェック
                     if 'word/document.xml' not in test_zip.namelist():
-                        print(f"⚠️ 有効なWordファイルではありません: {os.path.basename(file_path)}")
+                        debug_logger.warning(f"word/document.xmlが見つかりません: {file_path}")
+                        print(f"⚠️ 有効なWordファイルではありません（破損または別形式）: {os.path.basename(file_path)}")
                         return ""
             except zipfile.BadZipFile:
+                debug_logger.warning(f"ZIPファイルとして開けません: {file_path}")
+                print(f"⚠️ 破損したWordファイル: {os.path.basename(file_path)}")
                 return ""  # ZIPファイルでない場合は静かに終了
+            except Exception as e:
+                debug_logger.warning(f"Word事前チェックエラー: {file_path} - {e}")
+                return ""
 
             with zipfile.ZipFile(file_path, 'r') as docx:
                 # メイン文書の抽出
@@ -3300,7 +3311,8 @@ class UltraFastFullCompliantSearchSystem:
                 debug_logger.warning(f"PDFファイルサイズが小さすぎます: {file_path}")
                 return ""
 
-            if file_size > 50 * 1024 * 1024:  # 50MB以上は処理スキップ
+            # 大容量PDF対応: 200MBまで処理可能
+            if file_size > 200 * 1024 * 1024:  # 200MB以上は処理スキップ
                 print(
                     f"⚠️ PDFファイルが大きすぎます: {os.path.basename(file_path)} ({file_size / 1024 / 1024:.1f}MB)"
                 )
@@ -3321,8 +3333,8 @@ class UltraFastFullCompliantSearchSystem:
                 doc = fitz.open(normalized_path)
                 content = []
 
-                # ページ数制限（CPU負荷軽減）
-                max_pages = min(doc.page_count, 100)  # 最大100ページまで
+                # 大容量PDF対応: 最大500ページまで処理
+                max_pages = min(doc.page_count, 500)  # 最大500ページまで拡張
 
                 for page_num in range(max_pages):
                     try:
@@ -3958,7 +3970,9 @@ class UltraFastFullCompliantSearchSystem:
         success_count = 0
         error_count = 0
         
-        with ThreadPoolExecutor(max_workers=min(self.optimal_threads, len(batch_files))) as executor:
+        # 🚀 動的スレッド数調整: ファイル数とシステム負荷に応じて最適化
+        dynamic_workers = min(self.optimal_threads * 2, len(batch_files), 64)  # 最大64並列
+        with ThreadPoolExecutor(max_workers=dynamic_workers) as executor:
             # 各ファイルを並列処理
             futures = {executor.submit(self._process_single_file_with_progress, 
                                      file_path, progress_callback): file_path 

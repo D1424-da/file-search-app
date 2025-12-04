@@ -3559,11 +3559,11 @@ class UltraFastFullCompliantSearchSystem:
                             page_text = page.get_text("text", sort=True)
                             if page_text and page_text.strip():
                                 normalized = ' '.join(page_text.split())
-                            if len(normalized) > 0:
-                                content.append(normalized)
-                    except Exception as page_error:
-                        debug_logger.warning(f"PDFページ {page_num} 読み取りエラー: {page_error}")
-                        continue
+                                if len(normalized) > 0:
+                                    content.append(normalized)
+                        except Exception as page_error:
+                            debug_logger.warning(f"PDFページ {page_num} 読み取りエラー: {page_error}")
+                            continue
 
                 doc.close()
                 extracted_text = ' '.join(content)

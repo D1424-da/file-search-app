@@ -2485,9 +2485,20 @@ class UltraFastFullCompliantSearchSystem:
 
             debug_logger.debug(f"ファイル情報 - サイズ: {file_size}, 更新時刻: {modified_time}")
 
-            # ファイル内容抽出
-            debug_logger.debug(f"コンテンツ抽出開始: {file_path}")
-            content = self._extract_file_content(file_path)
+            # 🔥 大容量ファイルの早期スキップ（500MB以上）
+            if file_size > 500 * 1024 * 1024:
+                debug_logger.warning(f"超大容量ファイルをスキップ: {file_path} ({file_size/(1024*1024):.1f}MB)")
+                return False
+            
+            # 🚀 超大容量ファイル（200-500MB）は部分インデックスのみ
+            if file_size > 200 * 1024 * 1024:
+                debug_logger.info(f"超大容量ファイル - 部分インデックスモード: {file_path} ({file_size/(1024*1024):.1f}MB)")
+                # ファイル名とメタデータのみインデックス（高速処理）
+                content = file_path_obj.name  # ファイル名のみ
+            else:
+                # ファイル内容抽出
+                debug_logger.debug(f"コンテンツ抽出開始: {file_path}")
+                content = self._extract_file_content(file_path)
             if not content:
                 debug_logger.warning(f"コンテンツが空または抽出失敗: {file_path}")
                 return False
@@ -3173,7 +3184,14 @@ class UltraFastFullCompliantSearchSystem:
             
             # 🚀 大容量ファイル対応: 10MB以上はmmapで効率的にアクセス
             use_mmap = file_size > 10 * 1024 * 1024
-            max_read_size = min(file_size, 20 * 1024 * 1024)  # 最大20MBまで（50MB→20MBで高速化）
+            
+            # 🔥 超大容量ファイル（100MB以上）は最小限のみ
+            if file_size > 100 * 1024 * 1024:
+                max_read_size = 5 * 1024 * 1024  # 5MBのみ（超高速化）
+            elif file_size > 50 * 1024 * 1024:
+                max_read_size = 10 * 1024 * 1024  # 10MBまで
+            else:
+                max_read_size = min(file_size, 20 * 1024 * 1024)  # 最大20MBまで
             
             # バイナリで読み込んでエンコーディング検出（最適化: 4KBで検出）
             with open(file_path, 'rb') as f:
@@ -4419,29 +4437,64 @@ class UltraFastFullCompliantSearchSystem:
             return []
     
     def _process_file_batch_optimized(self, batch_files: List[Path], progress_callback=None) -> Dict[str, int]:
-        """最適化版バッチファイル処理"""
+        """最適化版バッチファイル処理（ファイルサイズ別優先度付き）"""
         success_count = 0
         error_count = 0
         
-        # 🚀 動的スレッド数調整: ファイル数とシステム負荷に応じて最適化
-        dynamic_workers = min(self.optimal_threads * 2, len(batch_files), 64)  # 最大64並列
+        # 🔥 ファイルをサイズ別にソート（小さいファイルを優先処理）
+        sorted_files = []
+        for file_path in batch_files:
+            try:
+                size = file_path.stat().st_size
+                sorted_files.append((file_path, size))
+            except:
+                sorted_files.append((file_path, 0))
+        
+        # 小さいファイルを優先してソート
+        sorted_files.sort(key=lambda x: x[1])
+        prioritized_files = [f[0] for f in sorted_files]
+        
+        # 🚀 動的スレッド数調整: ファイル数とサイズに応じて最適化
+        # 小さいファイルが多い場合はスレッド数を増やす
+        small_file_ratio = sum(1 for _, size in sorted_files if size < 5*1024*1024) / max(len(sorted_files), 1)
+        if small_file_ratio > 0.7:  # 70%以上が小ファイル
+            dynamic_workers = min(self.optimal_threads * 4, len(batch_files), 128)  # 最大128並列
+        else:
+            dynamic_workers = min(self.optimal_threads * 2, len(batch_files), 64)  # 最大64並列
+        
+        debug_logger.info(f"バッチ処理開始: {len(prioritized_files)}ファイル, {dynamic_workers}スレッド")
+        
         with ThreadPoolExecutor(max_workers=dynamic_workers) as executor:
             # 各ファイルを並列処理
             futures = {executor.submit(self._process_single_file_with_progress, 
                                      file_path, progress_callback): file_path 
-                      for file_path in batch_files}
+                      for file_path in prioritized_files}
             
             for future in as_completed(futures):
                 file_path = futures[future]
                 try:
-                    result = future.result(timeout=30)  # 30秒タイムアウト
+                    # 🔥 ファイルサイズに応じた動的タイムアウト
+                    file_size = file_path.stat().st_size if file_path.exists() else 0
+                    if file_size < 10 * 1024 * 1024:  # 10MB未満
+                        timeout = 10
+                    elif file_size < 50 * 1024 * 1024:  # 50MB未満
+                        timeout = 30
+                    elif file_size < 200 * 1024 * 1024:  # 200MB未満
+                        timeout = 60
+                    else:  # 200MB以上
+                        timeout = 120
+                    
+                    result = future.result(timeout=timeout)
                     if result:
                         success_count += 1
                     else:
                         error_count += 1
+                except concurrent.futures.TimeoutError:
+                    error_count += 1
+                    debug_logger.warning(f"タイムアウト: {file_path}")
                 except Exception as e:
                     error_count += 1
-                    print(f"⚠️ バッチ処理エラー: {file_path} - {e}")
+                    debug_logger.error(f"バッチ処理エラー: {file_path} - {e}")
                     
         return {'success': success_count, 'errors': error_count}
     
@@ -4460,15 +4513,26 @@ class UltraFastFullCompliantSearchSystem:
                     progress_callback(str(file_path), "skipped", False)
                 return True  # スキップは成功として扱う
             
-            # ファイルカテゴリ判定
+            # 🚀 ファイルサイズによる処理分岐（大容量ファイル最適化）
             try:
                 size = file_path.stat().st_size
-                if size < 10 * 1024 * 1024:  # 10MB未満
+                
+                # 🔥 超大容量ファイルの早期スキップ（500MB以上）
+                if size > 500 * 1024 * 1024:  # 500MB以上
+                    if progress_callback:
+                        progress_callback(str(file_path), "skipped_large", False)
+                    debug_logger.info(f"超大容量ファイルをスキップ: {file_path.name} ({size/(1024*1024):.1f}MB)")
+                    return True  # スキップは成功として扱う
+                
+                # ファイルカテゴリ判定
+                if size < 5 * 1024 * 1024:  # 5MB未満
                     category = "light"
-                elif size < 100 * 1024 * 1024:  # 100MB未満
+                elif size < 50 * 1024 * 1024:  # 50MB未満
                     category = "medium"
-                else:
+                elif size < 200 * 1024 * 1024:  # 200MB未満
                     category = "heavy"
+                else:  # 200-500MB
+                    category = "very_heavy"
             except:
                 category = "light"
             

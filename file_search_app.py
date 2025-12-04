@@ -3088,7 +3088,7 @@ class UltraFastFullCompliantSearchSystem:
             return ""
 
     def _extract_docx_content(self, file_path: str) -> str:
-        """Word文書抽出（新旧形式対応・エラーハンドリング強化）"""
+        """Word文書抽出（大容量対応・部分読み込み最適化）"""
         try:
             # ファイル拡張子チェック
             file_extension = os.path.splitext(file_path)[1].lower()
@@ -3098,10 +3098,15 @@ class UltraFastFullCompliantSearchSystem:
                 print(f"⚠️ 古い形式のWordファイルはサポートされていません: {os.path.basename(file_path)}")
                 return ""
 
-            # ファイルサイズチェック（空ファイル回避）
-            if os.path.getsize(file_path) < 100:  # 100バイト未満は無効
+            # 🚀 ファイルサイズチェック（大容量対応）
+            file_size = os.path.getsize(file_path)
+            if file_size < 100:  # 100バイト未満は無効
                 print(f"⚠️ ファイルサイズが小さすぎます: {os.path.basename(file_path)}")
                 return ""
+            
+            # 🚀 大容量ファイル（50MB以上）は部分的に処理
+            is_large_file = file_size > 50 * 1024 * 1024
+            max_paragraphs = 1000 if is_large_file else 10000  # 大容量は1000段落まで
 
             content = []
 
@@ -3132,13 +3137,20 @@ class UltraFastFullCompliantSearchSystem:
                 }
 
                 # 段落とテキスト要素を順序通りに抽出
+                paragraph_count = 0
                 for para in root.findall('.//w:p', namespaces):
+                    # 🚀 大容量ファイル: 段落数制限
+                    if is_large_file and paragraph_count >= max_paragraphs:
+                        debug_logger.info(f"大容量Word: {max_paragraphs}段落で処理終了")
+                        break
+                    
                     para_text = []
                     for text_elem in para.findall('.//w:t', namespaces):
                         if text_elem.text:
                             para_text.append(text_elem.text)
                     if para_text:
                         content.append(''.join(para_text))
+                        paragraph_count += 1
                 
                 # ヘッダーの抽出
                 try:
@@ -3188,7 +3200,7 @@ class UltraFastFullCompliantSearchSystem:
             return ""
 
     def _extract_xlsx_content(self, file_path: str) -> str:
-        """Excel文書抽出（新旧形式対応）"""
+        """Excel文書抽出（大容量対応・部分読み込み最適化）"""
         try:
             # ファイル拡張子チェック
             file_extension = os.path.splitext(file_path)[1].lower()
@@ -3197,6 +3209,12 @@ class UltraFastFullCompliantSearchSystem:
             if file_extension in ['.xls', '.xlt']:
                 print(f"⚠️ 古い形式のExcelファイルはサポートされていません: {os.path.basename(file_path)}")
                 return ""
+            
+            # 🚀 ファイルサイズチェック（大容量対応）
+            file_size = os.path.getsize(file_path)
+            is_large_file = file_size > 50 * 1024 * 1024
+            max_rows = 5000 if is_large_file else 50000  # 大容量は5000行まで
+            max_sheets = 3 if is_large_file else 10  # 大容量は3シートまで
             
             # ZIPファイルかどうかを事前チェック
             try:
@@ -3231,13 +3249,25 @@ class UltraFastFullCompliantSearchSystem:
                     ns = {'': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
 
                     sheet_files = [f for f in xlsx.namelist() if f.startswith('xl/worksheets/sheet')]
-
+                    
+                    # 🚀 大容量ファイル: シート数制限
+                    processed_sheets = 0
                     for sheet_file in sheet_files:
+                        if is_large_file and processed_sheets >= max_sheets:
+                            debug_logger.info(f"大容量Excel: {max_sheets}シートで処理終了")
+                            break
+                        
                         sheet_xml = xlsx.read(sheet_file)
                         sheet_root = ET.fromstring(sheet_xml)
                         
+                        # 🚀 大容量ファイル: 行数制限
+                        row_count = 0
                         # セルを順番に処理
                         for row in sheet_root.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'):
+                            if is_large_file and row_count >= max_rows:
+                                debug_logger.info(f"大容量Excel: シート{processed_sheets+1}で{max_rows}行処理")
+                                break
+                            row_count += 1
                             for cell in row.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
                                 cell_type = cell.get('t', 'n')  # セルタイプ: s=文字列, n=数値, b=ブール等
                                 
@@ -3264,6 +3294,8 @@ class UltraFastFullCompliantSearchSystem:
                                             content.append(value)
                                     elif value and len(value) > 2:  # 長い数値は保持（ID等）
                                         content.append(value)
+                        
+                        processed_sheets += 1
 
                 except Exception as e:
                     print(f"⚠️ Excelシート処理エラー: {e}")

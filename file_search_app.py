@@ -2490,10 +2490,10 @@ class UltraFastFullCompliantSearchSystem:
                 debug_logger.warning(f"超大容量ファイルをスキップ: {file_path} ({file_size/(1024*1024):.1f}MB)")
                 return False
             
-            # 🚀 超大容量ファイル（200-500MB）は部分インデックスのみ
-            if file_size > 200 * 1024 * 1024:
-                debug_logger.info(f"超大容量ファイル - 部分インデックスモード: {file_path} ({file_size/(1024*1024):.1f}MB)")
-                # ファイル名とメタデータのみインデックス（高速処理）
+            # 🚀 10MB以上のファイルはファイル名のみインデックス（高速処理）
+            if file_size >= 10 * 1024 * 1024:
+                debug_logger.info(f"大容量ファイル - ファイル名のみインデックス: {file_path} ({file_size/(1024*1024):.1f}MB)")
+                # ファイル名とメタデータのみインデックス
                 content = file_path_obj.name  # ファイル名のみ
             else:
                 # ファイル内容抽出
@@ -4475,14 +4475,12 @@ class UltraFastFullCompliantSearchSystem:
                 try:
                     # 🔥 ファイルサイズに応じた動的タイムアウト
                     file_size = file_path.stat().st_size if file_path.exists() else 0
-                    if file_size < 10 * 1024 * 1024:  # 10MB未満
+                    if file_size >= 10 * 1024 * 1024:  # 10MB以上（タイトルのみ）
+                        timeout = 5  # 超高速
+                    elif file_size < 5 * 1024 * 1024:  # 5MB未満
                         timeout = 10
-                    elif file_size < 50 * 1024 * 1024:  # 50MB未満
-                        timeout = 30
-                    elif file_size < 200 * 1024 * 1024:  # 200MB未満
-                        timeout = 60
-                    else:  # 200MB以上
-                        timeout = 120
+                    else:  # 5-10MB
+                        timeout = 20
                     
                     result = future.result(timeout=timeout)
                     if result:
@@ -4524,15 +4522,13 @@ class UltraFastFullCompliantSearchSystem:
                     debug_logger.info(f"超大容量ファイルをスキップ: {file_path.name} ({size/(1024*1024):.1f}MB)")
                     return True  # スキップは成功として扱う
                 
-                # ファイルカテゴリ判定
-                if size < 5 * 1024 * 1024:  # 5MB未満
+                # ファイルカテゴリ判定（10MB以上はタイトルのみ）
+                if size >= 10 * 1024 * 1024:  # 10MB以上
+                    category = "title_only"
+                elif size < 5 * 1024 * 1024:  # 5MB未満
                     category = "light"
-                elif size < 50 * 1024 * 1024:  # 50MB未満
+                else:  # 5-10MB
                     category = "medium"
-                elif size < 200 * 1024 * 1024:  # 200MB未満
-                    category = "heavy"
-                else:  # 200-500MB
-                    category = "very_heavy"
             except:
                 category = "light"
             

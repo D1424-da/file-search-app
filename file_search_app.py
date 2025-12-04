@@ -4564,7 +4564,7 @@ class UltraFastFullCompliantSearchSystem:
                              '.zip',  # ZIPファイル追加
                              '.jwc', '.dxf', '.sfc', '.jww',  # CADファイル追加
                              '.dwg', '.dwt', '.mpp', '.mpz']  # 追加CADファイル
-            # 画像ファイル(.tif, .tiff)は検索対象外
+            # 画像ファイル(.tif, .tiff, .jpg, .png等)は検索対象外
 
         start_time = time.time()
         directory_path = Path(directory)
@@ -4797,32 +4797,31 @@ class UltraFastFullCompliantSearchSystem:
             print(f"🔄 動的スレッド調整: 有効 (初期: {self.optimal_threads}, 最大: 16)")
 
         try:
-            # ファイルを種類別に分離（.tifファイルのみ画像処理）
-            image_extensions = ['.tif', '.tiff']  # .tifファイルのみ
-            image_files = []
+            # 画像ファイルは検索対象外として除外
+            image_extensions = ['.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp']
+            excluded_count = 0
             text_files = []
             
             for file_path in all_files:
                 if file_path.suffix.lower() in image_extensions:
-                    image_files.append(file_path)
+                    excluded_count += 1
                 else:
                     text_files.append(file_path)
             
-            print(f"📊 ファイル分類:")
-            print(f"  テキスト系: {len(text_files):,}ファイル (通常処理)")
-            print(f"  .tif画像系: {len(image_files):,}ファイル (OCR最適化処理)")
+            if excluded_count > 0:
+                print(f"⏭️  画像ファイル除外: {excluded_count:,}ファイル (.tif, .tiff, .jpg, .png等)")
             
-            # 1. まずテキストファイルを高速処理
+            # 対象ファイル数を更新
+            total_files = len(text_files)
+            all_files = text_files
+            
+            print(f"📊 インデックス対象: {total_files:,}ファイル")
+            
+            # テキストファイルを高速処理
             if text_files:
-                print(f"🚀 テキストファイル高速処理開始: {len(text_files):,}ファイル")
+                print(f"🚀 ファイル処理開始: {len(text_files):,}ファイル")
                 success_count += self._process_text_files_batch(text_files, start_time)
                 processed_files += len(text_files)
-            
-            # 2. .tif画像ファイルをCPU使用率を抑制して処理
-            if image_files:
-                print(f"🔍 .tif画像ファイルOCR処理開始: {len(image_files):,}ファイル (CPU最適化)")
-                success_count += self._process_image_files_optimized(image_files, start_time, processed_files, total_files)
-                processed_files += len(image_files)
             
             # 動的スレッド調整対応のバッチ処理（レガシー処理 - 上記で処理されない場合）
             current_batch_threads = self.optimal_threads

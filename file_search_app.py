@@ -1672,6 +1672,136 @@ class UltraFastFullCompliantSearchSystem:
             import traceback
             traceback.print_exc()
 
+    def _calculate_tf_idf_score(self, query_terms: List[str], doc_path: str, content: str) -> float:
+        """TF-IDF スコアを計算（検索精度向上）"""
+        try:
+            if not self._ranking_enabled or not content:
+                return 1.0
+            
+            content_lower = content.lower()
+            doc_length = len(content_lower.split())
+            
+            if doc_length == 0:
+                return 0.5
+            
+            tf_idf_score = 0.0
+            
+            for term in query_terms:
+                term_lower = term.lower()
+                
+                # TF (Term Frequency): 単語の出現頻度
+                term_count = content_lower.count(term_lower)
+                tf = term_count / doc_length if doc_length > 0 else 0
+                
+                # IDF (Inverse Document Frequency): キャッシュから取得または計算
+                if term_lower in self._idf_cache:
+                    idf = self._idf_cache[term_lower]
+                else:
+                    # 簡易IDF: 総ドキュメント数が不明な場合は固定値
+                    idf = 1.0 if term_count > 0 else 0.0
+                    self._idf_cache[term_lower] = idf
+                
+                # TF-IDF スコア
+                tf_idf_score += tf * idf
+            
+            return min(tf_idf_score * 2.0, 3.0)  # 最大3.0まで
+            
+        except Exception as e:
+            debug_logger.warning(f"TF-IDF計算エラー: {e}")
+            return 1.0
+    
+    def _calculate_position_score(self, query: str, file_name: str, content: str) -> float:
+        """位置情報スコアを計算（ファイル名・先頭出現で高スコア）"""
+        try:
+            score = 0.0
+            query_lower = query.lower()
+            
+            # ファイル名での出現（最高評価）
+            if file_name and query_lower in file_name.lower():
+                score += 3.0
+                # ファイル名の先頭に近いほど高スコア
+                pos = file_name.lower().find(query_lower)
+                if pos == 0:
+                    score += 2.0  # ファイル名の最初
+                elif pos < 10:
+                    score += 1.0  # ファイル名の前方
+            
+            # コンテンツでの出現位置
+            if content:
+                content_lower = content.lower()
+                pos = content_lower.find(query_lower)
+                
+                if pos >= 0:
+                    # 先頭200文字以内の出現は高評価
+                    if pos < 200:
+                        score += 1.5
+                    elif pos < 1000:
+                        score += 1.0
+                    else:
+                        score += 0.5
+                    
+                    # 複数回出現のボーナス
+                    occurrences = content_lower.count(query_lower)
+                    if occurrences > 1:
+                        score += min(occurrences * 0.2, 1.0)  # 最大1.0まで
+            
+            return score
+            
+        except Exception:
+            return 0.0
+    
+    def _calculate_file_type_score(self, file_path: str, query: str) -> float:
+        """ファイル種別スコアを計算（重要度による重み付け）"""
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            
+            # ファイル種別による重要度
+            high_priority = {'.txt': 1.5, '.md': 1.5, '.doc': 1.3, '.docx': 1.3}
+            medium_priority = {'.pdf': 1.2, '.xlsx': 1.1, '.xls': 1.1}
+            low_priority = {'.tif': 0.9, '.tiff': 0.9}  # OCRファイルは精度が低い
+            
+            if ext in high_priority:
+                return high_priority[ext]
+            elif ext in medium_priority:
+                return medium_priority[ext]
+            elif ext in low_priority:
+                return low_priority[ext]
+            else:
+                return 1.0  # デフォルト
+                
+        except Exception:
+            return 1.0
+    
+    def _calculate_advanced_relevance_score(self, 
+                                           query: str, 
+                                           file_path: str,
+                                           file_name: str, 
+                                           content: str,
+                                           base_score: float) -> float:
+        """高度な関連性スコアを計算（複数要素を統合）"""
+        try:
+            # クエリを単語に分解
+            query_terms = query.split()
+            
+            # 各要素のスコアを計算
+            tf_idf_score = self._calculate_tf_idf_score(query_terms, file_path, content)
+            position_score = self._calculate_position_score(query, file_name, content)
+            file_type_score = self._calculate_file_type_score(file_path, query)
+            
+            # 統合スコア: 基本スコア + TF-IDF + 位置 + ファイル種別
+            final_score = (
+                base_score * 1.0 +        # 基本スコア（元の重み）
+                tf_idf_score * 0.8 +      # TF-IDF（重要度高）
+                position_score * 1.2 +    # 位置情報（最重要）
+                file_type_score * 0.5     # ファイル種別（補助）
+            )
+            
+            return final_score
+            
+        except Exception as e:
+            debug_logger.warning(f"高度なスコア計算エラー: {e}")
+            return base_score
+    
     def _get_search_patterns(self, query: str) -> tuple:
         """🚀 検索パターン取得（キャッシュ付きで高速化）
         
@@ -1919,12 +2049,19 @@ class UltraFastFullCompliantSearchSystem:
                 # ファイルパスを除外してコンテンツとファイル名のみで検索
                 content_text = data.get('content_preview', data.get('content', '')) + ' ' + data.get('file_name', '')
                 if enhanced_search_match(content_text, query_patterns):
+                    # 🎯 高度なランキングスコア適用
+                    base_score = 1.0
+                    advanced_score = self._calculate_advanced_relevance_score(
+                        query, data['file_path'], data['file_name'], 
+                        data.get('content', ''), base_score
+                    )
+                    
                     results.append({
                         'file_path': data['file_path'],
                         'file_name': data['file_name'],
                         'content_preview': content_text[:200],
                         'layer': 'immediate',
-                        'relevance_score': 1.0
+                        'relevance_score': advanced_score
                     })
 
         return sorted(results, key=lambda x: x['relevance_score'], reverse=True)
@@ -1946,12 +2083,19 @@ class UltraFastFullCompliantSearchSystem:
                     # ファイルパスを除外してコンテンツとファイル名のみで検索
                     content_text = data.get('content', '') + ' ' + data.get('file_name', '')
                     if enhanced_search_match(content_text, query_patterns):
+                        # 🎯 高度なランキングスコア適用
+                        base_score = 0.8
+                        advanced_score = self._calculate_advanced_relevance_score(
+                            query, data['file_path'], data['file_name'], 
+                            data.get('content', ''), base_score
+                        )
+                        
                         chunk_results.append({
                             'file_path': data['file_path'],
                             'file_name': data['file_name'],
                             'content_preview': data['content'][:200],
                             'layer': 'hot',
-                            'relevance_score': 0.8
+                            'relevance_score': advanced_score
                         })
                 return chunk_results
 
@@ -1974,12 +2118,19 @@ class UltraFastFullCompliantSearchSystem:
                 # ファイルパスを除外してコンテンツとファイル名のみで検索
                 content_text = data.get('content', '') + ' ' + data.get('file_name', '')
                 if enhanced_search_match(content_text, query_patterns):
+                    # 🎯 高度なランキングスコア適用
+                    base_score = 0.8
+                    advanced_score = self._calculate_advanced_relevance_score(
+                        query, data['file_path'], data['file_name'], 
+                        data.get('content', ''), base_score
+                    )
+                    
                     results.append({
                         'file_path': data['file_path'],
                         'file_name': data['file_name'],
                         'content_preview': data['content'][:200],
                         'layer': 'hot',
-                        'relevance_score': 0.8
+                        'relevance_score': advanced_score
                     })
 
         return sorted(results, key=lambda x: x['relevance_score'], reverse=True)
@@ -2045,6 +2196,14 @@ class UltraFastFullCompliantSearchSystem:
                                         if query.strip().lower() in content_text.lower():
                                             exact_match_bonus = 2.0
                                         
+                                        # 従来のスコア計算
+                                        traditional_score = base_score + pattern_bonus + like_bonus + exact_match_bonus
+                                        
+                                        # 🎯 高度なランキングスコア適用
+                                        advanced_score = self._calculate_advanced_relevance_score(
+                                            query, row[0], row[1], row[2] or '', traditional_score
+                                        )
+                                        
                                         result = {
                                             'file_path': row[0],
                                             'file_name': row[1],
@@ -2052,7 +2211,7 @@ class UltraFastFullCompliantSearchSystem:
                                             'layer': f'complete_db_{db_index}_like',
                                             'file_type': row[3],
                                             'size': len(row[2]) if row[2] else 0,
-                                            'relevance_score': base_score + pattern_bonus + like_bonus + exact_match_bonus
+                                            'relevance_score': advanced_score
                                         }
                                         db_results.append(result)
                                     
@@ -2121,6 +2280,14 @@ class UltraFastFullCompliantSearchSystem:
                                         if original_query_length >= 4 and idx > 0:
                                             relevance_penalty = -1.0  # 部分マッチのペナルティ
                                         
+                                        # 従来のスコア計算
+                                        traditional_score = base_score + pattern_bonus + query_bonus + exact_match_bonus + relevance_penalty
+                                        
+                                        # 🎯 高度なランキングスコア適用
+                                        advanced_score = self._calculate_advanced_relevance_score(
+                                            query, row[0], row[1], row[2] or '', traditional_score
+                                        )
+                                        
                                         result = {
                                             'file_path': row[0],
                                             'file_name': row[1],
@@ -2128,7 +2295,7 @@ class UltraFastFullCompliantSearchSystem:
                                             'layer': f'complete_db_{db_index}',
                                             'file_type': row[3],
                                             'size': len(row[2]) if row[2] else 0,
-                                            'relevance_score': base_score + pattern_bonus + query_bonus + exact_match_bonus + relevance_penalty
+                                            'relevance_score': advanced_score
                                         }
                                         db_results.append(result)
                                     

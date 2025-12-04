@@ -246,7 +246,13 @@ except ImportError:
 def load_auto_install_settings():
     """自動インストール設定を読み込み"""
     try:
-        settings_path = Path(__file__).parent.parent / "config" / "auto_install_settings.json"
+        # EXE化対応: 実行ファイルのディレクトリを基準にする
+        if getattr(sys, 'frozen', False):
+            base_path = Path(sys.executable).parent
+        else:
+            base_path = Path(__file__).parent
+        
+        settings_path = base_path / "config" / "auto_install_settings.json"
         if settings_path.exists():
             with open(settings_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
@@ -584,13 +590,19 @@ def check_ocr_availability():
         # スタンドアロン版でのTesseract検索
         def find_bundled_tesseract():
             """同梱されたTesseractを検索"""
+            # EXE化対応: 実行ファイルのディレクトリを基準にする
+            if getattr(sys, 'frozen', False):
+                base_path = Path(sys.executable).parent
+            else:
+                base_path = Path(__file__).parent
+            
             possible_paths = [
                 # 同じディレクトリ内のtesseractフォルダ
-                Path(__file__).parent / "tesseract" / "tesseract.exe",
-                Path(__file__).parent.parent / "tesseract" / "tesseract.exe",
+                base_path / "tesseract" / "tesseract.exe",
+                base_path.parent / "tesseract" / "tesseract.exe",
                 # ポータブル版用のパス
-                Path(__file__).parent / "bin" / "tesseract.exe",
-                Path(__file__).parent.parent / "bin" / "tesseract.exe",
+                base_path / "bin" / "tesseract.exe",
+                base_path.parent / "bin" / "tesseract.exe",
                 # Windows標準インストールパス
                 Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
                 Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
@@ -1089,10 +1101,22 @@ class UltraFastFullCompliantSearchSystem:
     def __init__(self, project_root: str):
         self.project_root = Path(project_root)
         
+        # data_storageディレクトリの存在確認と作成（EXE化対応）
+        data_storage_dir = self.project_root / "data_storage"
+        if not data_storage_dir.exists():
+            print(f"📁 data_storageディレクトリを作成: {data_storage_dir}")
+            data_storage_dir.mkdir(parents=True, exist_ok=True)
+        
+        # cacheディレクトリも確認・作成
+        cache_dir = self.project_root / "cache"
+        if not cache_dir.exists():
+            print(f"📁 cacheディレクトリを作成: {cache_dir}")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        
         # まず既存のDBファイル数をチェック
         existing_db_count = 0
         for i in range(48):  # 最大48まで確認
-            complete_db_path = self.project_root / "data_storage" / f"complete_search_db_{i}.db"
+            complete_db_path = data_storage_dir / f"complete_search_db_{i}.db"
             if complete_db_path.exists() and complete_db_path.stat().st_size > 100000:  # 100KB以上=データあり
                 existing_db_count += 1
             elif not complete_db_path.exists():
@@ -8742,10 +8766,17 @@ def main():
         except:
             print("💻 システム仕様: 詳細情報取得不可")
         
-        # プロジェクトルート設定（現在のディレクトリを使用）
-        current_file_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = current_file_dir  # 現在のディレクトリ
+        # プロジェクトルート設定（EXE化対応）
+        if getattr(sys, 'frozen', False):
+            # PyInstallerでEXE化されている場合
+            # 実行ファイル（.exe）のあるディレクトリを取得
+            project_root = os.path.dirname(sys.executable)
+        else:
+            # 通常のPythonスクリプトとして実行されている場合
+            current_file_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = current_file_dir
         print(f"📁 プロジェクトルート: {project_root}")
+        print(f"🔧 実行モード: {'EXE版' if getattr(sys, 'frozen', False) else 'スクリプト版'}")
         
         # 検索システム初期化（最大パフォーマンス設定）
         print("🔧 最大パフォーマンス検索システム初期化中...")

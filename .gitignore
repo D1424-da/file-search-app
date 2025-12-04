@@ -18,3 +18,9 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# ビルド関連
+build/
+dist/
+*.exe
+*.spec.bak

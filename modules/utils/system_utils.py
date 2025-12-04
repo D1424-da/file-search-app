@@ -9,6 +9,8 @@ import os
 import time
 import threading
 import unicodedata
+import subprocess
+import platform
 from typing import List, Tuple
 
 
@@ -349,3 +351,59 @@ def setup_debug_logger(name: str = 'FileSearchApp'):
     logger.propagate = False
 
     return logger
+
+
+def auto_install_tesseract_engine():
+    """Tesseract OCRエンジンの自動インストール"""
+    try:
+        print("🔍 Tesseract OCR自動セットアップ開始...")
+        
+        # 既存のTesseractをチェック
+        try:
+            result = subprocess.run(['tesseract', '--version'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                print("✅ Tesseract OCRエンジンは既にインストール済みです")
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
+            pass
+        
+        # OS別インストール
+        system = platform.system().lower()
+        
+        if system == 'windows':
+            print("🔧 Windows用Tesseractの自動インストールを実行中...")
+            # Chocolateyまたは直接ダウンロードでのインストールを試行
+            try:
+                # Chocolateyを試す
+                subprocess.run(['choco', 'install', 'tesseract', '-y'], 
+                              check=True, timeout=300)
+                print("✅ Tesseract OCRインストール完了 (Chocolatey)")
+                return True
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                print("⚠️ Chocolateyが利用できません。手動インストールが必要です")
+                print("   👉 https://github.com/UB-Mannheim/tesseract/wiki からダウンロードしてください")
+                
+        elif system in ['linux', 'darwin']:  # Linux or macOS
+            print(f"🔧 {system}用Tesseractの自動インストールを実行中...")
+            try:
+                if system == 'linux':
+                    # Ubuntu/Debian系
+                    subprocess.run(['sudo', 'apt-get', 'update'], check=True, timeout=60)
+                    subprocess.run(['sudo', 'apt-get', 'install', '-y', 'tesseract-ocr'], 
+                                  check=True, timeout=300)
+                else:  # macOS
+                    # Homebrew
+                    subprocess.run(['brew', 'install', 'tesseract'], check=True, timeout=300)
+                
+                print("✅ Tesseract OCRインストール完了")
+                return True
+                
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                print("⚠️ 自動インストールに失敗しました。手動インストールが必要です")
+        
+        return False
+        
+    except Exception as e:
+        print(f"❌ Tesseract自動セットアップエラー: {e}")
+        return False

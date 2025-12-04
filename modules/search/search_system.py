@@ -49,7 +49,7 @@ class UltraFastFullCompliantSearchSystem:
         self.shutdown_requested = False
         
         # コンポーネント初期化
-        self.database_manager = DatabaseManager(project_root, db_count, optimal_threads)
+        self.database_manager = DatabaseManager(project_root, db_count)
         self.cache_manager = CacheManager(project_root)
         self.content_extractor = FileContentExtractor()
         

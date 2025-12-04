@@ -1,7 +1,7 @@
-# 🚀 file_search_app
+# 🚀 100%仕様適合 超高速ライブ全文検索アプリケーション
 
-
-Word・Excel・PDF・テキスト・画像(OCR)・ZIPファイルの全文検索機能を持つ高性能デスクトップアプリケーション
+機能別にモジュール化された高性能ファイル検索アプリケーション
+Word・Excel・PDF・テキスト・画像(OCR)・ZIPファイルの全文検索機能
 
 ## ✨ 主要機能
 
@@ -36,7 +36,30 @@ Word・Excel・PDF・テキスト・画像(OCR)・ZIPファイルの全文検索
 
 ```
 📁 プロジェクトフォルダ/
-├── 📄 file_search_app.py                         # 🎯 メインアプリケーション
+├── 📄 app.py                                     # 🎯 新メインアプリケーション（モジュール版）
+├── 📄 file_search_app.py                         # 元のアプリケーション（保存）
+├── 📁 modules/                                   # モジュールパッケージ
+│   ├── 📄 __init__.py
+│   ├── 📁 utils/                                # ユーティリティ
+│   │   ├── 📄 __init__.py
+│   │   ├── 📄 library_manager.py               # 自動ライブラリインストール
+│   │   ├── 📄 progress_tracker.py              # リアルタイム進捗追跡
+│   │   └── 📄 system_utils.py                  # システムユーティリティ
+│   ├── 📁 extractors/                           # コンテンツ抽出
+│   │   ├── 📄 __init__.py
+│   │   ├── 📄 base_extractor.py                # 基底クラス
+│   │   ├── 📄 office_extractor.py              # Office文書抽出
+│   │   ├── 📄 pdf_extractor.py                 # PDF抽出
+│   │   ├── 📄 ocr_extractor.py                 # OCR画像抽出
+│   │   └── 📄 content_extractor.py             # 統合抽出器
+│   ├── 📁 search/                               # 検索システム
+│   │   ├── 📄 __init__.py
+│   │   ├── 📄 database_manager.py              # SQLiteデータベース管理
+│   │   ├── 📄 cache_manager.py                 # 3層キャッシュ管理
+│   │   └── 📄 search_system.py                 # 統合検索システム
+│   └── 📁 ui/                                   # ユーザーインターフェース
+│       ├── 📄 __init__.py
+│       └── 📄 main_ui.py                       # Tkinterメインインターフェース
 ├── 📄 README.md                                  # プロジェクト説明
 ├── 📄 requirements.txt                           # 依存関係情報
 ├── 📄 start_app_improved.ps1                     # PowerShell起動スクリプト
@@ -49,7 +72,7 @@ Word・Excel・PDF・テキスト・画像(OCR)・ZIPファイルの全文検索
 ├── 📁 cache/                                     # キャッシュディレクトリ（実行時作成）
 │   ├── 💾 hot_cache.json                        # 高速層キャッシュ
 │   └── 🌐 network_indexes/                      # ネットワークインデックス
-└── 📁 fulltext_search_app/                       # データベースディレクトリ（実行時作成）
+└── 📁 data_storage/                              # データベースディレクトリ（実行時作成）
     └── 📄 complete_search_db_*.db                # 分割データベース
 ```
 
@@ -140,7 +163,12 @@ pip install PyMuPDF openpyxl python-docx chardet psutil xlrd docx2txt pytesserac
 
 ---
 
-**🚀 file_search_appV3.2** - 高速・安定・多機能な全文検索ソリューションイルの全文検索機能を持つ高性能デスクトップアプリケーション
+**🚀 モジュール化ファイル検索アプリV1.0** - 高速・安定・多機能な全文検索ソリューション
+
+## 🔄 バージョン情報
+
+- **V1.0（モジュール版）**: `python app.py` - 新しいモジュール化構造
+- **V3.2（レガシー版）**: `python file_search_app.py` - 元の単一ファイル版イルの全文検索機能を持つ高性能デスクトップアプリケーション
 
 ## ✨ 主要機能
 

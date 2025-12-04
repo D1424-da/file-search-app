@@ -5949,8 +5949,13 @@ class UltraFastCompliantUI:
             # 方法1: Explorerの/selectパラメータでファイルをハイライト表示
             try:
                 debug_logger.info(f"🔍 Explorerでファイルをハイライト表示: {file_path}")
-                subprocess.run(['explorer', f'/select,{file_path}'], check=False,
-                             creationflags=subprocess.CREATE_NO_WINDOW)
+                # 引数をリストの別要素として渡す（引用符は自動処理される）
+                result = subprocess.run(['explorer', '/select,', file_path], 
+                                      check=False,
+                                      capture_output=True,
+                                      creationflags=subprocess.CREATE_NO_WINDOW)
+                if result.stderr:
+                    debug_logger.warning(f"Explorer stderr: {result.stderr.decode('utf-8', errors='ignore')}")
                 debug_logger.info("✅ Explorerハイライト表示成功")
                 print(f"🎯 ファイルをハイライト表示しました: {os.path.basename(file_path)}")
                 return

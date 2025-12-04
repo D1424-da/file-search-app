@@ -17,7 +17,8 @@ from .system_utils import (
     normalize_search_text_ultra,
     enhanced_search_match,
     get_optimal_thread_count,
-    setup_debug_logger
+    setup_debug_logger,
+    auto_install_tesseract_engine
 )
 
 __all__ = [
@@ -30,5 +31,6 @@ __all__ = [
     'normalize_search_text_ultra',
     'enhanced_search_match',
     'get_optimal_thread_count',
-    'setup_debug_logger'
+    'setup_debug_logger',
+    'auto_install_tesseract_engine'
 ]

@@ -1,5 +1,6 @@
-# ポータブル版ファイル検索アプリ - 必要ライブラリ
+# モジュール化ファイル検索アプリ - 必要ライブラリ
 # このアプリは必要ライブラリを自動インストールします
+# 実行ファイル: python app.py
 
 # 🔧 必須ライブラリ（自動インストール対応）
 PyMuPDF>=1.20.0           # PDF処理用 (fitz)
@@ -20,9 +21,15 @@ Pillow>=8.0.0            # 画像処理用 (.tif/.tiff/.png/.jpg等)
 # zipfile - 標準ライブラリ（追加インストール不要）
 
 # 🚀 使用方法:
-# 1. python file_search_app.py を実行
+# 1. python app.py を実行（新しいモジュール化版）
 # 2. 初回起動時に必要ライブラリが自動インストールされます
 # 3. OCR機能にはTesseractエンジンの別途インストールが必要（自動インストール対応）
+# 
+# 📁 モジュール構造:
+# - modules/utils/      : ユーティリティ（ライブラリ管理、進捗追跡など）
+# - modules/extractors/ : コンテンツ抽出（Office, PDF, OCR）
+# - modules/search/     : 検索システム（DB管理、キャッシュ、検索コア）
+# - modules/ui/         : ユーザーインターフェース（Tkinter GUI）
 
 # 📋 対応ファイル形式:
 # - PDF: PyMuPDF使用

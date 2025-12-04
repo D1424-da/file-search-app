@@ -3161,8 +3161,8 @@ class UltraFastFullCompliantSearchSystem:
                 return self._extract_pdf_content(file_path)
             elif extension == '.zip':  # ZIPファイル内のテキストファイルを処理
                 return self._extract_zip_content(file_path)
-            elif extension in ['.tif', '.tiff']:  # .tifファイルのみ画像処理対象
-                return self._extract_image_content(file_path)
+            elif extension in ['.tif', '.tiff']:  # 画像ファイルは検索対象外
+                return ""  # 処理をスキップ
             elif extension in ['.jwc', '.jww', '.dxf', '.sfc', '.dwg', '.dwt', '.mpp', '.mpz']:  # CAD/図面ファイル（ファイル名のみ検索対象）
                 return ""  # 内容は抽出せず、ファイル名のみインデックス
             else:
@@ -4558,12 +4558,13 @@ class UltraFastFullCompliantSearchSystem:
         """ディレクトリ一括インデックス - 即座開始版（0.1秒以内開始保証）"""
         if file_extensions is None:
             file_extensions = ['.txt', '.docx', '.xlsx', '.pdf', 
-                             '.tif', '.tiff', '.doc', '.xls', '.ppt', '.pptx',
+                             '.doc', '.xls', '.ppt', '.pptx',
                              '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
                              '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
                              '.zip',  # ZIPファイル追加
                              '.jwc', '.dxf', '.sfc', '.jww',  # CADファイル追加
                              '.dwg', '.dwt', '.mpp', '.mpz']  # 追加CADファイル
+            # 画像ファイル(.tif, .tiff)は検索対象外
 
         start_time = time.time()
         directory_path = Path(directory)

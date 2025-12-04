@@ -1243,6 +1243,9 @@ class UltraFastFullCompliantSearchSystem:
         if not hasattr(self, '_pattern_cache_max_size'):
             self._pattern_cache_max_size = 1000  # 最大1000クエリをキャッシュ
         
+        # 🚀 データベース初期化済みフラグ（重複初期化防止）
+        self._db_initialized = False
+        
         # プロセス優先度を高に設定（超高速版）
         try:
             if psutil is not None:
@@ -1540,7 +1543,12 @@ class UltraFastFullCompliantSearchSystem:
             return 6  # 最終フォールバック
 
     def initialize_database(self):
-        """動的データベース高速並列初期化（34個対応版）"""
+        """動的データベース高速並列初期化（34個対応版・重複初期化防止）"""
+        # 🚀 既に初期化済みの場合はスキップ（高速化）
+        if self._db_initialized:
+            print(f"✅ データベース初期化済み - スキップ")
+            return
+        
         start_time = time.time()
         
         try:
@@ -1651,6 +1659,9 @@ class UltraFastFullCompliantSearchSystem:
 
             initialization_time = time.time() - start_time
             print(f"✅ データベース並列初期化完了: {success_count}/{self.db_count}個 ({initialization_time:.2f}秒)")
+            
+            # 🚀 初期化完了フラグを設定
+            self._db_initialized = True
             
             # キャッシュ復元（並列）
             self.load_caches()

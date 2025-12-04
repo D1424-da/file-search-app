@@ -1237,6 +1237,12 @@ class UltraFastFullCompliantSearchSystem:
         print(f"  I/O遅延: {self.io_delay*1000:.1f}ms")
         print(f"  バッチ遅延: {self.batch_delay*1000:.1f}ms")
         
+        # 検索パターンキャッシュ（重複生成防止）
+        if not hasattr(self, '_pattern_cache'):
+            self._pattern_cache = {}
+        if not hasattr(self, '_pattern_cache_max_size'):
+            self._pattern_cache_max_size = 1000  # 最大1000クエリをキャッシュ
+        
         # プロセス優先度を高に設定（超高速版）
         try:
             if psutil is not None:
@@ -1655,6 +1661,30 @@ class UltraFastFullCompliantSearchSystem:
             import traceback
             traceback.print_exc()
 
+    def _get_search_patterns(self, query: str) -> tuple:
+        """🚀 検索パターン取得（キャッシュ付きで高速化）
+        
+        Returns:
+            (half_width, full_width, normalized, query_patterns)
+        """
+        # キャッシュチェック
+        if query in self._pattern_cache:
+            return self._pattern_cache[query]
+        
+        # パターン生成
+        patterns = normalize_search_text_ultra(query)
+        
+        # キャッシュに保存
+        self._pattern_cache[query] = patterns
+        
+        # キャッシュサイズ制限（LRU風）
+        if len(self._pattern_cache) > self._pattern_cache_max_size:
+            # 最も古いエントリを削除
+            oldest_key = next(iter(self._pattern_cache))
+            del self._pattern_cache[oldest_key]
+        
+        return patterns
+
     def _get_db_index_for_file(self, file_path: str) -> int:
         """ファイルパスに基づいてデータベースインデックスを決定"""
         # ファイルパスのハッシュ値を使用して分散
@@ -1837,8 +1867,8 @@ class UltraFastFullCompliantSearchSystem:
         """即座層検索 - メモリキャッシュ（半角全角対応・並列化版）"""
         results = []
 
-        # 半角全角対応の検索パターンを生成
-        half_width, full_width, normalized, query_patterns = normalize_search_text_ultra(query)
+        # 🚀 キャッシュされたパターンを使用（高速化）
+        half_width, full_width, normalized, query_patterns = self._get_search_patterns(query)
 
         cache_items = list(self.immediate_cache.items())
         
@@ -1892,8 +1922,8 @@ class UltraFastFullCompliantSearchSystem:
         """高速層検索 - 高速キャッシュ（半角全角対応・並列化版）"""
         results = []
 
-        # 半角全角対応の検索パターンを生成
-        half_width, full_width, normalized, query_patterns = normalize_search_text_ultra(query)
+        # 🚀 キャッシュされたパターンを使用（高速化）
+        half_width, full_width, normalized, query_patterns = self._get_search_patterns(query)
 
         cache_items = list(self.hot_cache.items())
         
@@ -1948,8 +1978,8 @@ class UltraFastFullCompliantSearchSystem:
         results = []
 
         try:
-            # 半角全角対応の検索パターンを生成
-            half_width, full_width, normalized, query_patterns = normalize_search_text_ultra(query)
+            # 🚀 キャッシュされたパターンを使用（高速化）
+            half_width, full_width, normalized, query_patterns = self._get_search_patterns(query)
 
             # 8個のデータベースを並列検索
             def search_single_db(db_index: int) -> List[Dict[str, Any]]:

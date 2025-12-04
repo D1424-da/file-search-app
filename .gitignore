@@ -1,6 +1,8 @@
 ﻿# データベースファイル
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 
 # ログファイル
 *.log

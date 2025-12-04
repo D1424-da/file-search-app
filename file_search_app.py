@@ -188,6 +188,45 @@ def safe_truncate_utf8(text: str, max_length: int) -> str:
         # それでもダメなら空文字列
         return ""
 
+
+def normalize_extracted_text(text: str, max_length: int = 100000) -> str:
+    """
+    抽出されたテキストを正規化（ノイズ除去・読みやすさ向上）
+    
+    Args:
+        text: 抽出されたテキスト
+        max_length: 最大文字数
+        
+    Returns:
+        正規化されたテキスト
+    """
+    if not text:
+        return ""
+    
+    # 制御文字を除去（タブ・改行・スペースは保持）
+    import re
+    cleaned = ''.join(char for char in text if char.isprintable() or char in '\t\n\r ')
+    
+    # 連続する空白を1つに統一
+    cleaned = re.sub(r'[ \t]+', ' ', cleaned)
+    
+    # 連続する改行を最大2つまでに制限
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    
+    # 行頭・行末の空白を削除
+    lines = [line.strip() for line in cleaned.split('\n')]
+    cleaned = '\n'.join(line for line in lines if line)
+    
+    # 全体の前後の空白を削除
+    cleaned = cleaned.strip()
+    
+    # 最大文字数で切り詰め
+    if len(cleaned) > max_length:
+        cleaned = safe_truncate_utf8(cleaned, max_length)
+    
+    return cleaned
+
+
 try:
     import pytesseract
     TESSERACT_AVAILABLE = True
@@ -2740,6 +2779,8 @@ class UltraFastFullCompliantSearchSystem:
                 return self._extract_zip_content(file_path)
             elif extension in ['.tif', '.tiff']:  # .tifファイルのみ画像処理対象
                 return self._extract_image_content(file_path)
+            elif extension in ['.jwc', '.jww', '.dxf', '.sfc', '.dwg', '.dwt', '.mpp', '.mpz']:  # CAD/図面ファイル（ファイル名のみ検索対象）
+                return ""  # 内容は抽出せず、ファイル名のみインデックス
             else:
                 # 対象外の拡張子はスキップ
                 return ""
@@ -2749,16 +2790,74 @@ class UltraFastFullCompliantSearchSystem:
             return ""
 
     def _extract_txt_content(self, file_path: str) -> str:
-        """テキストファイル抽出"""
+        """テキストファイル抽出（エンコーディング自動検出強化版）"""
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                return f.read()
-        except:
-            try:
-                with open(file_path, 'r', encoding='cp932', errors='ignore') as f:
-                    return f.read()
-            except:
+            # ファイルサイズチェック
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
                 return ""
+            if file_size > 10 * 1024 * 1024:  # 10MB以上は一部のみ読み込み
+                read_size = 10 * 1024 * 1024
+            else:
+                read_size = file_size
+            
+            # バイナリで読み込んでエンコーディング検出
+            with open(file_path, 'rb') as f:
+                raw_data = f.read(min(read_size, 100000))  # 最初の100KBで検出
+                
+                # バイナリファイル検出（NULL文字が多い場合）
+                null_count = raw_data.count(b'\x00')
+                if null_count > len(raw_data) * 0.1:  # 10%以上NULL文字ならバイナリ
+                    return ""
+            
+            # chardetでエンコーディング検出
+            detected_encoding = None
+            if chardet:
+                try:
+                    detection = chardet.detect(raw_data)
+                    if detection and detection['confidence'] > 0.7:
+                        detected_encoding = detection['encoding']
+                        debug_logger.debug(f"検出エンコーディング: {detected_encoding} (信頼度: {detection['confidence']:.2f})")
+                except Exception as e:
+                    debug_logger.warning(f"エンコーディング検出エラー: {e}")
+            
+            # エンコーディング候補リスト（優先順）
+            encodings = []
+            if detected_encoding:
+                encodings.append(detected_encoding)
+            encodings.extend(['utf-8', 'cp932', 'shift_jis', 'euc_jp', 'iso2022_jp', 'utf-16', 'latin1'])
+            
+            # 各エンコーディングで試行
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding, errors='strict') as f:
+                        content = f.read(read_size)
+                        # 正常に読めたら返す
+                        if content and len(content.strip()) > 0:
+                            debug_logger.debug(f"テキスト抽出成功: {encoding}")
+                            return content
+                except (UnicodeDecodeError, LookupError):
+                    continue
+                except Exception as e:
+                    debug_logger.warning(f"読み込みエラー ({encoding}): {e}")
+                    continue
+            
+            # すべて失敗した場合はエラーを無視して読み込み
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(read_size)
+                    return normalize_extracted_text(content)
+            except:
+                try:
+                    with open(file_path, 'r', encoding='cp932', errors='ignore') as f:
+                        content = f.read(read_size)
+                        return normalize_extracted_text(content)
+                except:
+                    return ""
+                    
+        except Exception as e:
+            debug_logger.error(f"テキスト抽出エラー {file_path}: {e}")
+            return ""
 
     def _extract_docx_content(self, file_path: str) -> str:
         """Word文書抽出（新旧形式対応・エラーハンドリング強化）"""
@@ -2789,15 +2888,59 @@ class UltraFastFullCompliantSearchSystem:
                 return ""  # ZIPファイルでない場合は静かに終了
 
             with zipfile.ZipFile(file_path, 'r') as docx:
+                # メイン文書の抽出
                 xml_content = docx.read('word/document.xml')
                 root = ET.fromstring(xml_content)
+                
+                # 名前空間定義
+                namespaces = {
+                    'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+                }
 
-                # テキスト要素抽出
-                for elem in root.iter():
-                    if elem.text and elem.text.strip():
-                        content.append(elem.text.strip())
+                # 段落とテキスト要素を順序通りに抽出
+                for para in root.findall('.//w:p', namespaces):
+                    para_text = []
+                    for text_elem in para.findall('.//w:t', namespaces):
+                        if text_elem.text:
+                            para_text.append(text_elem.text)
+                    if para_text:
+                        content.append(''.join(para_text))
+                
+                # ヘッダーの抽出
+                try:
+                    for header_file in [f for f in docx.namelist() if 'header' in f.lower()]:
+                        header_xml = docx.read(header_file)
+                        header_root = ET.fromstring(header_xml)
+                        for text_elem in header_root.findall('.//w:t', namespaces):
+                            if text_elem.text and text_elem.text.strip():
+                                content.append(text_elem.text.strip())
+                except:
+                    pass
+                
+                # フッターの抽出
+                try:
+                    for footer_file in [f for f in docx.namelist() if 'footer' in f.lower()]:
+                        footer_xml = docx.read(footer_file)
+                        footer_root = ET.fromstring(footer_xml)
+                        for text_elem in footer_root.findall('.//w:t', namespaces):
+                            if text_elem.text and text_elem.text.strip():
+                                content.append(text_elem.text.strip())
+                except:
+                    pass
+                
+                # 脚注・コメントの抽出
+                try:
+                    for notes_file in [f for f in docx.namelist() if 'footnotes' in f.lower() or 'comments' in f.lower()]:
+                        notes_xml = docx.read(notes_file)
+                        notes_root = ET.fromstring(notes_xml)
+                        for text_elem in notes_root.findall('.//w:t', namespaces):
+                            if text_elem.text and text_elem.text.strip():
+                                content.append(text_elem.text.strip())
+                except:
+                    pass
 
-            return ' '.join(content)
+            result = ' '.join(content)
+            return normalize_extracted_text(result)
 
         except zipfile.BadZipFile:
             print(f"⚠️ Wordファイルが不正なZIP形式です: {os.path.basename(file_path)}")
@@ -2849,33 +2992,50 @@ class UltraFastFullCompliantSearchSystem:
                 try:
                     workbook_xml = xlsx.read('xl/workbook.xml')
                     wb_root = ET.fromstring(workbook_xml)
+                    
+                    # 名前空間定義
+                    ns = {'': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
 
-                    sheet_files = [f for f in xlsx.namelist() if f.startswith('xl/worksheets/')]
+                    sheet_files = [f for f in xlsx.namelist() if f.startswith('xl/worksheets/sheet')]
 
                     for sheet_file in sheet_files:
                         sheet_xml = xlsx.read(sheet_file)
                         sheet_root = ET.fromstring(sheet_xml)
-
-                        for elem in sheet_root.iter():
-                            if elem.text:
-                                # 数値チェックを強化（丸数字等を除外）
-                                text = elem.text.strip()
-                                if text and text.isascii() and text.isdigit():
-                                    try:
-                                        index = int(text)
-                                        if 0 <= index < len(shared_strings):
-                                            content.append(shared_strings[index])
-                                    except (ValueError, IndexError):
-                                        pass
-                                else:
-                                    # 直接のテキスト内容を追加（丸数字等を除外）
-                                    if text and len(text) > 1 and not any(char in text for char in '①②③④⑤⑥⑦⑧⑨⑩'):
-                                        content.append(text)
+                        
+                        # セルを順番に処理
+                        for row in sheet_root.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'):
+                            for cell in row.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
+                                cell_type = cell.get('t', 'n')  # セルタイプ: s=文字列, n=数値, b=ブール等
+                                
+                                # セル値を取得
+                                v_elem = cell.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v')
+                                if v_elem is not None and v_elem.text:
+                                    value = v_elem.text.strip()
+                                    
+                                    if cell_type == 's':  # 共有文字列参照
+                                        try:
+                                            index = int(value)
+                                            if 0 <= index < len(shared_strings):
+                                                text = shared_strings[index]
+                                                if text and len(text) > 0:
+                                                    content.append(text)
+                                        except (ValueError, IndexError):
+                                            pass
+                                    elif cell_type == 'str':  # 数式の文字列結果
+                                        if value and len(value) > 0:
+                                            content.append(value)
+                                    elif value and not value.replace('.', '').replace('-', '').isdigit():
+                                        # 数値以外の直接値
+                                        if len(value) > 0:
+                                            content.append(value)
+                                    elif value and len(value) > 2:  # 長い数値は保持（ID等）
+                                        content.append(value)
 
                 except Exception as e:
                     print(f"⚠️ Excelシート処理エラー: {e}")
 
-            return ' '.join(content)
+            result = ' '.join(content)
+            return normalize_extracted_text(result)
 
         except zipfile.BadZipFile:
             print(f"⚠️ Excelファイルが不正なZIP形式です: {os.path.basename(file_path)}")
@@ -3167,9 +3327,43 @@ class UltraFastFullCompliantSearchSystem:
                 for page_num in range(max_pages):
                     try:
                         page = doc[page_num]
-                        page_text = page.get_text()
+                        
+                        # 複数の抽出方法を試行（精度向上）
+                        page_text = ""
+                        
+                        # 方法1: レイアウト保持モード（テーブル等に有効）
+                        try:
+                            page_text = page.get_text("text", sort=True)  # ソート有効
+                            if not page_text or len(page_text.strip()) < 10:
+                                # 方法2: ブロック単位で抽出（より詳細）
+                                blocks = page.get_text("blocks")
+                                block_texts = []
+                                for block in blocks:
+                                    if len(block) >= 5 and block[4].strip():  # block[4]はテキスト
+                                        block_texts.append(block[4].strip())
+                                page_text = ' '.join(block_texts)
+                        except:
+                            # 方法3: 辞書形式で詳細取得
+                            try:
+                                text_dict = page.get_text("dict")
+                                dict_texts = []
+                                if "blocks" in text_dict:
+                                    for block in text_dict["blocks"]:
+                                        if "lines" in block:
+                                            for line in block["lines"]:
+                                                if "spans" in line:
+                                                    for span in line["spans"]:
+                                                        if "text" in span and span["text"].strip():
+                                                            dict_texts.append(span["text"].strip())
+                                page_text = ' '.join(dict_texts)
+                            except:
+                                page_text = page.get_text()  # 最終フォールバック
+                        
                         if page_text and page_text.strip():
-                            content.append(page_text)
+                            # テキストの正規化（余分な空白・改行を整理）
+                            normalized = ' '.join(page_text.split())
+                            if len(normalized) > 0:
+                                content.append(normalized)
                     except Exception as page_error:
                         debug_logger.warning(f"PDFページ {page_num} 読み取りエラー: {page_error}")
                         continue
@@ -3177,9 +3371,8 @@ class UltraFastFullCompliantSearchSystem:
                 doc.close()
                 extracted_text = ' '.join(content)
                 
-                # 最大文字数制限（メモリ効率化）
-                if len(extracted_text) > 500000:  # 50万文字制限
-                    extracted_text = extracted_text[:500000]
+                # 正規化処理を適用
+                extracted_text = normalize_extracted_text(extracted_text, max_length=500000)
                 
                 if content:
                     debug_logger.debug(f"PDF抽出成功: {file_path} ({len(extracted_text)} 文字)")
@@ -3374,6 +3567,104 @@ class UltraFastFullCompliantSearchSystem:
                 self._ocr_cache[cache_key] = ""
             return ""
 
+    # CAD/図面ファイルの内容抽出は無効化（ファイル名のみ検索対象）
+    # 将来的に必要になった場合のために、コードは残しておく
+    """
+    def _extract_cad_content(self, file_path: str) -> str:
+        \"\"\"CAD/図面ファイル（JWC, JWW, DXF, SFC）からテキスト抽出 - 現在は無効\"\"\"
+        try:
+            extension = os.path.splitext(file_path)[1].lower()
+            
+            # ファイルサイズチェック（大きすぎるファイルはスキップ）
+            file_size = os.path.getsize(file_path)
+            if file_size > 50 * 1024 * 1024:  # 50MB以上はスキップ
+                print(f"⚠️ CADファイルが大きすぎます ({file_path}): {file_size/1024/1024:.1f}MB")
+                return ""
+            
+            # DXFファイルの処理（テキストベースのASCII形式）
+            if extension == '.dxf':
+                try:
+                    # DXFはテキストベースなので直接読み取り
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read(100000)  # 最初の100KB
+                        # テキストエンティティや属性を抽出
+                        lines = content.split('\\n')
+                        text_parts = []
+                        for i, line in enumerate(lines):
+                            if line.strip() in ['TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF']:
+                                # テキストデータを探す
+                                for j in range(i+1, min(i+20, len(lines))):
+                                    if lines[j].strip() and not lines[j].strip().isdigit():
+                                        text_parts.append(lines[j].strip())
+                        return ' '.join(text_parts[:1000])  # 最大1000要素
+                except UnicodeDecodeError:
+                    # バイナリ形式のDXFの場合
+                    try:
+                        with open(file_path, 'r', encoding='cp932', errors='ignore') as f:
+                            content = f.read(50000)
+                            return content[:5000]
+                    except:
+                        return ""
+            
+            # JWW/JWC/SFCファイル（バイナリベース）
+            elif extension in ['.jww', '.jwc', '.sfc']:
+                try:
+                    # バイナリから可能な限りテキスト部分を抽出
+                    with open(file_path, 'rb') as f:
+                        data = f.read(100000)  # 最初の100KB
+                        
+                        # Shift-JISまたはUTF-8でデコード可能な部分を探す
+                        text_parts = []
+                        
+                        # バイト列から連続する印刷可能文字を探す
+                        current_text = bytearray()
+                        for byte in data:
+                            # 印刷可能なASCII文字、または日本語の可能性がある範囲
+                            if (32 <= byte <= 126) or (byte >= 0x80):
+                                current_text.append(byte)
+                            else:
+                                if len(current_text) > 3:  # 3バイト以上の連続
+                                    try:
+                                        decoded = current_text.decode('cp932', errors='ignore')
+                                        if len(decoded.strip()) > 2:
+                                            text_parts.append(decoded.strip())
+                                    except:
+                                        try:
+                                            decoded = current_text.decode('utf-8', errors='ignore')
+                                            if len(decoded.strip()) > 2:
+                                                text_parts.append(decoded.strip())
+                                        except:
+                                            pass
+                                current_text = bytearray()
+                        
+                        # 最後の部分も処理
+                        if len(current_text) > 3:
+                            try:
+                                decoded = current_text.decode('cp932', errors='ignore')
+                                if len(decoded.strip()) > 2:
+                                    text_parts.append(decoded.strip())
+                            except:
+                                pass
+                        
+                        # テキスト部分を結合
+                        result = ' '.join(text_parts[:500])  # 最大500要素
+                        
+                        if len(result) > 10:
+                            print(f"✅ CADファイル ({extension}) テキスト抽出: {os.path.basename(file_path)} ({len(result)}文字)")
+                        
+                        return result[:5000]  # 最大5000文字
+                        
+                except Exception as e:
+                    print(f"⚠️ CADファイル読み取りエラー ({file_path}): {e}")
+                    return ""
+            
+            return ""
+            
+        except Exception as e:
+            print(f"⚠️ CADファイル処理エラー {file_path}: {e}")
+            return ""
+    """
+
     def _process_text_files_batch(self, text_files: List[Path], start_time: float) -> int:
         """テキストファイルの高速バッチ処理"""
         success_count = 0
@@ -3560,7 +3851,9 @@ class UltraFastFullCompliantSearchSystem:
                              '.tif', '.tiff', '.doc', '.xls', '.ppt', '.pptx',
                              '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
                              '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
-                             '.zip']  # ZIPファイル追加
+                             '.zip',  # ZIPファイル追加
+                             '.jwc', '.dxf', '.sfc', '.jww',  # CADファイル追加
+                             '.dwg', '.dwt', '.mpp', '.mpz']  # 追加CADファイル
 
         start_time = time.time()
         directory_path = Path(directory)
@@ -3736,7 +4029,9 @@ class UltraFastFullCompliantSearchSystem:
                              '.tif', '.tiff', '.doc', '.xls', '.ppt', '.pptx',
                              '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
                              '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
-                             '.zip']  # ZIPファイル追加
+                             '.zip',  # ZIPファイル追加
+                             '.jwc', '.dxf', '.sfc', '.jww',  # CADファイル追加
+                             '.dwg', '.dwt', '.mpp', '.mpz']  # 追加CADファイル
 
         start_time = time.time()
         directory_path = Path(directory)
@@ -4987,7 +5282,8 @@ class UltraFastCompliantUI:
                                        textvariable=self.file_type_var,
                                        values=["all", ".txt", ".docx", ".doc", ".xlsx", ".xls", ".pdf", 
                                               ".tif", ".tiff", ".dot", ".dotx", ".dotm", ".docm",
-                                              ".xlt", ".xltx", ".xltm", ".xlsm", ".xlsb", ".zip"],
+                                              ".xlt", ".xltx", ".xltm", ".xlsm", ".xlsb",
+                                              ".jwc", ".dxf", ".sfc", ".jww", ".dwg", ".dwt", ".mpp", ".mpz", ".zip"],
                                        state="readonly",
                                        width=12)
         file_type_combo.pack(side=tk.LEFT, padx=(0, 20))
@@ -5563,7 +5859,7 @@ class UltraFastCompliantUI:
         if hasattr(self, '_last_double_click_time'):
             time_diff = current_time - self._last_double_click_time
             debug_logger.debug(f"🔍 [TIME_CHECK] 前回からの経過時間: {time_diff:.6f}秒")
-            if time_diff < 0.5:  # 0.5秒以内の重複を完全ブロック（さらに厳格化）
+            if time_diff < 1.0:  # 1秒以内の重複を完全ブロック（厳格化）
                 debug_logger.warning(f"🔍 [BLOCK_TIME] ダブルクリック時間間隔不足: {time_diff:.3f}秒")
                 print(f"🚫 [BLOCK_TIME] ダブルクリック間隔不足: {time_diff:.3f}秒 - ブロック")
                 return
@@ -5600,7 +5896,7 @@ class UltraFastCompliantUI:
         if hasattr(self, '_last_opened_file'):
             if (self._last_opened_file == file_path and 
                 hasattr(self, '_last_double_click_time') and 
-                current_time - self._last_double_click_time < 1.0):
+                current_time - self._last_double_click_time < 2.0):  # 2秒以内は重複とみなす
                 debug_logger.warning(f"🔍 [BLOCK_SAME_FILE] 同一ファイル短時間重複: {file_name}")
                 print(f"🚫 [BLOCK_SAME_FILE] 同一ファイル短時間重複: {os.path.basename(file_name)} - ブロック")
                 return
@@ -5637,9 +5933,9 @@ class UltraFastCompliantUI:
             messagebox.showerror("エラー", f"ファイルハイライト表示に失敗しました:\n{e}")
             print(f"❌ ファイルハイライト表示エラー: {e}")
         finally:
-            # 処理完了後、フラグを確実にリセット（より長い遅延）
-            debug_logger.debug("🔍 [FLAG_RESET_SCHEDULE] フラグリセットをスケジュール（3秒後）")
-            self.root.after(3000, self._reset_double_click_flag)  # 3秒後にリセット（より長い遅延）
+            # 処理完了後、フラグを確実にリセット（適切な遅延）
+            debug_logger.debug("🔍 [FLAG_RESET_SCHEDULE] フラグリセットをスケジュール（2秒後）")
+            self.root.after(2000, self._reset_double_click_flag)  # 2秒後にリセット
 
     def _reset_double_click_flag(self):
         """ダブルクリック処理フラグリセット専用メソッド（確実版）"""
@@ -5676,14 +5972,22 @@ class UltraFastCompliantUI:
             debug_logger.debug("🔍 [HIGHLIGHT_COMPLETE] UI行ハイライト完了")
             
             # 2. フォルダを開いてファイルをハイライト表示（遅延実行で確実に分離）
-            debug_logger.debug("🔍 [DELAY_SCHEDULE] エクスプローラ起動を200ms後にスケジュール")
+            debug_logger.debug("🔍 [DELAY_SCHEDULE] エクスプローラ起動を500ms後にスケジュール")
             
             def delayed_folder_open():
                 """遅延実行でフォルダオープン（重複防止強化版）"""
                 try:
                     debug_logger.info("🔍 [DELAYED_OPEN_START] 遅延フォルダオープン開始")
+                    
+                    # 再度ファイル存在確認（遅延実行中にファイルが移動/削除された可能性）
+                    if not os.path.exists(file_path):
+                        debug_logger.error(f"🔍 [FILE_GONE] ファイルが存在しなくなりました: {file_path}")
+                        return
+                    
+                    # Explorerでハイライト表示を実行
                     self._open_folder_with_highlight(file_path)
                     debug_logger.info("🔍 [DELAYED_OPEN_COMPLETE] 遅延フォルダオープン完了")
+                    
                 except Exception as delayed_error:
                     debug_logger.error(f"🔍 [DELAYED_OPEN_ERROR] 遅延フォルダオープンエラー: {delayed_error}")
                 finally:
@@ -5691,7 +5995,8 @@ class UltraFastCompliantUI:
                     self._integrated_processing = False
                     debug_logger.debug("🔍 [INTEGRATED_FLAG_RESET] 統合処理フラグをリセット")
             
-            self.root.after(200, delayed_folder_open)
+            # 500ms後に実行（UIの応答性とExplorerの起動タイミングを考慮）
+            self.root.after(500, delayed_folder_open)
             debug_logger.info("🔍 [EXPLORER_SCHEDULED] エクスプローラ起動スケジュール完了")
             
         except Exception as e:
@@ -5929,13 +6234,15 @@ class UltraFastCompliantUI:
         current_time = time.time()
         last_request_time = getattr(self, '_last_folder_open_time', 0)
         
-        if current_time - last_request_time < 1.0:  # 1秒以内の重複をブロック
-            debug_logger.warning("� フォルダオープン重複防止: 1秒以内の重複要求")
+        if current_time - last_request_time < 1.5:  # 1.5秒以内の重複をブロック
+            time_diff = current_time - last_request_time
+            debug_logger.warning(f"📂 フォルダオープン重複防止: {time_diff:.3f}秒以内の重複要求")
+            print(f"🚫 フォルダオープン重複ブロック（{time_diff:.3f}秒）")
             return
         
         self._last_folder_open_time = current_time
         
-        debug_logger.info(f"� フォルダオープン要求: {file_path}")
+        debug_logger.info(f"📂 フォルダオープン要求: {file_path}")
 
         try:
             # ファイル存在確認
@@ -5949,11 +6256,19 @@ class UltraFastCompliantUI:
             # 方法1: Explorerの/selectパラメータでファイルをハイライト表示
             try:
                 debug_logger.info(f"🔍 Explorerでファイルをハイライト表示: {file_path}")
-                subprocess.run(['explorer', f'/select,{file_path}'], check=False,
-                             creationflags=subprocess.CREATE_NO_WINDOW)
-                debug_logger.info("✅ Explorerハイライト表示成功")
-                print(f"🎯 ファイルをハイライト表示しました: {os.path.basename(file_path)}")
-                return
+                # 引数をリストの別要素として渡す（引用符は自動処理される）
+                result = subprocess.run(['explorer', '/select,', file_path], 
+                                      check=False,
+                                      capture_output=True,
+                                      creationflags=subprocess.CREATE_NO_WINDOW)
+                if result.returncode == 0:
+                    debug_logger.info("✅ Explorerハイライト表示成功")
+                    print(f"🎯 ファイルをハイライト表示しました: {os.path.basename(file_path)}")
+                    return
+                else:
+                    if result.stderr:
+                        debug_logger.warning(f"Explorer stderr: {result.stderr.decode('utf-8', errors='ignore')}")
+                    debug_logger.warning(f"Explorer戻り値: {result.returncode}")
                 
             except Exception as highlight_error:
                 debug_logger.warning(f"Explorer/selectハイライト表示失敗: {highlight_error}")
@@ -6088,6 +6403,7 @@ class UltraFastCompliantUI:
                                    '.doc', '.xls', '.ppt', '.pptx',
                                    '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
                                    '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
+                                   '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',  # CAD/図面ファイル追加
                                    '.zip'}  # ZIPファイル追加
             
             # 小さなフォルダは全カウント
@@ -7698,6 +8014,8 @@ class UltraFastCompliantUI:
                                    '.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp', '.gif',
                                    '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
                                    '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
+                                   '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',  # CAD/図面ファイル追加
+                                   '.jwc', '.dxf', '.sfc', '.jww',  # CAD/図面ファイル追加
                                    '.zip']  # ZIPファイル追加
                 
                 for root, dirs, files in os.walk(folder_path):
@@ -7993,6 +8311,7 @@ class UltraFastCompliantUI:
                                '.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp', '.gif',
                                '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
                                '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
+                               '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',  # CAD/図面ファイル追加
                                '.zip']  # ZIPファイル追加
             
             all_files = []

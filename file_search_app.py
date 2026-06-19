@@ -189,6 +189,38 @@ def safe_truncate_utf8(text: str, max_length: int) -> str:
         return ""
 
 
+# インデックス走査時に除外するディレクトリ名（完全一致で判定）
+# 部分一致にすると catalog→log, template→temp, blog→log 等を誤除外するため、
+# パスの「構成要素ごとの完全一致」で判定する。
+SKIP_DIR_NAMES = {
+    'system32', 'windows', 'pagefile', 'temp', 'tmp',
+    '.git', 'node_modules', '__pycache__',
+    'cache', 'log', 'logs', 'backup', 'trash',
+}
+# 前方一致で除外する特殊名（例: $RECYCLE.BIN）
+SKIP_DIR_PREFIXES = ('$recycle',)
+
+
+def path_has_skip_component(path: str, skip_names=None, skip_prefixes=None) -> bool:
+    """パスの構成要素のいずれかが除外名と完全一致(または特殊プレフィックス一致)するか判定。
+
+    部分一致による誤除外（例: '\\\\server\\catalog' が 'log' で除外される）を防ぐため、
+    パスをディレクトリ単位に分割し、各要素を除外名と完全一致で照合する。
+    UNCパス（\\\\server\\share）にも対応。
+    """
+    names = SKIP_DIR_NAMES if skip_names is None else skip_names
+    prefixes = SKIP_DIR_PREFIXES if skip_prefixes is None else skip_prefixes
+    for raw in path.replace('\\', '/').split('/'):
+        comp = raw.lower()
+        if not comp:
+            continue
+        if comp in names:
+            return True
+        if prefixes and comp.startswith(prefixes):
+            return True
+    return False
+
+
 def normalize_extracted_text(text: str, max_length: int = 100000) -> str:
     """
     抽出されたテキストを正規化（ノイズ除去・読みやすさ向上）
@@ -8739,8 +8771,8 @@ class UltraFastCompliantUI:
                 if sample_count >= max_samples:
                     break
                     
-                # システムディレクトリをスキップ
-                if any(skip in root.lower() for skip in ['system32', 'windows', '$recycle', 'pagefile']):
+                # システムディレクトリをスキップ（パス構成要素の完全一致で判定）
+                if path_has_skip_component(root, skip_names={'system32', 'windows', 'pagefile'}):
                     continue
                     
                 total_files += len(files)
@@ -8974,11 +9006,10 @@ class UltraFastCompliantUI:
             # 高速ファイル収集（即座処理開始版）
             first_batch_processed = False
             for root, dirs, files in os.walk(target_path):
-                # システムディレクトリを事前除外
-                root_lower = root.lower()
-                if any(skip in root_lower for skip in ['system32', 'windows', '$recycle', 'pagefile', 
-                                                      'temp', 'tmp', '.git', 'node_modules', '__pycache__', 
-                                                      'cache', 'log', 'logs', 'backup', 'trash']):
+                # システムディレクトリを事前除外（パス構成要素の完全一致で判定）
+                # 部分一致だと catalog→log, template→temp 等を誤除外し、ネットワーク
+                # 共有のフォルダが意図せず対象から外れるため、完全一致判定を使う。
+                if path_has_skip_component(root):
                     dirs.clear()  # サブディレクトリもスキップ
                     continue
                 

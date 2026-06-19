@@ -29,17 +29,26 @@ TARGET_EXTENSIONS = [
     '.zip',
 ]
 
-SKIP_KEYWORDS = ['system32', 'windows', '$recycle', 'pagefile',
-                 'temp', 'tmp', '.git', 'node_modules', '__pycache__',
-                 'cache', 'log', 'logs', 'backup', 'trash']
+SKIP_DIR_NAMES = {'system32', 'windows', 'pagefile', 'temp', 'tmp',
+                  '.git', 'node_modules', '__pycache__',
+                  'cache', 'log', 'logs', 'backup', 'trash'}
+SKIP_DIR_PREFIXES = ('$recycle',)
 
 
 def matched_skip_keyword(root_path: str):
-    """除外対象なら、ヒットしたキーワードを返す（本体と同じ部分一致判定）"""
-    root_lower = root_path.lower()
-    for skip in SKIP_KEYWORDS:
-        if skip in root_lower:
-            return skip
+    """除外対象なら、ヒットした除外名を返す（本体と同じ「構成要素の完全一致」判定）。
+
+    部分一致ではなくパスをディレクトリ単位に分割して完全一致で照合するため、
+    catalog/template/blog 等の正当なフォルダを誤除外しない。
+    """
+    for raw in root_path.replace('\\', '/').split('/'):
+        comp = raw.lower()
+        if not comp:
+            continue
+        if comp in SKIP_DIR_NAMES:
+            return comp
+        if comp.startswith(SKIP_DIR_PREFIXES):
+            return comp
     return None
 
 
@@ -82,9 +91,9 @@ def diagnose(target_path: str) -> int:
             print(f"     - {f}")
 
     if excluded_dirs:
-        print("\n⚠️  以下のディレクトリは除外キーワードに部分一致したため除外されました。")
-        print("    ネットワーク共有のパスに log/tmp/cache/temp/backup/windows 等の")
-        print("    文字列が含まれると、意図せず除外される点に注意してください。")
+        print("\n⚠️  以下のディレクトリは除外対象（フォルダ名が除外名と完全一致）のため除外されました。")
+        print("    対象に含めたい場合は、フォルダ名(log/logs/tmp/temp/cache/backup/trash 等)を")
+        print("    変更するか、本体の SKIP_DIR_NAMES から該当名を外してください。")
         for path, kw in excluded_dirs[:20]:
             print(f"     - [{kw}] {path}")
         if len(excluded_dirs) > 20:

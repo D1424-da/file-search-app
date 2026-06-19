@@ -221,6 +221,16 @@ def path_has_skip_component(path: str, skip_names=None, skip_prefixes=None) -> b
     return False
 
 
+def is_temp_or_lock_file(file_name: str) -> bool:
+    """Office等が作る一時/ロックファイルかどうか判定（インデックス対象外）。
+
+    例: '~$事業計画書.doc'（Wordの所有者ロックファイル）, '~WRL0001.tmp' 等。
+    これらは実体のある文書ではないため、収集・抽出の対象から除外する。
+    """
+    name = os.path.basename(file_name)
+    return name.startswith('~$') or name.startswith('~WRL') or name.endswith('.tmp')
+
+
 def normalize_extracted_text(text: str, max_length: int = 100000) -> str:
     """
     抽出されたテキストを正規化（ノイズ除去・読みやすさ向上）
@@ -3758,78 +3768,107 @@ class UltraFastFullCompliantSearchSystem:
                 return ""
             
             print(f"🔄 DOC処理開始: {os.path.basename(file_path)} ({file_size/1024:.1f}KB)")
-            
-            # 1. docx2txtを試行（一部のDOCファイルにも対応）
-            if docx2txt is not None:
+
+            base_name = os.path.basename(file_path)
+
+            # 1. OLE2形式（本物の旧.doc）かどうかを先に判定する。
+            #    OLE2なら docx2txt は必ず失敗する（.docはzipではない）ため呼ばない。
+            is_ole = False
+            if olefile is not None:
+                try:
+                    is_ole = olefile.isOleFile(file_path)
+                except Exception:
+                    is_ole = False
+
+            # 2. OLE2形式: WordDocumentストリームから本文テキストを抽出（日本語対応）
+            if is_ole and olefile is not None:
+                debug_logger.debug(f"OLE2形式のDOCを検出: {base_name}")
+                try:
+                    with olefile.OleFileIO(file_path) as ole:
+                        if ole.exists('WordDocument'):
+                            raw = ole.openstream('WordDocument').read()
+                            text = self._readable_text_from_bytes(raw)
+                            if text:
+                                text = normalize_extracted_text(text, max_length=500000)
+                                print(f"✅ OLE2 DOC本文抽出成功: {base_name} - {len(text)} 文字")
+                                return text
+                except Exception as olefile_error:
+                    debug_logger.warning(f"olefile処理エラー: {base_name} - {olefile_error}")
+
+            # 3. 非OLE2（.docx を .doc 拡張子にしている等）の場合のみ docx2txt を試行
+            elif docx2txt is not None:
                 try:
                     content = docx2txt.process(file_path)
                     if content and content.strip():
-                        content_preview = content.strip()[:100] + "..." if len(content.strip()) > 100 else content.strip()
-                        print(f"✅ docx2txtでDOC処理成功: {os.path.basename(file_path)} - 長さ: {len(content)} 文字")
-                        print(f"   内容プレビュー: {content_preview}")
+                        print(f"✅ docx2txtでDOC処理成功: {base_name} - 長さ: {len(content)} 文字")
                         return content.strip()
                 except Exception as docx2txt_error:
-                    print(f"⚠️ docx2txt処理エラー: {os.path.basename(file_path)} - {docx2txt_error}")
-            
-            # 2. olefileで基本情報を取得（フォールバック）
-            if olefile is not None:
-                try:
-                    if olefile.isOleFile(file_path):
-                        print(f"📝 OLE2形式のDOCファイルを検出: {os.path.basename(file_path)}")
-                        # olefileによる基本的な情報抽出
-                        with olefile.OleFileIO(file_path) as ole:
-                            # Word文書の基本情報を取得
-                            if ole.exists('WordDocument'):
-                                # 基本的なファイル情報のみ返す（安全な方法）
-                                return f"Microsoft Word文書 - {os.path.basename(file_path)} - OLE2形式"
-                            else:
-                                return f"Microsoft Word文書 - {os.path.basename(file_path)}"
-                except Exception as olefile_error:
-                    print(f"⚠️ olefile処理エラー: {os.path.basename(file_path)} - {olefile_error}")
-            
-            # 3. 基本的なバイナリ解析による文字列抽出（最後の手段）
+                    debug_logger.debug(f"docx2txt処理スキップ: {base_name} - {docx2txt_error}")
+
+            # 4. 最後の手段: ファイル全体からの可読テキスト抽出（日本語対応）
             try:
-                print(f"🔍 バイナリ解析を試行: {os.path.basename(file_path)}")
                 with open(file_path, 'rb') as f:
-                    data = f.read(min(file_size, 1024*1024))  # 最大1MB読み込み
-                    
-                # 可読文字のみを抽出（基本的な方法）
-                text_content = []
-                current_word = []
-                
-                for byte in data:
-                    char = chr(byte) if 32 <= byte <= 126 or byte in [9, 10, 13] else None
-                    if char:
-                        if char.isalnum() or char in ' .,!?-_()[]{}":;':
-                            current_word.append(char)
-                        elif current_word:
-                            word = ''.join(current_word)
-                            if len(word) >= 3:  # 3文字以上の単語のみ
-                                text_content.append(word)
-                            current_word = []
-                    elif current_word:
-                        word = ''.join(current_word)
-                        if len(word) >= 3:
-                            text_content.append(word)
-                        current_word = []
-                
-                if text_content:
-                    extracted_text = ' '.join(text_content[:50])  # 最初の50単語
-                    if extracted_text.strip():
-                        print(f"✅ バイナリ解析成功: {os.path.basename(file_path)} - {len(extracted_text)} 文字")
-                        return f"{extracted_text} - {os.path.basename(file_path)}"
-                        
+                    data = f.read(min(file_size, 4 * 1024 * 1024))  # 最大4MB読み込み
+                text = self._readable_text_from_bytes(data)
+                if text:
+                    text = normalize_extracted_text(text, max_length=500000)
+                    print(f"✅ バイナリ解析成功: {base_name} - {len(text)} 文字")
+                    return text
             except Exception as binary_error:
-                print(f"⚠️ バイナリ解析エラー: {os.path.basename(file_path)} - {binary_error}")
-            
-            # 4. 全ての方法が失敗した場合は基本情報のみ
-            print(f"📝 DOC内容抽出失敗、ファイル名のみインデックス: {os.path.basename(file_path)}")
-            print(f"   利用可能ライブラリ: docx2txt={docx2txt is not None}, olefile={olefile is not None}")
-            return f"Microsoft Word文書 - {os.path.basename(file_path)}"
+                debug_logger.warning(f"バイナリ解析エラー: {base_name} - {binary_error}")
+
+            # 5. 全ての方法が失敗した場合は基本情報のみ（ファイル名検索は可能）
+            debug_logger.info(f"DOC内容抽出失敗、ファイル名のみインデックス: {base_name}")
+            return f"Microsoft Word文書 - {base_name}"
             
         except Exception as e:
             print(f"⚠️ DOC抽出エラー: {os.path.basename(file_path)} - {e}")
             return ""
+
+    def _readable_text_from_bytes(self, data: bytes) -> str:
+        """バイナリ(.doc等)から可読テキストを抽出（日本語対応）。
+
+        旧.docはWordDocumentストリーム内に本文をUTF-16LEで持つことが多いため、
+        UTF-16LE と CP932(Shift_JIS) の両方でデコードを試し、日本語(ひらがな・
+        カタカナ・漢字・全角)と英数字・基本記号のみを残してノイズを除去する。
+        より多くの意味のある文字が取れたデコード結果を採用する。
+        ASCIIのみを拾う旧実装と違い、日本語の.doc本文も検索対象にできる。
+        """
+        def filter_readable(text: str) -> str:
+            kept = []
+            for ch in text:
+                o = ord(ch)
+                if (ch.isalnum() or ch == ' '
+                        or 0x3000 <= o <= 0x30ff      # 句読点・ひらがな・カタカナ
+                        or 0x4e00 <= o <= 0x9fff      # 漢字（CJK統合）
+                        or 0xff00 <= o <= 0xffef      # 全角英数・半角カナ
+                        or ch in '、。・「」『』（）【】〜ー－.,!?:;()[]{}/_-'):
+                    kept.append(ch)
+                else:
+                    kept.append(' ')
+            return ' '.join(''.join(kept).split())
+
+        def quality_score(text: str) -> int:
+            # 長い連続トークン（4文字以上）の総文字数で評価する。
+            # 正しいデコードは本文が長い連続語として現れ、誤デコード(別エンコーディングでの
+            # 誤読)は短い断片が散在するため、誤読のゴミを高評価しにくい。
+            return sum(len(tok) for tok in text.split() if len(tok) >= 4)
+
+        best = ""
+        best_score = 0
+        for enc in ('utf-16-le', 'cp932'):
+            try:
+                decoded = data.decode(enc, errors='ignore')
+            except Exception:
+                continue
+            cleaned = filter_readable(decoded)
+            score = quality_score(cleaned)
+            if score > best_score:
+                best_score = score
+                best = cleaned
+
+        # 意味のある連続テキストが極端に少ない場合はノイズとみなして破棄
+        return best if best_score >= 8 else ""
 
     def _extract_pdf_content(self, file_path: str) -> str:
         """PDF文書抽出（ページ並列化で80%高速化）"""
@@ -7146,6 +7185,8 @@ class UltraFastCompliantUI:
             # 最初の200個のアイテムをサンプリング
             for root, dirs, files in os.walk(folder_path):
                 for file in files:
+                    if is_temp_or_lock_file(file):
+                        continue  # Office等の一時/ロックファイル（~$～）は対象外
                     total_items += 1
                     if sample_count < 200:
                         if any(file.lower().endswith(ext) for ext in supported_extensions):
@@ -8498,8 +8539,10 @@ class UltraFastCompliantUI:
                     dirs[:] = [d for d in dirs if not d.lower().startswith(('.git', 'node_modules', '__pycache__', 'cache'))]
                     
                     for file in files:
+                        if is_temp_or_lock_file(file):
+                            continue  # Office等の一時/ロックファイル（~$～）は対象外
                         processed_files += 1
-                        
+
                         # 最大チェック数制限（UI応答性重視）
                         if processed_files > max_check_files:
                             # 推定で残りを計算
@@ -8808,6 +8851,8 @@ class UltraFastCompliantUI:
                 # ファイル処理（即座開始版）
                 batch_files = []
                 for file in files:
+                    if is_temp_or_lock_file(file):
+                        continue  # Office等の一時/ロックファイル（~$～）は対象外
                     if Path(file).suffix.lower() in target_extensions:
                         file_path = str(Path(root) / file)
                         batch_files.append(file_path)

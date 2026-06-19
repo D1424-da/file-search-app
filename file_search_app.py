@@ -6904,22 +6904,19 @@ class UltraFastCompliantUI:
             folder_path = os.path.dirname(file_path)
             
             # 方法1: Explorerの/selectパラメータでファイルをハイライト表示
+            # 注意: explorer.exe は成功時でも終了コード1を返す仕様のため、
+            # returncodeでの成否判定はできない。例外なく起動できたら成功とみなして
+            # return する（フォールバックを走らせるとExplorerが二重に開く）。
             try:
                 debug_logger.info(f"🔍 Explorerでファイルをハイライト表示: {file_path}")
                 # 引数をリストの別要素として渡す（引用符は自動処理される）
-                result = subprocess.run(['explorer', '/select,', file_path], 
-                                      check=False,
-                                      capture_output=True,
-                                      creationflags=subprocess.CREATE_NO_WINDOW)
-                if result.returncode == 0:
-                    debug_logger.info("✅ Explorerハイライト表示成功")
-                    print(f"🎯 ファイルをハイライト表示しました: {os.path.basename(file_path)}")
-                    return
-                else:
-                    if result.stderr:
-                        debug_logger.warning(f"Explorer stderr: {result.stderr.decode('utf-8', errors='ignore')}")
-                    debug_logger.warning(f"Explorer戻り値: {result.returncode}")
-                
+                subprocess.run(['explorer', '/select,', file_path],
+                               check=False,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+                debug_logger.info("✅ Explorerハイライト表示を起動")
+                print(f"🎯 ファイルをハイライト表示しました: {os.path.basename(file_path)}")
+                return
+
             except Exception as highlight_error:
                 debug_logger.warning(f"Explorer/selectハイライト表示失敗: {highlight_error}")
             

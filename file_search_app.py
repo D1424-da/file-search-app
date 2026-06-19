@@ -1170,7 +1170,13 @@ class UltraFastFullCompliantSearchSystem:
             complete_db_path = self.project_root / "data_storage" / f"complete_search_db_{i}.db"
             self.db_paths.append(db_path)
             self.complete_db_paths.append(complete_db_path)
-        
+
+        # 🚀 検索用の永続スレッドプールとスレッドローカル接続（接続/PRAGMAの張り直しコスト削減）
+        # 検索のたびにExecutorと8DB接続を作り直すと無駄なレイテンシが乗るため、
+        # ワーカースレッドと接続を使い回す。
+        self._search_executor = None
+        self._search_conn_local = threading.local()
+
         # 3層レイヤー構造（重複削除・役割明確化版）
         # 即座層: 検索キャッシュ専用（短時間保持・プレビューのみ）
         # 高速層: 中期キャッシュ（詳細コンテンツ・一時保存）  
@@ -1864,6 +1870,29 @@ class UltraFastFullCompliantSearchSystem:
         hash_value = hashlib.md5(file_path.encode('utf-8')).hexdigest()
         return int(hash_value, 16) % self.db_count
 
+    def _get_search_connection(self, db_index: int):
+        """検索用のスレッドローカルDB接続を取得（再利用）。
+
+        ワーカースレッドごとにDB接続をキャッシュし、検索のたびの connect+PRAGMA を回避する。
+        各スレッドは自分専用の接続を使うため check_same_thread=False でも安全。
+        読み取り専用(SELECT)・autocommitで使うため、WALモードで最新のコミット内容を参照できる。
+        """
+        local = self._search_conn_local
+        conns = getattr(local, 'conns', None)
+        if conns is None:
+            conns = {}
+            local.conns = conns
+        conn = conns.get(db_index)
+        if conn is None:
+            conn = sqlite3.connect(str(self.complete_db_paths[db_index]),
+                                   timeout=30.0, check_same_thread=False)
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('PRAGMA cache_size=20000')
+            conn.execute('PRAGMA temp_store=MEMORY')
+            conns[db_index] = conn
+        return conn
+
     def ultra_fast_search(self, query: str, max_results: int = 5500) -> List[Dict[str, Any]]:
         """最適化済み検索メソッド - 3層検索システム"""
         if not query or not query.strip():
@@ -2179,12 +2208,14 @@ class UltraFastFullCompliantSearchSystem:
             def search_single_db(db_index: int) -> List[Dict[str, Any]]:
                 db_results = []
                 try:
-                    complete_db_path = self.complete_db_paths[db_index]
-                    conn = sqlite3.connect(complete_db_path, timeout=30.0)
-                    # WALモード設定
-                    conn.execute('PRAGMA journal_mode=WAL')
-                    conn.execute('PRAGMA synchronous=NORMAL')
+                    # 🚀 スレッドローカルの永続接続を再利用（接続/PRAGMAの張り直しを回避）
+                    conn = self._get_search_connection(db_index)
                     cursor = conn.cursor()
+
+                    # 🚀 二段階スコアリング用カウンタ:
+                    # BM25(rank)順の上位のみ重い高度スコアリングを行い、残りは軽量スコアにする。
+                    scored_count = 0
+                    ADVANCED_SCORE_LIMIT = 300  # このDBで詳細スコアリングする最大件数
 
                     # 各パターンで検索実行（優先度順）
                     search_attempts = 0
@@ -2204,10 +2235,12 @@ class UltraFastFullCompliantSearchSystem:
                                 # 2文字以下の場合はLIKE検索（trigramトークナイザー対応）
                                 # ファイルパスを除外してコンテンツとファイル名のみで検索
                                 try:
+                                    # 🚀 本文全文は転送しない: プレビュー用に先頭2000文字だけ取得し、
+                                    #    サイズ表示用に length(content) を別途取得（全文コピーを回避）
                                     cursor.execute(
                                         '''
-                                        SELECT file_path, file_name, content, file_type,
-                                               1.0 as relevance_score
+                                        SELECT file_path, file_name, substr(content, 1, 2000) AS content_head,
+                                               file_type, length(content) AS content_len
                                         FROM documents_fts
                                         WHERE (content LIKE ? OR file_name LIKE ?)
                                         ORDER BY file_name
@@ -2217,33 +2250,38 @@ class UltraFastFullCompliantSearchSystem:
                                     rows = cursor.fetchall()
 
                                     for row in rows:
+                                        content_head = row[2] or ''
                                         # LIKE検索の場合のスコア調整
                                         base_score = 1.0
                                         pattern_bonus = 0.2 * (len(query_patterns) - idx)
                                         like_bonus = 1.5  # LIKE検索は高スコア（正確なマッチのため）
-                                        
-                                        # 🎯 厳密マッチボーナス: 元クエリと完全一致の場合
+
+                                        # 🎯 厳密マッチボーナス: 元クエリと完全一致の場合（先頭2000文字内で判定）
                                         exact_match_bonus = 0.0
-                                        content_text = (row[2] or '') + ' ' + (row[1] or '')
+                                        content_text = content_head + ' ' + (row[1] or '')
                                         if query.strip().lower() in content_text.lower():
                                             exact_match_bonus = 2.0
-                                        
+
                                         # 従来のスコア計算
                                         traditional_score = base_score + pattern_bonus + like_bonus + exact_match_bonus
-                                        
-                                        # 🎯 高度なランキングスコア適用
-                                        advanced_score = self._calculate_advanced_relevance_score(
-                                            query, row[0], row[1], row[2] or '', traditional_score
-                                        )
-                                        
+
+                                        # 🚀 二段階スコアリング: 上位のみ高度スコア、残りは軽量スコア
+                                        if scored_count < ADVANCED_SCORE_LIMIT:
+                                            final_score = self._calculate_advanced_relevance_score(
+                                                query, row[0], row[1], content_head, traditional_score
+                                            )
+                                            scored_count += 1
+                                        else:
+                                            final_score = traditional_score
+
                                         result = {
                                             'file_path': row[0],
                                             'file_name': row[1],
-                                            'content_preview': row[2][:200] if row[2] else '',
+                                            'content_preview': content_head[:200],
                                             'layer': f'complete_db_{db_index}_like',
                                             'file_type': row[3],
-                                            'size': len(row[2]) if row[2] else 0,
-                                            'relevance_score': advanced_score
+                                            'size': row[4] if row[4] else 0,
+                                            'relevance_score': final_score
                                         }
                                         db_results.append(result)
                                     
@@ -2273,10 +2311,12 @@ class UltraFastFullCompliantSearchSystem:
 
                             for search_query in search_queries:
                                 try:
+                                    # 🚀 本文全文は転送しない: プレビュー用に先頭2000文字、
+                                    #    サイズ表示用に length(content) を取得（全文コピーを回避）
                                     cursor.execute(
                                         '''
-                                        SELECT file_path, file_name, content, file_type,
-                                               rank AS relevance_score
+                                        SELECT file_path, file_name, substr(content, 1, 2000) AS content_head,
+                                               file_type, rank AS relevance_score, length(content) AS content_len
                                         FROM documents_fts
                                         WHERE documents_fts MATCH ?
                                         ORDER BY rank
@@ -2286,10 +2326,11 @@ class UltraFastFullCompliantSearchSystem:
                                     rows = cursor.fetchall()
 
                                     for row in rows:
+                                        content_head = row[2] or ''
                                         # 検索パターンによるスコア調整（精度重視）
                                         base_score = row[4] if len(row) > 4 and row[4] else 0.5
                                         pattern_bonus = 0.1 * (len(query_patterns) - idx)
-                                        
+
                                         # 検索クエリタイプによるボーナス
                                         if search_query.startswith('"') and search_query.endswith('"'):
                                             # フレーズ検索は最高スコア
@@ -2300,34 +2341,38 @@ class UltraFastFullCompliantSearchSystem:
                                         else:
                                             # 基本検索は標準スコア
                                             query_bonus = 0.5
-                                        
-                                        # 🎯 厳密マッチボーナス: 元クエリと完全一致の場合
+
+                                        # 🎯 厳密マッチボーナス: 元クエリと完全一致の場合（先頭2000文字内で判定）
                                         exact_match_bonus = 0.0
-                                        content_text = (row[2] or '') + ' ' + (row[1] or '')
+                                        content_text = content_head + ' ' + (row[1] or '')
                                         if query.strip().lower() in content_text.lower():
                                             exact_match_bonus = 3.0  # FTS検索での完全一致は最高評価
-                                        
+
                                         # 🎯 関連性フィルタ: 元のクエリが4文字以上の場合、部分マッチのスコアを下げる
                                         relevance_penalty = 0.0
                                         if original_query_length >= 4 and idx > 0:
                                             relevance_penalty = -1.0  # 部分マッチのペナルティ
-                                        
+
                                         # 従来のスコア計算
                                         traditional_score = base_score + pattern_bonus + query_bonus + exact_match_bonus + relevance_penalty
-                                        
-                                        # 🎯 高度なランキングスコア適用
-                                        advanced_score = self._calculate_advanced_relevance_score(
-                                            query, row[0], row[1], row[2] or '', traditional_score
-                                        )
-                                        
+
+                                        # 🚀 二段階スコアリング: BM25(rank)順の上位のみ高度スコア、残りは軽量スコア
+                                        if scored_count < ADVANCED_SCORE_LIMIT:
+                                            final_score = self._calculate_advanced_relevance_score(
+                                                query, row[0], row[1], content_head, traditional_score
+                                            )
+                                            scored_count += 1
+                                        else:
+                                            final_score = traditional_score
+
                                         result = {
                                             'file_path': row[0],
                                             'file_name': row[1],
-                                            'content_preview': row[2][:200] if row[2] else '',
+                                            'content_preview': content_head[:200],
                                             'layer': f'complete_db_{db_index}',
                                             'file_type': row[3],
-                                            'size': len(row[2]) if row[2] else 0,
-                                            'relevance_score': advanced_score
+                                            'size': row[5] if len(row) > 5 and row[5] else 0,
+                                            'relevance_score': final_score
                                         }
                                         db_results.append(result)
                                     
@@ -2349,29 +2394,38 @@ class UltraFastFullCompliantSearchSystem:
                             # 個別パターンのエラーは無視して続行
                             continue
 
-                    conn.close()
+                    # 接続はプールに残して再利用するため close しない
 
                 except Exception as e:
                     print(f"⚠️ DB{db_index}検索エラー: {e}")
-                    if 'conn' in locals():
-                        try:
-                            conn.close()
-                        except:
-                            pass
+                    # 異常があった接続はプールから破棄して次回再作成させる
+                    try:
+                        conns = getattr(self._search_conn_local, 'conns', None)
+                        if conns and db_index in conns:
+                            try:
+                                conns[db_index].close()
+                            except Exception:
+                                pass
+                            del conns[db_index]
+                    except Exception:
+                        pass
 
                 return db_results
 
-            # 8個のデータベースを並列で検索
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.db_count) as executor:
-                future_to_db = {executor.submit(search_single_db, i): i for i in range(self.db_count)}
-                
-                for future in concurrent.futures.as_completed(future_to_db):
-                    db_index = future_to_db[future]
-                    try:
-                        db_results = future.result(timeout=10.0)  # 10秒タイムアウト
-                        results.extend(db_results)
-                    except Exception as e:
-                        print(f"⚠️ DB{db_index}並列検索エラー: {e}")
+            # 8個のデータベースを並列で検索（永続スレッドプールを再利用）
+            if self._search_executor is None:
+                self._search_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.db_count, thread_name_prefix='search-db')
+            executor = self._search_executor
+            future_to_db = {executor.submit(search_single_db, i): i for i in range(self.db_count)}
+
+            for future in concurrent.futures.as_completed(future_to_db):
+                db_index = future_to_db[future]
+                try:
+                    db_results = future.result(timeout=10.0)  # 10秒タイムアウト
+                    results.extend(db_results)
+                except Exception as e:
+                    print(f"⚠️ DB{db_index}並列検索エラー: {e}")
 
             # 重複除去（file_pathベース）とスコア順ソート
             seen_paths = set()

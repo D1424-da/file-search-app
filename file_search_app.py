@@ -7664,17 +7664,22 @@ class UltraFastCompliantUI:
                 display_name = os.path.basename(current_file)
                 if len(display_name) > 50:
                     display_name = display_name[:47] + "..."
-                    
+
                 current_text = f"📄 {display_name}\n📁 {os.path.dirname(current_file)}"
-                
+
                 self.progress_window.current_file_text.delete(1.0, tk.END)
                 self.progress_window.current_file_text.insert(tk.END, current_text)
-            
-            # 次回更新をスケジュール（0.5秒間隔でリアルタイム更新）
-            self.root.after(500, self.update_progress_window)
-            
+
         except Exception as e:
             print(f"⚠️ 進捗ウィンドウ更新エラー: {e}")
+        finally:
+            # 次回更新をスケジュール（0.5秒間隔）。例外が起きても更新チェーンが
+            # 止まらないよう finally で必ず再スケジュールする。
+            try:
+                if self.progress_window and self.progress_window.winfo_exists():
+                    self.root.after(500, self.update_progress_window)
+            except Exception:
+                pass
 
     def categorize_files_by_size_fast_ui_safe(self, files):
         """UI応答性を重視したファイルサイズ分類（超高速並列版）"""
@@ -9226,47 +9231,42 @@ class UltraFastCompliantUI:
                 
                 system_load = self._cached_system_load
                 current_db_count = getattr(self.search_system, 'db_count', 8)
-                
-                # 並列度設定（抽出はI/O・C拡張中心でGILを解放するため高並列が有効）。
-                # DB書き込みは専用1スレッドに集約済みのため、抽出スレッドは多くしてよい。
-                cpu = max(4, getattr(self.search_system, 'optimal_threads', current_db_count))
+
+                # 並列度設定（重要）:
+                #   Pythonスレッドが多すぎるとGILを奪い合い、Tkinterのmainloop(UIスレッド)が
+                #   餓死して3層レイヤー状況・リアルタイム統計が更新されなくなる。さらに
+                #   抽出はPython処理も多くCPUコア数を超える並列化は逆効果。
+                #   そのため「CPU基準の現実的な上限」に抑える（UI応答と実効スループットの両立）。
+                base = max(2, getattr(self.search_system, 'base_threads', 4))
+                ui_hard_cap = min(max(8, base * 2), 24)  # UIを固めないための絶対上限
                 if file_category == "heavy":
-                    # 重いファイルはメモリ・CPU負荷が大きいので控えめ
-                    optimal_workers = 2 if system_load > 0.8 else 4
+                    optimal_workers = 2 if system_load > 0.8 else 3
                 elif file_category == "medium":
-                    # システム負荷に応じて動的調整
-                    if system_load > 0.9:
-                        optimal_workers = max(4, cpu)
-                    elif system_load > 0.7:
-                        optimal_workers = max(8, cpu * 2)
-                    else:
-                        optimal_workers = max(16, cpu * 3)
-                else:
-                    # 軽量ファイル: 小さなテキスト/Office中心でI/O律速。高並列で稼ぐ
-                    if system_load > 0.8:
-                        optimal_workers = max(8, cpu * 2)
+                    if system_load > 0.85:
+                        optimal_workers = max(2, base // 2)
                     elif system_load > 0.6:
-                        optimal_workers = max(16, cpu * 4)
+                        optimal_workers = max(3, base)
                     else:
-                        optimal_workers = max(32, cpu * 6)
-                
-                # 超極限並列数制限（2000ファイル/秒目標達成）
-                if system_load < 0.3:
-                    max_workers = min(len(file_batch), optimal_workers, 96)   # 超低負荷時は96並列まで（200%増強）
-                elif system_load < 0.5:
-                    max_workers = min(len(file_batch), optimal_workers, 80)   # 低負荷時は80並列まで（167%増強）
-                elif system_load < 0.7:
-                    max_workers = min(len(file_batch), optimal_workers, 64)   # 中負荷時は64並列まで（160%増強）
+                        optimal_workers = max(4, base)
                 else:
-                    max_workers = min(len(file_batch), optimal_workers, 48)   # 高負荷時は48並列まで（150%増強）
-                
-                # 超極限モード：プロセスバッチサイズを2000ファイル/秒対応に超増強
+                    # 軽量ファイル: I/O律速なのでコア数の約2倍まで（UI上限を超えない）
+                    if system_load > 0.85:
+                        optimal_workers = max(4, base)
+                    elif system_load > 0.6:
+                        optimal_workers = max(6, int(base * 1.5))
+                    else:
+                        optimal_workers = max(8, base * 2)
+
+                # UI応答性を守る絶対上限を適用
+                max_workers = min(len(file_batch), optimal_workers, ui_hard_cap)
+
+                # プロセスバッチサイズ
                 if file_category == "light":
-                    process_batch_size = min(1000, len(file_batch))  # 軽量ファイルは1000ファイル/バッチ（200%増強）
+                    process_batch_size = min(1000, len(file_batch))
                 elif file_category == "medium":
-                    process_batch_size = min(500, len(file_batch))   # 中程度ファイルは500ファイル/バッチ（200%増強）
+                    process_batch_size = min(500, len(file_batch))
                 else:
-                    process_batch_size = min(100, len(file_batch))   # 重いファイルは100ファイル/バッチ（200%増強）
+                    process_batch_size = min(100, len(file_batch))
                 
                 # 超極限性能モードログ出力
                 if len(file_batch) > 0:

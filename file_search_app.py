@@ -1213,8 +1213,10 @@ class UltraFastFullCompliantSearchSystem:
         print(f"  OCRキャッシュ機能: 有効（重複処理防止）")
         
         # 最大パフォーマンス設定適用（メモリ効率最適化）
-        self.max_immediate_cache = 150000  # メモリ効率を考慮した最適値
-        self.max_hot_cache = 1500000  # メモリ効率を考慮した最適値
+        # キャッシュ上限（メモリ安全＋O(1)FIFO退避前提の現実的な値）。
+        # 旧値(150万)は hot×最大10KB で十数GBに達し得たため大幅縮小。
+        self.max_immediate_cache = 20000   # 即座層（直近ファイルの軽量メタ）
+        self.max_hot_cache = 50000          # 高速層（直近ファイルの本文プレビュー）
         
         # 動的バッチサイズ設定（超高速版）
         try:
@@ -2698,43 +2700,39 @@ class UltraFastFullCompliantSearchSystem:
                 'modified_time': modified_time,
             }
 
-            if getattr(self, '_bulk_indexing', False):
-                # 🚀 一括インデックス中はスループット最優先:
-                #   即座層/高速層への per-file 登録（文字列スライス・dict操作・
-                #   サイズ超過時のO(n)整理）を省略し、完全層へ直接バッチ書き込みする。
-                #   検索は完全層(数百ms〜2秒ごとにフラッシュ)で対応できる。
-                self._enqueue_complete_layer(file_path, content, base_data, file_hash)
-            else:
-                # ライブ(単発)インデックス: 即時検索性のため即座層・高速層にも登録
-                def safe_truncate_utf8(text: str, max_length: int) -> str:
-                    if len(text) <= max_length:
-                        return text
-                    truncated = text[:max_length]
-                    try:
-                        truncated.encode('utf-8')
-                        return truncated
-                    except UnicodeEncodeError:
-                        return text[:max_length - 1] if max_length > 1 else ""
+            # 即座層へ登録（軽量メタのみ・O(1)FIFO退避）。一括/単発を問わず登録するので
+            # UIの3層レイヤー状況が常に動いて見える。重い処理はしないのでスループットへの影響は軽微。
+            def safe_truncate_utf8(text: str, max_length: int) -> str:
+                if len(text) <= max_length:
+                    return text
+                truncated = text[:max_length]
+                try:
+                    truncated.encode('utf-8')
+                    return truncated
+                except UnicodeEncodeError:
+                    return text[:max_length - 1] if max_length > 1 else ""
 
-                self.immediate_cache[str(file_path)] = {
-                    'file_path': str(file_path),
-                    'file_name': file_path_obj.name,
-                    'content_preview': safe_truncate_utf8(content, 500),
-                    'file_type': file_path_obj.suffix.lower(),
-                    'size': file_size,
-                    'indexed_time': time.time(),
-                    'layer': 'immediate'
-                }
-                if len(self.immediate_cache) > self.max_immediate_cache:
-                    cleanup_count = max(1, self.max_immediate_cache // 10)
-                    sorted_items = sorted(self.immediate_cache.items(),
-                                          key=lambda x: x[1]['indexed_time'])
-                    for i in range(cleanup_count):
-                        if i < len(sorted_items):
-                            del self.immediate_cache[sorted_items[i][0]]
+            self.immediate_cache[str(file_path)] = {
+                'file_path': str(file_path),
+                'file_name': file_path_obj.name,
+                'content_preview': safe_truncate_utf8(content, 500),
+                'file_type': file_path_obj.suffix.lower(),
+                'size': file_size,
+                'indexed_time': time.time(),
+                'layer': 'immediate'
+            }
+            # O(1) FIFO退避（挿入順で最古を削除。sort のO(n log n)を回避）
+            while len(self.immediate_cache) > self.max_immediate_cache:
+                try:
+                    del self.immediate_cache[next(iter(self.immediate_cache))]
+                except (StopIteration, KeyError):
+                    break
 
-                self._move_to_hot_layer(file_path, content)
-                self._enqueue_complete_layer(file_path, content, base_data, file_hash)
+            # 高速層へ移動（即座層から移動・本文プレビュー保持）
+            self._move_to_hot_layer(file_path, content)
+
+            # 完全層(DB)へバッチ書き込み（書き込み専用スレッドでシャード並列バルクインサート）
+            self._enqueue_complete_layer(file_path, content, base_data, file_hash)
 
             self.stats["indexed_files"] += 1
             # 差分インデックス用キャッシュを更新（次回以降の再インデックスでスキップ判定に使う）
@@ -2751,13 +2749,11 @@ class UltraFastFullCompliantSearchSystem:
     def _move_to_hot_layer(self, file_path: str, content: str):
         """🔄 高速層移動（即座層から移動 - 重複削除）"""
         try:
-            # 即座層から削除（重複削除）
+            # 即座層の情報を参照（削除はしない＝即座層も残してUIで3層とも動くようにする。
+            # 検索時は file_path で重複除去されるため両層に存在しても問題ない）
             if file_path in self.immediate_cache:
-                base_data = self.immediate_cache[file_path]
-                del self.immediate_cache[file_path]
-                debug_logger.debug(f"即座層から削除: {os.path.basename(file_path)}")
+                base_data = dict(self.immediate_cache[file_path])
             else:
-                # 即座層にない場合は基本データを再構築
                 base_data = {
                     'file_name': os.path.basename(file_path),
                     'file_type': Path(file_path).suffix.lower(),
@@ -2765,35 +2761,36 @@ class UltraFastFullCompliantSearchSystem:
                     'indexed_time': time.time()
                 }
 
-            # 高速層データ作成（中期保存用 - より多くのコンテンツ）
+            # 高速層データ作成（中期保存用）
             hot_data = base_data.copy()
             hot_data.update({
                 'file_path': file_path,
-                'content': content[:10000],  # より詳細なコンテンツ保存
+                'content': content[:2000],  # メモリ抑制のため先頭2000文字に短縮
                 'layer': 'hot',
                 'moved_from_immediate': time.time()
             })
 
             self.hot_cache[file_path] = hot_data
 
-            # キャッシュサイズ制限
-            if len(self.hot_cache) > self.max_hot_cache:
-                oldest_key = min(self.hot_cache.keys(),
-                                 key=lambda k: self.hot_cache[k]['indexed_time'])
-                del self.hot_cache[oldest_key]
-                debug_logger.debug(f"高速層古いエントリ削除: {oldest_key}")
+            # キャッシュサイズ制限（O(1) FIFO: 挿入順で最古を削除。min()のO(n)走査を回避）
+            while len(self.hot_cache) > self.max_hot_cache:
+                try:
+                    oldest_key = next(iter(self.hot_cache))
+                    del self.hot_cache[oldest_key]
+                except (StopIteration, KeyError):
+                    break
 
-            # キャッシュを定期保存（バックグラウンド）- 頻度を制限
-            if not hasattr(self, '_last_save_time'):
-                self._last_save_time = 0
-            
-            current_time = time.time()
-            if current_time - self._last_save_time > 5.0 and not self.shutdown_requested:  # 5秒間隔に制限 + シャットダウンチェック
-                self._last_save_time = current_time
-                timer = threading.Timer(1.0, self.save_caches)
-                self._background_threads.append(timer)  # 追跡リストに追加
-                timer.start()
-            
+            # キャッシュ定期保存（一括インデックス中はI/O削減のためスキップ）
+            if not getattr(self, '_bulk_indexing', False):
+                if not hasattr(self, '_last_save_time'):
+                    self._last_save_time = 0
+                current_time = time.time()
+                if current_time - self._last_save_time > 5.0 and not self.shutdown_requested:
+                    self._last_save_time = current_time
+                    timer = threading.Timer(1.0, self.save_caches)
+                    self._background_threads.append(timer)
+                    timer.start()
+
             debug_logger.debug(f"高速層移動完了: {os.path.basename(file_path)}")
 
         except Exception as e:
@@ -2994,134 +2991,113 @@ class UltraFastFullCompliantSearchSystem:
         """
         if not file_data_list:
             return {'success': 0, 'errors': 0}
-        
-        success_count = 0
-        error_count = 0
-        
+
         # DBインデックスごとにグループ化
         db_groups = {}
         for file_data in file_data_list:
-            file_path = file_data['file_path']
-            db_index = self._get_db_index_for_file(file_path)
-            if db_index not in db_groups:
-                db_groups[db_index] = []
-            db_groups[db_index].append(file_data)
-        
-        # 各DBに対してバルクインサート実行
-        for db_index, group_data in db_groups.items():
-            try:
-                complete_db_path = self.complete_db_paths[db_index]
-                
-                # データベース接続
-                conn = sqlite3.connect(
-                    str(complete_db_path),
-                    timeout=120.0,
-                    check_same_thread=False
-                )
-                
-                # 高速設定
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA cache_size=50000")
-                conn.execute("PRAGMA temp_store=MEMORY")
-                conn.execute("PRAGMA busy_timeout=300000")  # 5分待機（大幅延長）
-                conn.execute("PRAGMA wal_autocheckpoint=1000")
-                
-                cursor = conn.cursor()
-                
-                # 🚀 トランザクション開始（バルク処理で100倍高速化）
-                conn.execute("BEGIN EXCLUSIVE")
-                
-                # バルクインサート用データ準備
-                documents_data = []
-                fts_data = []
-                
-                for file_data in group_data:
-                    file_path = file_data['file_path']
-                    content = file_data['content']
-                    base_data = file_data['base_data']
-                    file_hash = file_data['file_hash']
-                    
-                    # 安全な文字列処理
-                    safe_content = content[:1000000] if content else ""
-                    safe_file_name = base_data.get('file_name', os.path.basename(file_path))[:500]
-                    safe_file_type = base_data.get('file_type', Path(file_path).suffix.lower())[:50]
-                    # 実ファイルの更新時刻を保存（差分インデックスが再起動後も効くようにする）
-                    file_mtime = base_data.get('modified_time', time.time())
-                    file_size_val = base_data.get('size', 0)
+            db_index = self._get_db_index_for_file(file_data['file_path'])
+            db_groups.setdefault(db_index, []).append(file_data)
 
-                    # 既存チェック
-                    cursor.execute('SELECT id FROM documents WHERE file_path = ?', (file_path,))
-                    existing = cursor.fetchone()
+        # 🚀 シャード(DB)ごとに並列書き込み。各シャードは別ファイルなので競合なく
+        #    並列化でき、書き込みスループットがシャード数に比例して向上する。
+        if len(db_groups) <= 1:
+            results = [self._write_db_group(idx, grp) for idx, grp in db_groups.items()]
+        else:
+            workers = min(len(db_groups), self.db_count)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = [ex.submit(self._write_db_group, idx, grp)
+                           for idx, grp in db_groups.items()]
+                results = [f.result() for f in concurrent.futures.as_completed(futures)]
 
-                    if existing:
-                        # 更新データ
-                        cursor.execute(
-                            '''UPDATE documents
-                               SET content = ?, file_name = ?, file_type = ?, size = ?,
-                                   modified_time = ?, indexed_time = ?, hash = ?
-                               WHERE file_path = ?''',
-                            (safe_content, safe_file_name, safe_file_type, file_size_val,
-                             file_mtime, time.time(), file_hash, file_path)
-                        )
-                        # FTS更新
-                        cursor.execute('DELETE FROM documents_fts WHERE rowid = ?', (existing[0],))
-                        fts_data.append((existing[0], file_path, safe_file_name, safe_content, safe_file_type))
-                    else:
-                        # 新規データ
-                        documents_data.append((
-                            file_path, safe_file_name, safe_content, safe_file_type,
-                            file_size_val, file_mtime, time.time(), file_hash
-                        ))
-                
-                # 🚀 バルクインサート実行（executemanyで高速化）
-                if documents_data:
-                    cursor.executemany(
-                        '''INSERT INTO documents (file_path, file_name, content, file_type, size, 
-                                                 modified_time, indexed_time, hash)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-                        documents_data
-                    )
-                    
-                    # 挿入されたIDを取得してFTSに追加
-                    for doc_data in documents_data:
-                        cursor.execute('SELECT id FROM documents WHERE file_path = ?', (doc_data[0],))
-                        doc_id = cursor.fetchone()
-                        if doc_id:
-                            fts_data.append((doc_id[0], doc_data[0], doc_data[1], doc_data[2], doc_data[3]))
-                
-                # FTSバルクインサート
-                if fts_data:
-                    cursor.executemany(
-                        '''INSERT INTO documents_fts(rowid, file_path, file_name, content, file_type)
-                           VALUES (?, ?, ?, ?, ?)''',
-                        fts_data
-                    )
-                
-                # トランザクションコミット
-                conn.commit()
-                success_count += len(group_data)
-                
-                debug_logger.info(f"バルクインサート成功: DB{db_index}, {len(group_data)}件")
-                print(f"✅ DB{db_index}バルク完全層移行完了: {len(group_data)}件")
-                
-                conn.close()
-                
-                # 🚀 DB書き込み後の短い待機（競合回避）
-                time.sleep(0.01)  # 10ms待機で次の書き込みをスムーズに
-                
-            except Exception as e:
-                error_count += len(group_data)
-                debug_logger.error(f"バルクインサートエラー: DB{db_index} - {e}")
-                print(f"⚠️ DB{db_index}バルクエラー: {e}")
-                if 'conn' in locals():
-                    try:
-                        conn.rollback()
-                        conn.close()
-                    except:
-                        pass
-        
+        success_count = sum(s for s, _ in results)
+        error_count = sum(e for _, e in results)
         return {'success': success_count, 'errors': error_count}
+
+    def _write_db_group(self, db_index: int, group_data: List[Dict[str, Any]]):
+        """単一シャード(DB)へのバルクインサート。(成功件数, 失敗件数) を返す。"""
+        conn = None
+        try:
+            complete_db_path = self.complete_db_paths[db_index]
+            conn = sqlite3.connect(str(complete_db_path), timeout=120.0, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=50000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA busy_timeout=300000")
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
+            cursor = conn.cursor()
+            conn.execute("BEGIN")
+
+            documents_data = []
+            fts_data = []
+            for file_data in group_data:
+                file_path = file_data['file_path']
+                content = file_data['content']
+                base_data = file_data['base_data']
+                file_hash = file_data['file_hash']
+
+                safe_content = content[:1000000] if content else ""
+                safe_file_name = base_data.get('file_name', os.path.basename(file_path))[:500]
+                safe_file_type = base_data.get('file_type', Path(file_path).suffix.lower())[:50]
+                # 実ファイルの更新時刻を保存（差分インデックスが再起動後も効くようにする）
+                file_mtime = base_data.get('modified_time', time.time())
+                file_size_val = base_data.get('size', 0)
+
+                cursor.execute('SELECT id FROM documents WHERE file_path = ?', (file_path,))
+                existing = cursor.fetchone()
+                if existing:
+                    cursor.execute(
+                        '''UPDATE documents
+                           SET content = ?, file_name = ?, file_type = ?, size = ?,
+                               modified_time = ?, indexed_time = ?, hash = ?
+                           WHERE file_path = ?''',
+                        (safe_content, safe_file_name, safe_file_type, file_size_val,
+                         file_mtime, time.time(), file_hash, file_path)
+                    )
+                    cursor.execute('DELETE FROM documents_fts WHERE rowid = ?', (existing[0],))
+                    fts_data.append((existing[0], file_path, safe_file_name, safe_content, safe_file_type))
+                else:
+                    documents_data.append((
+                        file_path, safe_file_name, safe_content, safe_file_type,
+                        file_size_val, file_mtime, time.time(), file_hash
+                    ))
+
+            if documents_data:
+                cursor.executemany(
+                    '''INSERT INTO documents (file_path, file_name, content, file_type, size,
+                                             modified_time, indexed_time, hash)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                    documents_data
+                )
+                for doc_data in documents_data:
+                    cursor.execute('SELECT id FROM documents WHERE file_path = ?', (doc_data[0],))
+                    doc_id = cursor.fetchone()
+                    if doc_id:
+                        fts_data.append((doc_id[0], doc_data[0], doc_data[1], doc_data[2], doc_data[3]))
+
+            if fts_data:
+                cursor.executemany(
+                    '''INSERT INTO documents_fts(rowid, file_path, file_name, content, file_type)
+                       VALUES (?, ?, ?, ?, ?)''',
+                    fts_data
+                )
+
+            conn.commit()
+            conn.close()
+            debug_logger.info(f"バルクインサート成功: DB{db_index}, {len(group_data)}件")
+            print(f"✅ DB{db_index}バルク完全層移行完了: {len(group_data)}件")
+            return (len(group_data), 0)
+
+        except Exception as e:
+            debug_logger.error(f"バルクインサートエラー: DB{db_index} - {e}")
+            print(f"⚠️ DB{db_index}バルクエラー: {e}")
+            if conn is not None:
+                try:
+                    conn.rollback()
+                    conn.close()
+                except Exception:
+                    pass
+            return (0, len(group_data))
 
     def _add_to_complete_layer(self, file_path: str, content: str, base_data: Dict[str, Any],
                                file_hash: str):

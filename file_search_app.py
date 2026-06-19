@@ -1330,6 +1330,19 @@ class UltraFastFullCompliantSearchSystem:
         # 既にインデックス済みで未更新のファイルを再抽出せずスキップし、再インデックスを高速化する
         self._index_mtime_cache: Dict[str, float] = {}
         self._index_mtime_lock = threading.Lock()
+
+        # 🚀 クエリ結果キャッシュ（同一検索の再実行を回避）。
+        #   即座層(file_path→メタデータ)とはスキーマが異なるため別dictで管理する。
+        self._query_result_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._query_cache_lock = threading.Lock()
+        self._query_cache_max = 200
+
+        # 🚀 完全層(DB)バッチ書き込み用バッファ。
+        #   ファイル毎にTimerで単発INSERTする代わりに、まとめてバルクインサートする。
+        self._complete_buffer: List[Dict[str, Any]] = []
+        self._complete_buffer_lock = threading.Lock()
+        self._complete_buffer_max = 200
+        self._complete_flush_timer = None
         self.new_files_buffer = []  # 新規ファイル一時保存
         self.max_buffer_size = 200  # バッファサイズを倍増
         self.incremental_scan_interval = 10  # 10秒に短縮（より頻繁にスキャン）
@@ -1992,6 +2005,15 @@ class UltraFastFullCompliantSearchSystem:
         start_time = time.time()
         results = []
 
+        # 🚀 クエリ結果キャッシュ: 同一検索（インデックス中以外）はDB検索を再実行せず即返す
+        cache_key = f"{query}\x00{file_type_filter}"
+        if not self.indexing_in_progress:
+            with self._query_cache_lock:
+                cached = self._query_result_cache.get(cache_key)
+            if cached is not None:
+                print(f"⚡ クエリキャッシュヒット: '{query}' ({len(cached)}件)")
+                return [r.copy() for r in cached][:max_results]
+
         try:
             # インデックス中の動作制御（軽量化）
             if self.indexing_in_progress:
@@ -2072,12 +2094,26 @@ class UltraFastFullCompliantSearchSystem:
             
             layer_msg = " / ".join(layer_parts)
             print(f"🔍 {status_msg} 3層統合検索: {len(unique_results)}件 ({search_time:.4f}秒) [フィルタ: {file_type_filter}]{cache_msg} [{layer_msg}]")
-            
+
+            # 🚀 クエリ結果キャッシュへ保存（インデックス中以外）。新規インデックスで無効化される。
+            if not self.indexing_in_progress:
+                with self._query_cache_lock:
+                    if len(self._query_result_cache) >= self._query_cache_max:
+                        # LRU風: 最古エントリを削除
+                        self._query_result_cache.pop(next(iter(self._query_result_cache)), None)
+                    self._query_result_cache[cache_key] = [r.copy() for r in unique_results]
+
             return unique_results[:max_results]
 
         except Exception as e:
             print(f"❌ 統合検索エラー: {e}")
             return []
+
+    def _invalidate_query_cache(self):
+        """クエリ結果キャッシュを破棄（完全層にデータが追加/更新されたとき呼ぶ）。"""
+        with self._query_cache_lock:
+            if self._query_result_cache:
+                self._query_result_cache.clear()
 
     def _search_immediate_layer(self, query: str) -> List[Dict[str, Any]]:
         """即座層検索 - メモリキャッシュ（半角全角対応・並列化版）"""
@@ -2093,13 +2129,15 @@ class UltraFastFullCompliantSearchSystem:
             def search_cache_chunk(chunk_items):
                 chunk_results = []
                 for key, data in chunk_items:
+                    # 即座層エントリのキーは 'content_preview'（'content'ではない）。
                     # ファイルパスを除外してコンテンツとファイル名のみで検索
-                    content_text = data.get('content', '') + ' ' + data.get('file_name', '')
+                    preview = data.get('content_preview', data.get('content', ''))
+                    content_text = preview + ' ' + data.get('file_name', '')
                     if enhanced_search_match(content_text, query_patterns):
                         chunk_results.append({
                             'file_path': data['file_path'],
                             'file_name': data['file_name'],
-                            'content_preview': data['content'][:200],
+                            'content_preview': preview[:200],
                             'layer': 'immediate',
                             'relevance_score': 1.0
                         })
@@ -2689,15 +2727,19 @@ class UltraFastFullCompliantSearchSystem:
                         oldest_key = sorted_items[i][0]
                         del self.immediate_cache[oldest_key]
                 
-                debug_logger.debug(f"即座層バッチクリーンアップ: {cleanup_count}件削除")            # Phase 2: 高速層移動（即座層から移動 - 重複削除）
-            debug_logger.debug("高速層移動タイマー設定")
-            threading.Timer(1.0, self._move_to_hot_layer,
-                            args=[file_path, content]).start()
+                debug_logger.debug(f"即座層バッチクリーンアップ: {cleanup_count}件削除")            # Phase 2: 高速層へ即時移動（即座層から移動・インメモリで軽量・即検索可能）
+            #   従来はファイル毎に Timer を生成していたが、スレッド乱立を避けるため同期実行。
+            self._move_to_hot_layer(file_path, content)
 
-            # Phase 3: 完全層移動（高速層から移動 - 重複削除）
-            debug_logger.debug("完全層移動タイマー設定")
-            threading.Timer(5.0, self._move_to_complete_layer,
-                            args=[file_path, content, file_hash]).start()
+            # Phase 3: 完全層(DB)へはバッチ書き込み（Timer乱立を避けバルクインサートを活用）
+            base_data = {
+                'file_name': file_path_obj.name,
+                'file_type': file_path_obj.suffix.lower(),
+                'size': file_size,
+                'indexed_time': time.time(),
+                'modified_time': modified_time,
+            }
+            self._enqueue_complete_layer(file_path, content, base_data, file_hash)
 
             self.stats["indexed_files"] += 1
             # 差分インデックス用キャッシュを更新（次回以降の再インデックスでスキップ判定に使う）
@@ -2762,6 +2804,64 @@ class UltraFastFullCompliantSearchSystem:
         except Exception as e:
             print(f"⚠️ 高速層移動エラー: {e}")
             debug_logger.error(f"高速層移動エラー: {e}")
+
+    def _enqueue_complete_layer(self, file_path: str, content: str,
+                                base_data: Dict[str, Any], file_hash: str):
+        """完全層(DB)書き込みをバッファに積む。一定件数でバルクフラッシュする。
+
+        ファイル毎にTimerで単発INSERTする旧方式を廃し、_bulk_add_to_complete_layer
+        によるバルクインサート（高速）でまとめて永続化する。
+        """
+        flush_now = False
+        with self._complete_buffer_lock:
+            self._complete_buffer.append({
+                'file_path': file_path,
+                'content': content,
+                'base_data': base_data,
+                'file_hash': file_hash,
+            })
+            if len(self._complete_buffer) >= self._complete_buffer_max:
+                flush_now = True
+        if flush_now:
+            self.flush_complete_buffer()
+        else:
+            self._schedule_complete_flush()
+
+    def _schedule_complete_flush(self):
+        """完全層バッファのフラッシュを一度だけ予約（Timerは常に最大1個）。"""
+        with self._complete_buffer_lock:
+            if self._complete_flush_timer is not None:
+                return
+            if getattr(self, 'shutdown_requested', False):
+                return
+            timer = threading.Timer(2.0, self.flush_complete_buffer)
+            self._complete_flush_timer = timer
+            try:
+                self._background_threads.append(timer)
+            except Exception:
+                pass
+        timer.start()
+
+    def flush_complete_buffer(self):
+        """バッファ中の完全層書き込みをバルクインサートで一括永続化する。"""
+        with self._complete_buffer_lock:
+            batch = self._complete_buffer
+            self._complete_buffer = []
+            if self._complete_flush_timer is not None:
+                try:
+                    self._complete_flush_timer.cancel()
+                except Exception:
+                    pass
+                self._complete_flush_timer = None
+        if not batch:
+            return
+        try:
+            self._bulk_add_to_complete_layer(batch)
+            # 完全層が更新されたのでクエリ結果キャッシュを無効化（古い結果を返さない）
+            self._invalidate_query_cache()
+        except Exception as e:
+            debug_logger.error(f"完全層バッチフラッシュエラー: {e}")
+            print(f"⚠️ 完全層バッチフラッシュエラー: {e}")
 
     def _move_to_complete_layer(self, file_path: str, content: str, file_hash: str):
         """🔄 完全層移動（高速層から移動 - 重複削除）"""
@@ -2880,20 +2980,23 @@ class UltraFastFullCompliantSearchSystem:
                     safe_content = content[:1000000] if content else ""
                     safe_file_name = base_data.get('file_name', os.path.basename(file_path))[:500]
                     safe_file_type = base_data.get('file_type', Path(file_path).suffix.lower())[:50]
-                    
+                    # 実ファイルの更新時刻を保存（差分インデックスが再起動後も効くようにする）
+                    file_mtime = base_data.get('modified_time', time.time())
+                    file_size_val = base_data.get('size', 0)
+
                     # 既存チェック
                     cursor.execute('SELECT id FROM documents WHERE file_path = ?', (file_path,))
                     existing = cursor.fetchone()
-                    
+
                     if existing:
                         # 更新データ
                         cursor.execute(
-                            '''UPDATE documents 
-                               SET content = ?, file_name = ?, file_type = ?, size = ?, 
+                            '''UPDATE documents
+                               SET content = ?, file_name = ?, file_type = ?, size = ?,
                                    modified_time = ?, indexed_time = ?, hash = ?
                                WHERE file_path = ?''',
-                            (safe_content, safe_file_name, safe_file_type, base_data['size'],
-                             time.time(), time.time(), file_hash, file_path)
+                            (safe_content, safe_file_name, safe_file_type, file_size_val,
+                             file_mtime, time.time(), file_hash, file_path)
                         )
                         # FTS更新
                         cursor.execute('DELETE FROM documents_fts WHERE rowid = ?', (existing[0],))
@@ -2902,7 +3005,7 @@ class UltraFastFullCompliantSearchSystem:
                         # 新規データ
                         documents_data.append((
                             file_path, safe_file_name, safe_content, safe_file_type,
-                            base_data['size'], time.time(), time.time(), file_hash
+                            file_size_val, file_mtime, time.time(), file_hash
                         ))
                 
                 # 🚀 バルクインサート実行（executemanyで高速化）
@@ -5165,7 +5268,13 @@ class UltraFastFullCompliantSearchSystem:
             if 'original_batch_size' in locals():
                 self.batch_size = original_batch_size
                 print(f"🔄 バッチサイズ復元: {self.batch_size}")
-            
+
+            # 完全層バッファに残ったファイルを最終フラッシュ（バルク書き込み）
+            try:
+                self.flush_complete_buffer()
+            except Exception as flush_err:
+                print(f"⚠️ 完全層最終フラッシュエラー: {flush_err}")
+
             # インデックス完了状態に設定
             self.indexing_in_progress = False
             self.indexing_results_ready = True
@@ -9165,10 +9274,16 @@ class UltraFastCompliantUI:
                     progress_pct = (total_processed / total_files) * 100
                     safe_ui_update(f"処理中: {total_processed:,}/{total_files:,} ({progress_pct:.1f}%)")
             
+            # 完全層バッファに残ったファイルを最終フラッシュ（バルク書き込み）
+            try:
+                self.search_system.flush_complete_buffer()
+            except Exception as flush_err:
+                print(f"⚠️ 完全層最終フラッシュエラー: {flush_err}")
+
             # 処理完了
             safe_ui_update(f"完了: {total_processed:,}ファイル処理済み", force=True)
             print(f"✅ インデックス処理完了: {total_processed:,}/{total_files:,}ファイル")
-            
+
         except Exception as e:
             safe_ui_update(f"エラー: {str(e)}", force=True)
             print(f"❌ インデックス処理エラー: {e}")

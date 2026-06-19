@@ -3837,14 +3837,18 @@ class UltraFastFullCompliantSearchSystem:
                             continue
 
                 # 🔥 OCRフォールバック: テキスト層が無い（=スキャン）ページを画像化してOCR
-                # テキストがほとんど取れなかったページを対象にする
+                # テキスト層がほぼ皆無のページのみ対象にする（短いが正規のテキスト層を持つ
+                # ページ＝章扉・ページ番号のみ等をOCR結果で上書きして劣化させないため）
                 ocr_target_pages = [p for p in range(max_pages)
-                                    if len(page_texts.get(p, "")) < 10]
+                                    if len(page_texts.get(p, "")) < 3]
                 if ocr_target_pages:
                     ocr_results = self._ocr_pdf_pages(doc, ocr_target_pages, file_path)
                     for page_num, ocr_text in ocr_results.items():
-                        if ocr_text:
-                            page_texts[page_num] = ocr_text
+                        if not ocr_text:
+                            continue
+                        existing = page_texts.get(page_num, "")
+                        # 既存のテキスト層は温存し、OCR結果を追記する
+                        page_texts[page_num] = f"{existing} {ocr_text}".strip() if existing else ocr_text
 
                 doc.close()
 
@@ -3943,39 +3947,47 @@ class UltraFastFullCompliantSearchSystem:
 
             ocr_config = '--oem 1 --psm 6'
 
-            for page_num in target_pages:
+            def ocr_single_page(page_num: int) -> str:
+                """単一ページをレンダリングしてOCR（並列処理用）"""
+                page = doc[page_num]
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                image = Image.open(io.BytesIO(pix.tobytes("png")))
+
+                # グレースケール化（OCR精度向上・高速化）
+                if image.mode not in ('L', '1'):
+                    image = image.convert('L')
+
+                # 日本語優先 or 英語優先で言語を選択
+                lang = 'jpn+eng' if likely_japanese else 'eng'
                 try:
-                    page = doc[page_num]
-                    pix = page.get_pixmap(matrix=matrix, alpha=False)
-                    image = Image.open(io.BytesIO(pix.tobytes("png")))
+                    text = pytesseract.image_to_string(image, lang=lang, config=ocr_config).strip()
+                except pytesseract.TesseractError:
+                    # 言語データが無い場合は英語のみで再試行
+                    text = pytesseract.image_to_string(image, lang='eng', config=ocr_config).strip()
 
-                    # グレースケール化（OCR精度向上・高速化）
-                    if image.mode not in ('L', '1'):
-                        image = image.convert('L')
-
-                    # 日本語優先 or 英語優先で言語を選択
-                    lang = 'jpn+eng' if likely_japanese else 'eng'
+                # 英語で結果が不十分なら日本語も試行
+                if len(text) < 5 and not likely_japanese:
                     try:
-                        text = pytesseract.image_to_string(image, lang=lang, config=ocr_config).strip()
+                        jp_text = pytesseract.image_to_string(image, lang='jpn', config=ocr_config).strip()
+                        if len(jp_text) > len(text):
+                            text = jp_text
                     except pytesseract.TesseractError:
-                        # 言語データが無い場合は英語のみで再試行
-                        text = pytesseract.image_to_string(image, lang='eng', config=ocr_config).strip()
+                        pass
 
-                    # 英語で結果が不十分なら日本語も試行
-                    if len(text) < 5 and not likely_japanese:
-                        try:
-                            jp_text = pytesseract.image_to_string(image, lang='jpn', config=ocr_config).strip()
-                            if len(jp_text) > len(text):
-                                text = jp_text
-                        except pytesseract.TesseractError:
-                            pass
+                return ' '.join(text.split())
 
-                    text = ' '.join(text.split())
-                    if len(text) >= 2:
-                        results[page_num] = text
-                except Exception as page_error:
-                    debug_logger.warning(f"PDF OCRページ {page_num} エラー: {page_error}")
-                    continue
+            # 🚀 並列OCR（テキスト抽出と同じ最大4スレッド）＋ページ単位タイムアウトでハング防止
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(ocr_single_page, p): p for p in target_pages}
+                for future in as_completed(futures):
+                    page_num = futures[future]
+                    try:
+                        text = future.result(timeout=30.0)  # 1ページ最大30秒
+                        if len(text) >= 2:
+                            results[page_num] = text
+                    except Exception as page_error:
+                        debug_logger.warning(f"PDF OCRページ {page_num} エラー: {page_error}")
+                        continue
 
             if results:
                 ocr_chars = sum(len(t) for t in results.values())

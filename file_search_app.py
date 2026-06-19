@@ -3786,7 +3786,10 @@ class UltraFastFullCompliantSearchSystem:
                 # 🚀 ページ数に応じた処理戦略
                 total_pages = doc.page_count
                 max_pages = min(total_pages, 200)  # 最大200ページ（500→200で高速化）
-                
+
+                # ページ番号 -> 抽出テキスト（テキスト層が無いページの検出に使用）
+                page_texts = {}
+
                 # 🚀 並列処理でページ抽出（10ページ以上の場合）
                 if max_pages >= 10:
                     def extract_single_page(page_num: int) -> str:
@@ -3807,21 +3810,20 @@ class UltraFastFullCompliantSearchSystem:
                         except Exception as e:
                             debug_logger.warning(f"ページ{page_num}抽出エラー: {e}")
                             return ""
-                    
+
                     # 🚀 並列ページ抽出（最大4スレッド）
-                    content = []
                     with ThreadPoolExecutor(max_workers=4) as executor:
                         futures = {executor.submit(extract_single_page, i): i for i in range(max_pages)}
                         for future in as_completed(futures):
+                            page_num = futures[future]
                             try:
                                 page_text = future.result(timeout=5.0)  # 5秒タイムアウト
                                 if page_text:
-                                    content.append(page_text)
+                                    page_texts[page_num] = page_text
                             except Exception:
                                 continue
                 else:
                     # 少ないページは従来の同期処理
-                    content = []
                     for page_num in range(max_pages):
                         try:
                             page = doc[page_num]
@@ -3829,12 +3831,25 @@ class UltraFastFullCompliantSearchSystem:
                             if page_text and page_text.strip():
                                 normalized = ' '.join(page_text.split())
                                 if len(normalized) > 0:
-                                    content.append(normalized)
+                                    page_texts[page_num] = normalized
                         except Exception as page_error:
                             debug_logger.warning(f"PDFページ {page_num} 読み取りエラー: {page_error}")
                             continue
 
+                # 🔥 OCRフォールバック: テキスト層が無い（=スキャン）ページを画像化してOCR
+                # テキストがほとんど取れなかったページを対象にする
+                ocr_target_pages = [p for p in range(max_pages)
+                                    if len(page_texts.get(p, "")) < 10]
+                if ocr_target_pages:
+                    ocr_results = self._ocr_pdf_pages(doc, ocr_target_pages, file_path)
+                    for page_num, ocr_text in ocr_results.items():
+                        if ocr_text:
+                            page_texts[page_num] = ocr_text
+
                 doc.close()
+
+                # ページ順に結合
+                content = [page_texts[p] for p in sorted(page_texts.keys())]
                 extracted_text = ' '.join(content)
                 
                 # 正規化処理を適用
@@ -3886,6 +3901,91 @@ class UltraFastFullCompliantSearchSystem:
         except Exception as e:
             print(f"⚠️ PDF抽出エラー: {e}")
             return ""
+
+    def _ocr_pdf_pages(self, doc, page_nums, file_path: str) -> dict:
+        """テキスト層の無いPDFページを画像化してOCR抽出
+
+        スキャン（画像ベース）PDF対応。各ページをPyMuPDFでレンダリングし、
+        pytesseractでテキスト抽出する。
+        戻り値: {ページ番号: 抽出テキスト}
+        """
+        results = {}
+        try:
+            # OCRライブラリの利用可能性チェック
+            if not PIL_AVAILABLE or not TESSERACT_AVAILABLE:
+                debug_logger.debug("PDF OCRフォールバック: OCRライブラリ未導入のためスキップ")
+                return results
+
+            try:
+                pytesseract.get_tesseract_version()
+            except pytesseract.TesseractNotFoundError:
+                debug_logger.debug("PDF OCRフォールバック: Tesseract未導入のためスキップ")
+                return results
+
+            import io
+            import fitz
+
+            # 処理過多防止: OCR対象ページ数を制限（速度優先）
+            max_ocr_pages = 30
+            target_pages = list(page_nums)[:max_ocr_pages]
+            if len(page_nums) > max_ocr_pages:
+                debug_logger.debug(
+                    f"PDF OCR対象ページを{max_ocr_pages}ページに制限: {os.path.basename(file_path)}")
+
+            # ファイル名から日本語の可能性を判定（言語選択の最適化）
+            filename_lower = os.path.basename(file_path).lower()
+            likely_japanese = any(hint in filename_lower
+                                  for hint in ['日本語', 'japanese', 'jpn', '図面', '設計', '報告', '議事'])
+
+            # 200dpi相当（72dpi * 約2.78）でレンダリング（OCR精度と速度のバランス）
+            zoom = 2.0
+            matrix = fitz.Matrix(zoom, zoom)
+
+            ocr_config = '--oem 1 --psm 6'
+
+            for page_num in target_pages:
+                try:
+                    page = doc[page_num]
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)
+                    image = Image.open(io.BytesIO(pix.tobytes("png")))
+
+                    # グレースケール化（OCR精度向上・高速化）
+                    if image.mode not in ('L', '1'):
+                        image = image.convert('L')
+
+                    # 日本語優先 or 英語優先で言語を選択
+                    lang = 'jpn+eng' if likely_japanese else 'eng'
+                    try:
+                        text = pytesseract.image_to_string(image, lang=lang, config=ocr_config).strip()
+                    except pytesseract.TesseractError:
+                        # 言語データが無い場合は英語のみで再試行
+                        text = pytesseract.image_to_string(image, lang='eng', config=ocr_config).strip()
+
+                    # 英語で結果が不十分なら日本語も試行
+                    if len(text) < 5 and not likely_japanese:
+                        try:
+                            jp_text = pytesseract.image_to_string(image, lang='jpn', config=ocr_config).strip()
+                            if len(jp_text) > len(text):
+                                text = jp_text
+                        except pytesseract.TesseractError:
+                            pass
+
+                    text = ' '.join(text.split())
+                    if len(text) >= 2:
+                        results[page_num] = text
+                except Exception as page_error:
+                    debug_logger.warning(f"PDF OCRページ {page_num} エラー: {page_error}")
+                    continue
+
+            if results:
+                ocr_chars = sum(len(t) for t in results.values())
+                print(f"✅ PDF OCRフォールバック成功 ({os.path.basename(file_path)}): "
+                      f"{len(results)}ページ / {ocr_chars}文字")
+
+        except Exception as e:
+            debug_logger.warning(f"PDF OCRフォールバックエラー ({os.path.basename(file_path)}): {e}")
+
+        return results
 
     def _extract_image_content(self, file_path: str) -> str:
         """.tifファイルからOCRでテキスト抽出（超高速最適化版・キャッシュ強化）"""

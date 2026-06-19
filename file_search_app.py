@@ -1343,6 +1343,12 @@ class UltraFastFullCompliantSearchSystem:
         self._complete_buffer_lock = threading.Lock()
         self._complete_buffer_max = 200
         self._complete_flush_timer = None
+        # 一括インデックス中フラグ（True の間は即座層/高速層をスキップしスループット優先）
+        self._bulk_indexing = False
+        # 完全層への書き込みを1スレッドに直列化する専用Executor（EXCLUSIVE競合を回避）
+        self._flush_executor = None
+        # 書き込みが抽出に追いつかない時のバックプレッシャ（保留バッチ数を上限4に制限しメモリ膨張を防ぐ）
+        self._flush_semaphore = threading.BoundedSemaphore(4)
         self.new_files_buffer = []  # 新規ファイル一時保存
         self.max_buffer_size = 200  # バッファサイズを倍増
         self.incremental_scan_interval = 10  # 10秒に短縮（より頻繁にスキャン）
@@ -2683,55 +2689,7 @@ class UltraFastFullCompliantSearchSystem:
             file_hash = hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
             debug_logger.debug(f"ハッシュ計算完了: {file_hash[:8]}...")
 
-            # 🆕 3層構造最適化: 重複削除と役割明確化
-            # Phase 1: 即座層（検索キャッシュ専用 - 短時間のみ保持）
-            debug_logger.debug("即座層への一時追加開始")
-            
-            # UTF-8対応の安全な文字列切り取り処理
-            def safe_truncate_utf8(text: str, max_length: int) -> str:
-                """UTF-8文字列を安全に切り取る（日本語対応）"""
-                if len(text) <= max_length:
-                    return text
-                # 文字境界で安全に切り取り
-                truncated = text[:max_length]
-                # 最後の文字が不完全な場合は1文字削る
-                try:
-                    truncated.encode('utf-8')
-                    return truncated
-                except UnicodeEncodeError:
-                    return text[:max_length-1] if max_length > 1 else ""
-            
-            immediate_data = {
-                'file_path': str(file_path),
-                'file_name': file_path_obj.name,
-                'content_preview': safe_truncate_utf8(content, 500),  # UTF-8対応安全切り取り
-                'file_type': file_path_obj.suffix.lower(),
-                'size': file_size,
-                'indexed_time': time.time(),
-                'layer': 'immediate'
-            }
-
-            # 即座層は一時的なキャッシュのみ（重複削除）
-            self.immediate_cache[str(file_path)] = immediate_data
-            debug_logger.debug(f"即座層一時追加完了: {file_path}")
-
-            # キャッシュサイズ制限（最大パフォーマンス版）
-            if len(self.immediate_cache) > self.max_immediate_cache:
-                # 効率的なクリーンアップ（一度に複数削除）
-                cleanup_count = max(1, self.max_immediate_cache // 10)  # 10%削除
-                sorted_items = sorted(self.immediate_cache.items(),
-                                    key=lambda x: x[1]['indexed_time'])
-                
-                for i in range(cleanup_count):
-                    if i < len(sorted_items):
-                        oldest_key = sorted_items[i][0]
-                        del self.immediate_cache[oldest_key]
-                
-                debug_logger.debug(f"即座層バッチクリーンアップ: {cleanup_count}件削除")            # Phase 2: 高速層へ即時移動（即座層から移動・インメモリで軽量・即検索可能）
-            #   従来はファイル毎に Timer を生成していたが、スレッド乱立を避けるため同期実行。
-            self._move_to_hot_layer(file_path, content)
-
-            # Phase 3: 完全層(DB)へはバッチ書き込み（Timer乱立を避けバルクインサートを活用）
+            # 🆕 3層構造最適化
             base_data = {
                 'file_name': file_path_obj.name,
                 'file_type': file_path_obj.suffix.lower(),
@@ -2739,7 +2697,44 @@ class UltraFastFullCompliantSearchSystem:
                 'indexed_time': time.time(),
                 'modified_time': modified_time,
             }
-            self._enqueue_complete_layer(file_path, content, base_data, file_hash)
+
+            if getattr(self, '_bulk_indexing', False):
+                # 🚀 一括インデックス中はスループット最優先:
+                #   即座層/高速層への per-file 登録（文字列スライス・dict操作・
+                #   サイズ超過時のO(n)整理）を省略し、完全層へ直接バッチ書き込みする。
+                #   検索は完全層(数百ms〜2秒ごとにフラッシュ)で対応できる。
+                self._enqueue_complete_layer(file_path, content, base_data, file_hash)
+            else:
+                # ライブ(単発)インデックス: 即時検索性のため即座層・高速層にも登録
+                def safe_truncate_utf8(text: str, max_length: int) -> str:
+                    if len(text) <= max_length:
+                        return text
+                    truncated = text[:max_length]
+                    try:
+                        truncated.encode('utf-8')
+                        return truncated
+                    except UnicodeEncodeError:
+                        return text[:max_length - 1] if max_length > 1 else ""
+
+                self.immediate_cache[str(file_path)] = {
+                    'file_path': str(file_path),
+                    'file_name': file_path_obj.name,
+                    'content_preview': safe_truncate_utf8(content, 500),
+                    'file_type': file_path_obj.suffix.lower(),
+                    'size': file_size,
+                    'indexed_time': time.time(),
+                    'layer': 'immediate'
+                }
+                if len(self.immediate_cache) > self.max_immediate_cache:
+                    cleanup_count = max(1, self.max_immediate_cache // 10)
+                    sorted_items = sorted(self.immediate_cache.items(),
+                                          key=lambda x: x[1]['indexed_time'])
+                    for i in range(cleanup_count):
+                        if i < len(sorted_items):
+                            del self.immediate_cache[sorted_items[i][0]]
+
+                self._move_to_hot_layer(file_path, content)
+                self._enqueue_complete_layer(file_path, content, base_data, file_hash)
 
             self.stats["indexed_files"] += 1
             # 差分インデックス用キャッシュを更新（次回以降の再インデックスでスキップ判定に使う）
@@ -2805,54 +2800,20 @@ class UltraFastFullCompliantSearchSystem:
             print(f"⚠️ 高速層移動エラー: {e}")
             debug_logger.error(f"高速層移動エラー: {e}")
 
-    def _enqueue_complete_layer(self, file_path: str, content: str,
-                                base_data: Dict[str, Any], file_hash: str):
-        """完全層(DB)書き込みをバッファに積む。一定件数でバルクフラッシュする。
+    def _get_flush_executor(self):
+        """完全層書き込み専用の単一ワーカーExecutorを取得。
 
-        ファイル毎にTimerで単発INSERTする旧方式を廃し、_bulk_add_to_complete_layer
-        によるバルクインサート（高速）でまとめて永続化する。
+        DB書き込みを1スレッドに直列化することで、多数のワーカースレッドが
+        同じDBに対して BEGIN EXCLUSIVE で奪い合うロック競合を防ぎ、かつ
+        ワーカースレッドをDB書き込みでブロックさせない（抽出に専念させる）。
         """
-        flush_now = False
-        with self._complete_buffer_lock:
-            self._complete_buffer.append({
-                'file_path': file_path,
-                'content': content,
-                'base_data': base_data,
-                'file_hash': file_hash,
-            })
-            if len(self._complete_buffer) >= self._complete_buffer_max:
-                flush_now = True
-        if flush_now:
-            self.flush_complete_buffer()
-        else:
-            self._schedule_complete_flush()
+        if self._flush_executor is None:
+            self._flush_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='complete-flush')
+        return self._flush_executor
 
-    def _schedule_complete_flush(self):
-        """完全層バッファのフラッシュを一度だけ予約（Timerは常に最大1個）。"""
-        with self._complete_buffer_lock:
-            if self._complete_flush_timer is not None:
-                return
-            if getattr(self, 'shutdown_requested', False):
-                return
-            timer = threading.Timer(2.0, self.flush_complete_buffer)
-            self._complete_flush_timer = timer
-            try:
-                self._background_threads.append(timer)
-            except Exception:
-                pass
-        timer.start()
-
-    def flush_complete_buffer(self):
-        """バッファ中の完全層書き込みをバルクインサートで一括永続化する。"""
-        with self._complete_buffer_lock:
-            batch = self._complete_buffer
-            self._complete_buffer = []
-            if self._complete_flush_timer is not None:
-                try:
-                    self._complete_flush_timer.cancel()
-                except Exception:
-                    pass
-                self._complete_flush_timer = None
+    def _flush_batch(self, batch: List[Dict[str, Any]]):
+        """バッチを完全層へバルクインサート（書き込み専用スレッドで実行）。"""
         if not batch:
             return
         try:
@@ -2862,6 +2823,111 @@ class UltraFastFullCompliantSearchSystem:
         except Exception as e:
             debug_logger.error(f"完全層バッチフラッシュエラー: {e}")
             print(f"⚠️ 完全層バッチフラッシュエラー: {e}")
+
+    def _run_flush_batch(self, batch: List[Dict[str, Any]]):
+        """非同期フラッシュ実行ラッパ（完了時にバックプレッシャ用セマフォを解放）。"""
+        try:
+            self._flush_batch(batch)
+        finally:
+            try:
+                self._flush_semaphore.release()
+            except Exception:
+                pass
+
+    def _submit_flush(self, batch: List[Dict[str, Any]]):
+        """バッチを書き込み専用スレッドへ投入。保留が上限なら呼び出し側を待たせて抑制する。"""
+        if not batch:
+            return
+        # 保留バッチが上限に達していれば acquire がブロック→抽出スレッドに自然なバックプレッシャ
+        self._flush_semaphore.acquire()
+        try:
+            self._get_flush_executor().submit(self._run_flush_batch, batch)
+        except Exception:
+            # 投入失敗時はセマフォを戻し同期実行でフォールバック
+            try:
+                self._flush_semaphore.release()
+            except Exception:
+                pass
+            self._flush_batch(batch)
+
+    def _enqueue_complete_layer(self, file_path: str, content: str,
+                                base_data: Dict[str, Any], file_hash: str):
+        """完全層(DB)書き込みをバッファに積み、一定件数で書き込み専用スレッドへ非同期フラッシュ。
+
+        ファイル毎にTimerで単発INSERTする旧方式を廃し、バルクインサートでまとめて
+        永続化する。フラッシュは単一ワーカーで直列実行するためワーカースレッドは
+        ブロックされず、DBロック競合も起きない。
+        """
+        batch = None
+        with self._complete_buffer_lock:
+            self._complete_buffer.append({
+                'file_path': file_path,
+                'content': content,
+                'base_data': base_data,
+                'file_hash': file_hash,
+            })
+            if len(self._complete_buffer) >= self._complete_buffer_max:
+                batch = self._complete_buffer
+                self._complete_buffer = []
+                if self._complete_flush_timer is not None:
+                    try:
+                        self._complete_flush_timer.cancel()
+                    except Exception:
+                        pass
+                    self._complete_flush_timer = None
+        if batch is not None:
+            self._submit_flush(batch)
+        else:
+            self._schedule_complete_flush()
+
+    def _schedule_complete_flush(self):
+        """完全層バッファの遅延フラッシュを一度だけ予約（Timerは常に最大1個）。"""
+        with self._complete_buffer_lock:
+            if self._complete_flush_timer is not None:
+                return
+            if getattr(self, 'shutdown_requested', False):
+                return
+            timer = threading.Timer(2.0, self._timed_flush)
+            self._complete_flush_timer = timer
+            try:
+                self._background_threads.append(timer)
+            except Exception:
+                pass
+        timer.start()
+
+    def _timed_flush(self):
+        """遅延タイマーによる部分バッファのフラッシュ（書き込み専用スレッドへ非同期投入）。"""
+        with self._complete_buffer_lock:
+            self._complete_flush_timer = None
+            batch = self._complete_buffer
+            self._complete_buffer = []
+        if batch:
+            self._submit_flush(batch)
+
+    def flush_complete_buffer(self):
+        """残りのバッファを書き込み、保留中の非同期フラッシュも完了まで待機する（最終フラッシュ用）。"""
+        with self._complete_buffer_lock:
+            batch = self._complete_buffer
+            self._complete_buffer = []
+            if self._complete_flush_timer is not None:
+                try:
+                    self._complete_flush_timer.cancel()
+                except Exception:
+                    pass
+                self._complete_flush_timer = None
+            ex = self._flush_executor
+        if batch:
+            if ex is not None:
+                self._submit_flush(batch)
+            else:
+                self._flush_batch(batch)
+        # 保留中の書き込みをすべて完了させてからExecutorを破棄（次回インデックスで再作成）
+        if ex is not None:
+            try:
+                ex.shutdown(wait=True)
+            except Exception:
+                pass
+            self._flush_executor = None
 
     def _move_to_complete_layer(self, file_path: str, content: str, file_hash: str):
         """🔄 完全層移動（高速層から移動 - 重複削除）"""
@@ -4740,6 +4806,8 @@ class UltraFastFullCompliantSearchSystem:
         # インデックス状態設定
         self.indexing_in_progress = True
         self.indexing_results_ready = False
+        # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
+        self._bulk_indexing = True
         
         print(f"⚡ 最適化バルクインデックス開始: {directory}")
         
@@ -5269,7 +5337,8 @@ class UltraFastFullCompliantSearchSystem:
                 self.batch_size = original_batch_size
                 print(f"🔄 バッチサイズ復元: {self.batch_size}")
 
-            # 完全層バッファに残ったファイルを最終フラッシュ（バルク書き込み）
+            # 一括インデックスモード解除＋完全層バッファの最終フラッシュ（バルク書き込み）
+            self._bulk_indexing = False
             try:
                 self.flush_complete_buffer()
             except Exception as flush_err:
@@ -6661,8 +6730,19 @@ class UltraFastCompliantUI:
                     except tk.TclError:
                         return
 
+        # 既にバックグラウンド統計取得が走っている場合は重複起動しない（スレッド累積防止）
+        if getattr(self, '_complete_stats_in_flight', False):
+            return
+        self._complete_stats_in_flight = True
+
+        def _runner():
+            try:
+                background_stats_update()
+            finally:
+                self._complete_stats_in_flight = False
+
         # バックグラウンドスレッドで実行
-        threading.Thread(target=background_stats_update, daemon=True).start()
+        threading.Thread(target=_runner, daemon=True).start()
 
     def _update_ui_with_complete_stats(self, complete_count: int, indexing_status: str):
         """完全層統計でUIを更新"""
@@ -6704,20 +6784,21 @@ class UltraFastCompliantUI:
             self.stats_label.config(text="UI更新エラー")
 
     def periodic_update(self):
-        """定期更新処理（UI応答性重視版）"""
+        """定期更新処理（インデックス中も3層レイヤー状況を更新）"""
         try:
-            # UI応答性チェック：重い処理中は統計更新をスキップ
-            if hasattr(self, 'bulk_indexing_active') and self.bulk_indexing_active:
-                print("🔄 インデックス中のため統計更新をスキップ")
-            else:
-                # 軽量統計更新のみ実行
-                self._lightweight_statistics_update()
-                
+            # インデックス中こそ層の状況が動くので、必ず更新する（軽量処理のみ）
+            self._lightweight_statistics_update()
         except Exception as e:
             logging.error(f"定期更新エラー: {e}")
         finally:
-            # 次回更新をスケジュール（UI応答性重視で8秒間隔）
-            self.root.after(8000, self.periodic_update)
+            # インデックス中はこまめに（1.5秒）、通常時は省電力で長め（8秒）に再スケジュール
+            indexing = (getattr(self.search_system, 'indexing_in_progress', False)
+                        or getattr(self, 'bulk_indexing_active', False))
+            interval = 1500 if indexing else 8000
+            try:
+                self.root.after(interval, self.periodic_update)
+            except Exception:
+                pass
     
     def _lightweight_statistics_update(self):
         """軽量統計更新（UI応答性重視版）"""
@@ -6729,13 +6810,17 @@ class UltraFastCompliantUI:
             # 即座層・高速層ラベル更新
             self.immediate_label.config(text=f"{immediate_count:,} ファイル")
             self.hot_label.config(text=f"{hot_count:,} ファイル")
-            
+
             # インデックス状況表示（軽量版）
             indexing_status = ""
             if self.search_system.indexing_in_progress:
                 indexing_status = " | ⚡ インデックス中"
             elif hasattr(self, 'bulk_indexing_active') and self.bulk_indexing_active:
                 indexing_status = " | 🚀 大容量インデックス中"
+
+            # 完全層(実ファイル数=緑ラベル)もバックグラウンドで更新する。
+            # 従来は完全層ラベルが定期更新されず「0 ファイル」のまま動かなかった。
+            self._update_complete_layer_stats_async(indexing_status)
             
             # 軽量統計表示
             parallel_info = f" | 並列: {getattr(self.search_system, 'optimal_threads', 8)}スレッド"
@@ -9032,6 +9117,9 @@ class UltraFastCompliantUI:
             except Exception as mtime_load_error:
                 print(f"⚠️ 差分インデックス用mtime読み込みスキップ: {mtime_load_error}")
 
+            # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
+            self.search_system._bulk_indexing = True
+
             # UI応答性を確保するための高頻度チェック
             self._ui_update_counter = 0
             self._last_ui_update = time.time()
@@ -9163,25 +9251,28 @@ class UltraFastCompliantUI:
                 system_load = self._cached_system_load
                 current_db_count = getattr(self.search_system, 'db_count', 8)
                 
-                # UI応答性重視の並列度設定（無限ループ防止）
+                # 並列度設定（抽出はI/O・C拡張中心でGILを解放するため高並列が有効）。
+                # DB書き込みは専用1スレッドに集約済みのため、抽出スレッドは多くしてよい。
+                cpu = max(4, getattr(self.search_system, 'optimal_threads', current_db_count))
                 if file_category == "heavy":
-                    optimal_workers = 2  # 重いファイルは2並列（100%増強）
+                    # 重いファイルはメモリ・CPU負荷が大きいので控えめ
+                    optimal_workers = 2 if system_load > 0.8 else 4
                 elif file_category == "medium":
                     # システム負荷に応じて動的調整
                     if system_load > 0.9:
-                        optimal_workers = 2
+                        optimal_workers = max(4, cpu)
                     elif system_load > 0.7:
-                        optimal_workers = 4
+                        optimal_workers = max(8, cpu * 2)
                     else:
-                        optimal_workers = max(2, current_db_count // 4)
+                        optimal_workers = max(16, cpu * 3)
                 else:
-                    # 軽量ファイルでもUI応答性重視
+                    # 軽量ファイル: 小さなテキスト/Office中心でI/O律速。高並列で稼ぐ
                     if system_load > 0.8:
-                        optimal_workers = max(2, current_db_count // 6)
+                        optimal_workers = max(8, cpu * 2)
                     elif system_load > 0.6:
-                        optimal_workers = max(4, current_db_count // 3)
+                        optimal_workers = max(16, cpu * 4)
                     else:
-                        optimal_workers = max(8, current_db_count)
+                        optimal_workers = max(32, cpu * 6)
                 
                 # 超極限並列数制限（2000ファイル/秒目標達成）
                 if system_load < 0.3:
@@ -9274,7 +9365,8 @@ class UltraFastCompliantUI:
                     progress_pct = (total_processed / total_files) * 100
                     safe_ui_update(f"処理中: {total_processed:,}/{total_files:,} ({progress_pct:.1f}%)")
             
-            # 完全層バッファに残ったファイルを最終フラッシュ（バルク書き込み）
+            # 一括インデックスモード解除＋完全層バッファの最終フラッシュ（バルク書き込み）
+            self.search_system._bulk_indexing = False
             try:
                 self.search_system.flush_complete_buffer()
             except Exception as flush_err:

@@ -6661,8 +6661,19 @@ class UltraFastCompliantUI:
                     except tk.TclError:
                         return
 
+        # 既にバックグラウンド統計取得が走っている場合は重複起動しない（スレッド累積防止）
+        if getattr(self, '_complete_stats_in_flight', False):
+            return
+        self._complete_stats_in_flight = True
+
+        def _runner():
+            try:
+                background_stats_update()
+            finally:
+                self._complete_stats_in_flight = False
+
         # バックグラウンドスレッドで実行
-        threading.Thread(target=background_stats_update, daemon=True).start()
+        threading.Thread(target=_runner, daemon=True).start()
 
     def _update_ui_with_complete_stats(self, complete_count: int, indexing_status: str):
         """完全層統計でUIを更新"""
@@ -6704,20 +6715,21 @@ class UltraFastCompliantUI:
             self.stats_label.config(text="UI更新エラー")
 
     def periodic_update(self):
-        """定期更新処理（UI応答性重視版）"""
+        """定期更新処理（インデックス中も3層レイヤー状況を更新）"""
         try:
-            # UI応答性チェック：重い処理中は統計更新をスキップ
-            if hasattr(self, 'bulk_indexing_active') and self.bulk_indexing_active:
-                print("🔄 インデックス中のため統計更新をスキップ")
-            else:
-                # 軽量統計更新のみ実行
-                self._lightweight_statistics_update()
-                
+            # インデックス中こそ層の状況が動くので、必ず更新する（軽量処理のみ）
+            self._lightweight_statistics_update()
         except Exception as e:
             logging.error(f"定期更新エラー: {e}")
         finally:
-            # 次回更新をスケジュール（UI応答性重視で8秒間隔）
-            self.root.after(8000, self.periodic_update)
+            # インデックス中はこまめに（1.5秒）、通常時は省電力で長め（8秒）に再スケジュール
+            indexing = (getattr(self.search_system, 'indexing_in_progress', False)
+                        or getattr(self, 'bulk_indexing_active', False))
+            interval = 1500 if indexing else 8000
+            try:
+                self.root.after(interval, self.periodic_update)
+            except Exception:
+                pass
     
     def _lightweight_statistics_update(self):
         """軽量統計更新（UI応答性重視版）"""
@@ -6729,13 +6741,17 @@ class UltraFastCompliantUI:
             # 即座層・高速層ラベル更新
             self.immediate_label.config(text=f"{immediate_count:,} ファイル")
             self.hot_label.config(text=f"{hot_count:,} ファイル")
-            
+
             # インデックス状況表示（軽量版）
             indexing_status = ""
             if self.search_system.indexing_in_progress:
                 indexing_status = " | ⚡ インデックス中"
             elif hasattr(self, 'bulk_indexing_active') and self.bulk_indexing_active:
                 indexing_status = " | 🚀 大容量インデックス中"
+
+            # 完全層(実ファイル数=緑ラベル)もバックグラウンドで更新する。
+            # 従来は完全層ラベルが定期更新されず「0 ファイル」のまま動かなかった。
+            self._update_complete_layer_stats_async(indexing_status)
             
             # 軽量統計表示
             parallel_info = f" | 並列: {getattr(self.search_system, 'optimal_threads', 8)}スレッド"

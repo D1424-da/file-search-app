@@ -1326,6 +1326,10 @@ class UltraFastFullCompliantSearchSystem:
         self.incremental_indexing_enabled = True
         self.last_full_scan_time = 0
         self.indexed_files_registry = {}  # {file_path: last_modified_time}
+        # 🚀 差分インデックス用キャッシュ: {file_path: modified_time}
+        # 既にインデックス済みで未更新のファイルを再抽出せずスキップし、再インデックスを高速化する
+        self._index_mtime_cache: Dict[str, float] = {}
+        self._index_mtime_lock = threading.Lock()
         self.new_files_buffer = []  # 新規ファイル一時保存
         self.max_buffer_size = 200  # バッファサイズを倍増
         self.incremental_scan_interval = 10  # 10秒に短縮（より頻繁にスキャン）
@@ -2548,6 +2552,31 @@ class UltraFastFullCompliantSearchSystem:
 
         return unique_results
 
+    def _load_index_mtime_cache(self):
+        """差分インデックス用に、全DBの (file_path -> modified_time) をメモリへ読み込む。
+
+        一括インデックス開始時に呼び出す。既存DBの最終更新時刻を一括ロードしておき、
+        未更新ファイルを再抽出せずスキップできるようにする（再インデックスを大幅高速化）。
+        """
+        cache = {}
+        for db_path in self.complete_db_paths:
+            try:
+                if not os.path.exists(db_path):
+                    continue
+                conn = sqlite3.connect(str(db_path), timeout=30.0)
+                try:
+                    cur = conn.execute('SELECT file_path, modified_time FROM documents')
+                    for fp, mt in cur.fetchall():
+                        if fp is not None and mt is not None:
+                            cache[fp] = mt
+                finally:
+                    conn.close()
+            except Exception as e:
+                debug_logger.warning(f"差分インデックス用mtime読み込みエラー {db_path}: {e}")
+        with self._index_mtime_lock:
+            self._index_mtime_cache = cache
+        print(f"🗂️ 差分インデックス: 既存 {len(cache):,} 件の更新時刻を読み込み（未更新はスキップ）")
+
     def live_progressive_index_file(self, file_path: str) -> bool:
         """ライブプログレッシブファイルインデックス（デバッグログ強化）"""
         debug_logger.debug(f"インデックス開始: {file_path}")
@@ -2586,6 +2615,13 @@ class UltraFastFullCompliantSearchSystem:
             modified_time = stat.st_mtime
 
             debug_logger.debug(f"ファイル情報 - サイズ: {file_size}, 更新時刻: {modified_time}")
+
+            # 🚀 差分インデックス: 既にインデックス済みで更新時刻が一致するならスキップ
+            #   （本文抽出という最も重い処理を丸ごと省き、再インデックスを高速化）
+            cached_mtime = self._index_mtime_cache.get(file_path)
+            if cached_mtime is not None and abs(cached_mtime - modified_time) <= 1.0:
+                debug_logger.debug(f"未更新のため差分スキップ: {file_path}")
+                return True
 
             # 🔥 大容量ファイルの早期スキップ（500MB以上）
             if file_size > 500 * 1024 * 1024:
@@ -2664,6 +2700,9 @@ class UltraFastFullCompliantSearchSystem:
                             args=[file_path, content, file_hash]).start()
 
             self.stats["indexed_files"] += 1
+            # 差分インデックス用キャッシュを更新（次回以降の再インデックスでスキップ判定に使う）
+            with self._index_mtime_lock:
+                self._index_mtime_cache[file_path] = modified_time
             debug_logger.info(f"3層構造最適化インデックス完了: {file_path}")
             return True
 
@@ -4588,7 +4627,13 @@ class UltraFastFullCompliantSearchSystem:
 
         start_time = time.time()
         directory_path = Path(directory)
-        
+
+        # 🚀 差分インデックス: 既存DBの更新時刻を読み込み、未更新ファイルをスキップする
+        try:
+            self._load_index_mtime_cache()
+        except Exception as mtime_load_error:
+            debug_logger.warning(f"差分インデックス用mtime読み込みスキップ: {mtime_load_error}")
+
         # インデックス状態設定
         self.indexing_in_progress = True
         self.indexing_results_ready = False
@@ -6783,29 +6828,51 @@ class UltraFastCompliantUI:
             debug_logger.info("🔍 [INTEGRATED_COMPLETE] 統合ハイライト処理完了")
 
     def _highlight_selected_result_safe(self, item_id):
-        """安全な検索結果行ハイライト表示（統合版）"""
+        """検索結果行を確実・目立つ形でハイライト（永続・自動スクロール版）。
+
+        従来は2秒で色が戻り「対象が分かりにくい」状態だった。次に別の行を
+        ダブルクリックするまでハイライトを保持し、選択・フォーカス・スクロールも
+        行って対象ファイルを目立たせる。
+        """
         try:
-            # 元の背景色を保存
-            original_tags = self.results_tree.item(item_id, 'tags')
-            
-            # ハイライト用のタグを設定
-            self.results_tree.tag_configure('highlight', background='#FFD700', foreground='#000000')  # 金色でハイライト
-            self.results_tree.item(item_id, tags=['highlight'])
-            
-            print("✨ 検索結果行をハイライト表示しました")
-            
-            # 2秒後に元の色に戻す（安全版）
-            def restore_color_safe():
+            tree = self.results_tree
+
+            # 直前のハイライト行を元のタグに戻す（1行だけを強調状態に保つ）
+            prev = getattr(self, '_highlighted_item', None)
+            if prev and prev != item_id:
                 try:
-                    if hasattr(self, 'results_tree') and self.results_tree.winfo_exists():
-                        # アイテムが存在するかチェック
-                        if item_id in self.results_tree.get_children():
-                            self.results_tree.item(item_id, tags=original_tags)
-                except Exception as restore_error:
-                    print(f"⚠️ 色復元処理エラー: {restore_error}")
-                    
-            self.root.after(2000, restore_color_safe)
-            
+                    if prev in tree.get_children():
+                        tree.item(prev, tags=getattr(self, '_highlighted_item_orig_tags', ()))
+                except Exception:
+                    pass
+
+            # 今回の行の元タグを保存（後で復元できるように）
+            self._highlighted_item_orig_tags = tree.item(item_id, 'tags')
+
+            # 目立つ濃いオレンジ＋白字＋太字でハイライト
+            tree.tag_configure('highlight', background='#FF6D00', foreground='#FFFFFF')
+            try:
+                # 太字フォント（環境にフォントが無い場合も例外で無視）
+                import tkinter.font as tkfont
+                base_font = tkfont.nametofont("TkDefaultFont")
+                bold_font = (base_font.actual('family'), base_font.actual('size'), 'bold')
+                tree.tag_configure('highlight', font=bold_font)
+            except Exception:
+                pass
+
+            tree.item(item_id, tags=['highlight'])
+
+            # 選択・フォーカス・スクロールで対象を確実に画面内に出す
+            try:
+                tree.selection_set(item_id)
+                tree.focus(item_id)
+                tree.see(item_id)
+            except Exception:
+                pass
+
+            self._highlighted_item = item_id
+            print("✨ 検索結果行をハイライト表示しました（永続）")
+
         except Exception as e:
             print(f"⚠️ 検索結果ハイライト表示エラー: {e}")
     
@@ -6992,6 +7059,45 @@ class UltraFastCompliantUI:
             messagebox.showerror("エラー", f"ファイルを開けませんでした: {e}")
             debug_logger.error(f"ファイル開く処理エラー: {e}")
 
+    def _shell_select_file(self, file_path: str) -> bool:
+        """Windows Shell API でフォルダを開き対象ファイルを確実に選択（ハイライト）する。
+
+        SHOpenFolderAndSelectItems は、対象フォルダのExplorerウィンドウが既に
+        開いている場合でも確実にファイルを選択状態にするため、explorer /select の
+        「選択されないことがある」不安定さを解消できる。
+        Windows以外・呼び出し失敗時は False を返し、呼び出し側でフォールバックする。
+        """
+        try:
+            import ctypes
+        except Exception:
+            return False
+        if os.name != 'nt':
+            return False
+        try:
+            shell32 = ctypes.windll.shell32
+            ole32 = ctypes.windll.ole32
+
+            shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+            shell32.ILCreateFromPathW.argtypes = [ctypes.c_wchar_p]
+            shell32.SHOpenFolderAndSelectItems.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_ulong]
+            shell32.ILFree.argtypes = [ctypes.c_void_p]
+
+            ole32.CoInitialize(None)
+            pidl = shell32.ILCreateFromPathW(file_path)
+            if not pidl:
+                ole32.CoUninitialize()
+                return False
+            try:
+                hr = shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)
+                return hr == 0
+            finally:
+                shell32.ILFree(pidl)
+                ole32.CoUninitialize()
+        except Exception as e:
+            debug_logger.warning(f"SHOpenFolderAndSelectItems失敗: {e}")
+            return False
+
     def _open_folder_with_highlight(self, file_path):
         """📂 フォルダを開いてファイルをハイライト（シンプル版・重複防止）"""
         
@@ -7000,18 +7106,18 @@ class UltraFastCompliantUI:
         import subprocess
         import time
         
-        # シンプルな重複防止
+        # 単一ジェスチャ内の二重起動だけを防ぐ短いガード（正当な再クリックは弾かない）
         current_time = time.time()
         last_request_time = getattr(self, '_last_folder_open_time', 0)
-        
-        if current_time - last_request_time < 1.5:  # 1.5秒以内の重複をブロック
+
+        if current_time - last_request_time < 0.6:  # 0.6秒以内の重複のみブロック
             time_diff = current_time - last_request_time
             debug_logger.warning(f"📂 フォルダオープン重複防止: {time_diff:.3f}秒以内の重複要求")
             print(f"🚫 フォルダオープン重複ブロック（{time_diff:.3f}秒）")
             return
-        
+
         self._last_folder_open_time = current_time
-        
+
         debug_logger.info(f"📂 フォルダオープン要求: {file_path}")
 
         try:
@@ -7022,17 +7128,23 @@ class UltraFastCompliantUI:
                 return
 
             folder_path = os.path.dirname(file_path)
-            
-            # 方法1: Explorerの/selectパラメータでファイルをハイライト表示
+            native_path = os.path.normpath(file_path)
+
+            # 方法0【最優先・最も確実】: Shell API SHOpenFolderAndSelectItems
+            #   explorer /select は「対象フォルダが既に開いている」場合に選択し直さない
+            #   ことがあり、ハイライトが「あったりなかったり」になる。Shell APIは
+            #   既存ウィンドウでも確実にファイルを選択状態にする。
+            if self._shell_select_file(native_path):
+                debug_logger.info("✅ SHOpenFolderAndSelectItemsでハイライト成功")
+                print(f"🎯 ファイルをハイライト表示しました: {os.path.basename(file_path)}")
+                return
+
+            # 方法1: Explorerの/selectパラメータでファイルをハイライト表示（フォールバック）
             # 注意1: explorer.exe は成功時でも終了コード1を返す仕様のため、
             #   returncodeでの成否判定はできない。例外なく起動できたら成功とみなして
             #   return する（フォールバックを走らせるとExplorerが二重に開く）。
             # 注意2: "/select," とパスは1つの文字列 `/select,"パス"` として渡す必要がある。
-            #   リストで別々の引数にすると、Explorerがファイルを選択(ハイライト)せず
-            #   既定フォルダだけ開いてしまう。
             try:
-                # Windowsネイティブのバックスラッシュ区切りに統一（/select はパス形式に敏感）
-                native_path = os.path.normpath(file_path)
                 debug_logger.info(f"🔍 Explorerでファイルをハイライト表示: {native_path}")
                 subprocess.run(f'explorer /select,"{native_path}"',
                                check=False,
@@ -8804,7 +8916,13 @@ class UltraFastCompliantUI:
         try:
             start_time = time.time()  # 処理時間計測開始
             print(f"⚡ 即座インデックス開始: {target_name}")
-            
+
+            # 🚀 差分インデックス: 既存DBの更新時刻を読み込み、未更新ファイルをスキップする
+            try:
+                self.search_system._load_index_mtime_cache()
+            except Exception as mtime_load_error:
+                print(f"⚠️ 差分インデックス用mtime読み込みスキップ: {mtime_load_error}")
+
             # UI応答性を確保するための高頻度チェック
             self._ui_update_counter = 0
             self._last_ui_update = time.time()

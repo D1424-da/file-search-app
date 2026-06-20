@@ -904,7 +904,7 @@ class _FileContentExtractor:
                 # ページ＝章扉・ページ番号のみ等をOCR結果で上書きして劣化させないため）
                 ocr_target_pages = [p for p in range(max_pages)
                                     if len(page_texts.get(p, "")) < 3]
-                debug_logger.info(
+                print(
                     f"[PDF診断] {os.path.basename(file_path)}: "
                     f"総ページ={total_pages} 処理={max_pages} "
                     f"テキスト層={_text_pages}p OCR対象={len(ocr_target_pages)}p "
@@ -922,7 +922,7 @@ class _FileContentExtractor:
 
                 _t_ocr_elapsed = time.time() - _t_ocr_start
                 if ocr_target_pages:
-                    debug_logger.info(
+                    print(
                         f"[PDF診断] {os.path.basename(file_path)}: "
                         f"OCR完了={_t_ocr_elapsed:.2f}s "
                         f"OCR対象{len(ocr_target_pages)}p中{len(ocr_results)}p取得"
@@ -1067,7 +1067,7 @@ class _FileContentExtractor:
                             results[page_num] = text
                     except TimeoutError:
                         _timeout_count += 1
-                        debug_logger.warning(f"PDF OCRページ {page_num} タイムアウト(30s): {os.path.basename(file_path)}")
+                        print(f"[OCR診断] タイムアウト(30s) ページ{page_num}: {os.path.basename(file_path)}")
                         continue
                     except Exception as page_error:
                         _ocr_page_times.append(time.time() - _tp_start)
@@ -1078,7 +1078,7 @@ class _FileContentExtractor:
             if _ocr_page_times:
                 _avg = sum(_ocr_page_times) / len(_ocr_page_times)
                 _max = max(_ocr_page_times)
-                debug_logger.info(
+                print(
                     f"[OCR診断] {os.path.basename(file_path)}: "
                     f"対象{len(target_pages)}p 成功{len(results)}p タイムアウト{_timeout_count}p "
                     f"ページ平均={_avg:.2f}s 最大={_max:.2f}s 合計={_ocr_total:.2f}s"
@@ -1321,7 +1321,7 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
         content = _proc_extractor._extract_file_content(file_path)
         _elapsed = time.time() - _t0
         if _elapsed > 5.0:
-            debug_logger.info(
+            print(
                 f"[抽出診断] pid={_pid} ext={_ext} {_elapsed:.2f}s "
                 f"size={file_size//1024}KB chars={len(content) if content else 0} "
                 f"{os.path.basename(file_path)}"
@@ -1329,5 +1329,5 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
         return (file_path, content, file_size, modified_time, _elapsed)
     except Exception as _e:
         _elapsed = time.time() - _t0
-        debug_logger.warning(f"[抽出診断] pid={_pid} ext={_ext} ERROR {_elapsed:.2f}s {file_path}: {_e}")
+        print(f"[抽出診断] pid={_pid} ext={_ext} ERROR {_elapsed:.2f}s {file_path}: {_e}")
         return (file_path, None, file_size, modified_time, _elapsed)

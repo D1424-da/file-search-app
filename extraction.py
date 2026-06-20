@@ -22,6 +22,7 @@ import re
 import time
 import json
 import mmap
+import struct
 import logging
 import zipfile
 import threading
@@ -759,6 +760,17 @@ class _FileContentExtractor:
             # 2. OLE2形式: WordDocumentストリームから本文テキストを抽出（日本語対応）
             if is_ole and olefile is not None:
                 debug_logger.debug(f"OLE2形式のDOCを検出: {base_name}")
+                # 2a. piece table(CLX)による正確な本文抽出（文字化け回避の本命）
+                try:
+                    with olefile.OleFileIO(file_path) as ole:
+                        text = self._extract_doc_text_ole(ole)
+                    if text and len(text) >= 4:
+                        text = normalize_extracted_text(text, max_length=500000)
+                        print(f"✅ DOC本文抽出成功(piece table): {base_name} - {len(text)} 文字")
+                        return text
+                except Exception as pt_error:
+                    debug_logger.warning(f"piece table抽出エラー: {base_name} - {pt_error}")
+                # 2b. フォールバック: WordDocumentストリームの生バイト解析
                 try:
                     with olefile.OleFileIO(file_path) as ole:
                         if ole.exists('WordDocument'):
@@ -766,7 +778,7 @@ class _FileContentExtractor:
                             text = self._readable_text_from_bytes(raw)
                             if text:
                                 text = normalize_extracted_text(text, max_length=500000)
-                                print(f"✅ OLE2 DOC本文抽出成功: {base_name} - {len(text)} 文字")
+                                print(f"✅ OLE2 DOC本文抽出成功(raw): {base_name} - {len(text)} 文字")
                                 return text
                 except Exception as olefile_error:
                     debug_logger.warning(f"olefile処理エラー: {base_name} - {olefile_error}")
@@ -845,6 +857,81 @@ class _FileContentExtractor:
 
         # 意味のある連続テキストが極端に少ない場合はノイズとみなして破棄
         return best if best_score >= 8 else ""
+
+    def _extract_doc_text_ole(self, ole) -> str:
+        """OLE2形式(.doc)の本文を FIB + piece table(CLX) から正確に抽出する。
+
+        旧.docの本文は WordDocument ストリームに書式バイトと混在して格納され、
+        各テキスト片(piece)の位置・符号化は Table ストリーム内の piece table(CLX)が
+        示す。CLX を辿って各 piece を UTF-16LE か CP1252(8bit圧縮)の正しい符号化で
+        デコードし連結することで、書式バイトが混入しない正確な本文を得る。
+        生バイトを当て推量でデコードする方式と違い文字化けしない。
+        参考: [MS-DOC] FIB / Clx / PlcPcd / Pcd。
+        """
+        if not ole.exists('WordDocument'):
+            return ""
+        wd = ole.openstream('WordDocument').read()
+        if len(wd) < 0x200:
+            return ""
+        # FIB: 使用する Table ストリーム選択フラグ と CLX の位置(fcClx/lcbClx)
+        flags = struct.unpack_from('<H', wd, 0x000A)[0]
+        table_name = '1Table' if (flags & 0x0200) else '0Table'
+        if not ole.exists(table_name):
+            alt = '0Table' if table_name == '1Table' else '1Table'
+            if not ole.exists(alt):
+                return ""
+            table_name = alt
+        fcClx = struct.unpack_from('<I', wd, 0x01A2)[0]
+        lcbClx = struct.unpack_from('<I', wd, 0x01A6)[0]
+        if lcbClx == 0:
+            return ""
+        tbl = ole.openstream(table_name).read()
+        clx = tbl[fcClx:fcClx + lcbClx]
+        # CLX を走査し Pcdt(0x02) 内の PlcPcd を取り出す（Prc(0x01)は読み飛ばす）
+        i = 0
+        plcpcd = b''
+        while i < len(clx):
+            if clx[i] == 0x01:  # Prc: cbGrpprl(2B) ぶんを読み飛ばす
+                if i + 3 > len(clx):
+                    break
+                cb = struct.unpack_from('<H', clx, i + 1)[0]
+                i += 3 + cb
+            elif clx[i] == 0x02:  # Pcdt: lcb(4B) の後に PlcPcd 本体
+                if i + 5 > len(clx):
+                    break
+                lcb = struct.unpack_from('<I', clx, i + 1)[0]
+                plcpcd = clx[i + 5:i + 5 + lcb]
+                break
+            else:
+                break
+        if not plcpcd:
+            return ""
+        # PlcPcd: (n+1)個のCP(各4B) に続いて n個のPCD(各8B)
+        n = (len(plcpcd) - 4) // 12
+        if n <= 0:
+            return ""
+        cps = [struct.unpack_from('<I', plcpcd, k * 4)[0] for k in range(n + 1)]
+        pcd_base = (n + 1) * 4
+        parts = []
+        for k in range(n):
+            char_count = cps[k + 1] - cps[k]
+            if char_count <= 0:
+                continue
+            # PCD は8バイト。先頭2バイトのフラグを挟んで fc(4B) が続く
+            fc = struct.unpack_from('<I', plcpcd, pcd_base + k * 8 + 2)[0]
+            if fc & 0x40000000:  # fCompressed: CP1252(1バイト/文字), 実位置は fc/2
+                offset = (fc & 0x3FFFFFFF) // 2
+                raw = wd[offset:offset + char_count]
+                parts.append(raw.decode('cp1252', errors='ignore'))
+            else:                # 非圧縮: UTF-16LE(2バイト/文字)
+                offset = fc & 0x3FFFFFFF
+                raw = wd[offset:offset + char_count * 2]
+                parts.append(raw.decode('utf-16-le', errors='ignore'))
+        text = ''.join(parts)
+        # Word制御コードを整形（段落=\r、セル/行末などを改行/空白へ）
+        text = text.replace('\r', '\n').replace('\x07', '\n').replace('\x0b', '\n')
+        text = ''.join(ch if (ch in '\n\t' or ord(ch) >= 0x20) else ' ' for ch in text)
+        return text.strip()
 
     def _extract_pdf_content(self, file_path: str) -> str:
         """PDF文書抽出（ページ並列化で80%高速化）"""

@@ -540,65 +540,115 @@ class _FileContentExtractor:
 
                 # ワークシート処理
                 try:
-                    workbook_xml = xlsx.read('xl/workbook.xml')
-                    wb_root = ET.fromstring(workbook_xml)
-                    
-                    # 名前空間定義
-                    ns = {'': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+                    # シート表示名の解決: workbook.xml の <sheets><sheet name r:id> と
+                    #   workbook.xml.rels の rId→Target を突き合わせ、各 worksheet ファイルに
+                    #   対応する表示名を得る。これにより .xls 抽出と同じ [シート: 名前] を出せる。
+                    _r_ns = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
+                    sheet_name_by_file = {}
+                    try:
+                        rels_xml = xlsx.read('xl/_rels/workbook.xml.rels')
+                        rels_root = ET.fromstring(rels_xml)
+                        rid_to_target = {}
+                        for rel in rels_root:
+                            rid = rel.get('Id')
+                            target = rel.get('Target')
+                            if rid and target:
+                                # Target は workbook.xml からの相対(例 worksheets/sheet1.xml)
+                                norm = target.lstrip('/')
+                                if not norm.startswith('xl/'):
+                                    norm = 'xl/' + norm
+                                rid_to_target[rid] = norm
+                        workbook_xml = xlsx.read('xl/workbook.xml')
+                        wb_root = ET.fromstring(workbook_xml)
+                        for sh in wb_root.iter(_ns_main + 'sheet'):
+                            name = sh.get('name')
+                            rid = sh.get(_r_ns + 'id')
+                            if name and rid and rid in rid_to_target:
+                                sheet_name_by_file[rid_to_target[rid]] = name
+                    except Exception:
+                        sheet_name_by_file = {}
 
                     sheet_files = [f for f in xlsx.namelist() if f.startswith('xl/worksheets/sheet')]
-                    
+                    # シート順は数値部分で安定ソート（sheet2 が sheet10 より前に来るように）
+                    def _sheet_sort_key(fname):
+                        m = re.search(r'sheet(\d+)\.xml$', fname)
+                        return (0, int(m.group(1))) if m else (1, fname)
+                    sheet_files.sort(key=_sheet_sort_key)
+
                     # 🚀 大容量ファイル: シート数制限
                     processed_sheets = 0
                     for sheet_file in sheet_files:
                         if is_large_file and processed_sheets >= max_sheets:
                             debug_logger.info(f"大容量Excel: {max_sheets}シートで処理終了")
                             break
-                        
+
                         sheet_xml = xlsx.read(sheet_file)
                         sheet_root = ET.fromstring(sheet_xml)
-                        
+
+                        # シート見出し（.xls 抽出と同じ書式）。表示名が無ければファイル名から補う。
+                        sheet_name = sheet_name_by_file.get(sheet_file)
+                        if not sheet_name:
+                            m = re.search(r'(sheet\d+)\.xml$', sheet_file)
+                            sheet_name = m.group(1) if m else sheet_file
+                        content.append(f"[シート: {sheet_name}]")
+
                         # 🚀 大容量ファイル: 行数制限
                         row_count = 0
-                        # セルを順番に処理
+                        # 行単位で処理（行内のセルは空白連結、行は改行で連結）
                         for row in sheet_root.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'):
                             if is_large_file and row_count >= max_rows:
                                 debug_logger.info(f"大容量Excel: シート{processed_sheets+1}で{max_rows}行処理")
                                 break
                             row_count += 1
+                            row_values = []
                             for cell in row.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
-                                cell_type = cell.get('t', 'n')  # セルタイプ: s=文字列, n=数値, b=ブール等
-                                
+                                cell_type = cell.get('t', 'n')  # セルタイプ: s=文字列, n=数値, b=ブール, str=数式文字列, inlineStr=直接埋込文字列
+
+                                if cell_type == 'inlineStr':
+                                    # インライン文字列は <v> ではなく <is><t> に本文がある。
+                                    # 旧実装はこれを読まず、openpyxl 等が書く .xlsx の本文が
+                                    # 丸ごと欠落していた。<is> 配下の全 <t> を連結する。
+                                    is_elem = cell.find(_ns_main + 'is')
+                                    if is_elem is not None:
+                                        parts = [t.text for t in is_elem.iter(_ns_main + 't') if t.text]
+                                        text = ''.join(parts).strip()
+                                        if text:
+                                            row_values.append(text)
+                                    continue
+
                                 # セル値を取得
                                 v_elem = cell.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v')
                                 if v_elem is not None and v_elem.text:
                                     value = v_elem.text.strip()
-                                    
+
                                     if cell_type == 's':  # 共有文字列参照
                                         try:
                                             index = int(value)
                                             if 0 <= index < len(shared_strings):
                                                 text = shared_strings[index]
                                                 if text and len(text) > 0:
-                                                    content.append(text)
+                                                    row_values.append(text)
                                         except (ValueError, IndexError):
                                             pass
                                     elif cell_type == 'str':  # 数式の文字列結果
                                         if value and len(value) > 0:
-                                            content.append(value)
+                                            row_values.append(value)
                                     elif value and not value.replace('.', '').replace('-', '').isdigit():
                                         # 数値以外の直接値
                                         if len(value) > 0:
-                                            content.append(value)
+                                            row_values.append(value)
                                     elif value and len(value) > 2:  # 長い数値は保持（ID等）
-                                        content.append(value)
-                        
+                                        row_values.append(value)
+
+                            if row_values:
+                                content.append(' '.join(row_values))
+
                         processed_sheets += 1
 
                 except Exception as e:
                     print(f"⚠️ Excelシート処理エラー: {e}")
 
-            result = ' '.join(content)
+            result = '\n'.join(content)
             return normalize_extracted_text(result)
 
         except zipfile.BadZipFile:
@@ -855,10 +905,19 @@ class _FileContentExtractor:
             kept = []
             for ch in text:
                 o = ord(ch)
+                # 半角カナ・半角形(0xFF61–0xFFEF)は最優先で除外する。
+                #   生バイナリを cp932 で誤デコードすると、ゴミバイトの多くがこの範囲
+                #   (ｦｧ…ﾝ)に落ち、ソースに無いカタカナがプレビューに出る「幻のカタカナ」
+                #   化けの主因だった。なお半角カナは ch.isalnum()==True のため、下の
+                #   isalnum 判定より先にここで弾かないと漏れる。本物の半角カナを失う
+                #   より化けを出さない方を優先する（本文は全角カナ範囲で取れる）。
+                if 0xff61 <= o <= 0xffef:
+                    kept.append(' ')
+                    continue
                 if (ch.isalnum() or ch == ' '
-                        or 0x3000 <= o <= 0x30ff      # 句読点・ひらがな・カタカナ
+                        or 0x3000 <= o <= 0x30ff      # 句読点・ひらがな・全角カタカナ
                         or 0x4e00 <= o <= 0x9fff      # 漢字（CJK統合）
-                        or 0xff00 <= o <= 0xffef      # 全角英数・半角カナ
+                        or 0xff01 <= o <= 0xff60      # 全角英数・記号（半角カナは除外）
                         or ch in '、。・「」『』（）【】〜ー－.,!?:;()[]{}/_-'):
                     kept.append(ch)
                 else:
@@ -871,21 +930,75 @@ class _FileContentExtractor:
             # 誤読)は短い断片が散在するため、誤読のゴミを高評価しにくい。
             return sum(len(tok) for tok in text.split() if len(tok) >= 4)
 
+        def is_confident(text: str) -> bool:
+            # 生バイナリの誤デコード(ゴミ)と本物の本文を見分ける。
+            #   重要な観測: ランダムなバイト列を cp932/utf-16le でデコードすると、
+            #   その大半は「漢字」範囲の有効なコードポイントに落ちる一方、ひらがなは
+            #   ほとんど現れない（ランダム漢字ノイズ）。逆に本物の日本語の散文は
+            #   助詞・送り仮名のため必ず相当量のひらがなを含む。したがって
+            #     ・CJK(漢字・かな)主体なのに「ひらがなが極端に少ない」→ ノイズ
+            #     ・ASCII主体(英数の本文)はそのまま信頼
+            #   で判定する。これにより「幻のカタカナ」を含むゴミ scrape を破棄できる。
+            if not text:
+                return False
+            hira = kana = cjk = ascii_alpha = ascii_digit = total = 0
+            for ch in text:
+                if ch == ' ':
+                    continue
+                total += 1
+                o = ord(ch)
+                if 0x3040 <= o <= 0x309f:
+                    hira += 1
+                    cjk += 1
+                elif 0x30a0 <= o <= 0x30ff:
+                    kana += 1
+                    cjk += 1
+                elif 0x4e00 <= o <= 0x9fff:
+                    cjk += 1
+                elif ch.isascii() and ch.isalpha():
+                    ascii_alpha += 1
+                elif ch.isascii() and ch.isdigit():
+                    ascii_digit += 1
+            if total == 0:
+                return False
+            # CJK文字が相当量あるなら、本物の日本語散文の指標であるひらがな比率を要求。
+            #   ・ランダム漢字ノイズ → ひらがな≒0 で弾かれる。
+            #   ・utf-16le本文を cp932 で誤読したゴミ(高位バイト0x30由来の '0' 多数)も、
+            #     ひらがながほぼ無いので弾かれる。ASCII判定より先に CJK 判定を行うのが要。
+            if cjk / total >= 0.20:
+                return (hira / cjk) >= 0.15
+            # CJK がほとんど無く ASCII *英字* が主体なら英語/英数本文として信頼。
+            #   英字(数字でなく)を要求するのが要点: 誤デコードのゴミは高位バイト 0x30 由来の
+            #   数字 '0' が多く英字が少ないため、数字ではなく英字比率で判定すると弾ける。
+            if ascii_alpha / total >= 0.50:
+                return True
+            return False
+
+        # 各エンコーディングでデコードし、(信頼できるか, スコア) で最良を選ぶ。
+        #   信頼できる候補を常に優先する。例えば utf-16le の本文を cp932 で誤読すると
+        #   空白の無い連続ゴミになり quality_score だけだと誤読側が高得点になりがちだが、
+        #   誤読側はひらがな比率が低く is_confident=False なので選ばれない。
         best = ""
-        best_score = 0
+        best_key = (False, -1)  # (信頼できる, スコア)
         for enc in ('utf-16-le', 'cp932'):
             try:
                 decoded = data.decode(enc, errors='ignore')
             except Exception:
                 continue
             cleaned = filter_readable(decoded)
-            score = quality_score(cleaned)
-            if score > best_score:
-                best_score = score
+            key = (is_confident(cleaned), quality_score(cleaned))
+            if key > best_key:
+                best_key = key
                 best = cleaned
 
-        # 意味のある連続テキストが極端に少ない場合はノイズとみなして破棄
-        return best if best_score >= 8 else ""
+        # 低信頼のスクレイプは破棄する。ノイズ排除はひらがな比率による is_confident が
+        #   担う（ランダム/誤デコードのゴミは is_confident=False で弾かれる）。文字数の
+        #   floor は極端に短い断片を避ける程度に留め(旧 best_score>=8)、正当だが短い本文
+        #   まで捨てないようにする。両条件を満たさない場合は "" を返し、ファイル名のみで
+        #   インデックスさせる（幻のカタカナを出さない）。
+        if best_key[0] and best_key[1] >= 8:
+            return best
+        return ""
 
     def _extract_doc_text_ole(self, ole) -> str:
         """OLE2形式(.doc)の本文を FIB + piece table(CLX) から正確に抽出する。

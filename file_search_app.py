@@ -1923,72 +1923,6 @@ class UltraFastFullCompliantSearchSystem:
             conns[db_index] = conn
         return conn
 
-    def ultra_fast_search(self, query: str, max_results: int = 5500) -> List[Dict[str, Any]]:
-        """最適化済み検索メソッド - 3層検索システム"""
-        if not query or not query.strip():
-            return []
-
-        query = query.strip()
-        start_time = time.time()
-
-        # 統計更新（軽量化）
-        self.stats["search_count"] += 1
-
-        try:
-            # 第1層: 即座層検索（最優先キャッシュ）
-            immediate_results = self._search_immediate_layer(query)
-            if immediate_results:
-                self.stats["immediate_layer_hits"] += 1
-                self.stats["total_search_time"] += time.time() - start_time
-                self._update_average_search_time()
-                return immediate_results[:max_results]
-
-            # 第2層: ホット層検索（一時キャッシュ）
-            hot_results = self._search_hot_layer(query)
-            if hot_results:
-                self.stats["hot_layer_hits"] += 1
-                self.stats["total_search_time"] += time.time() - start_time
-                self._update_average_search_time()
-                
-                # 即座層にキャッシュ（非同期）
-                threading.Timer(0.001, self._cache_search_results, args=[query, hot_results]).start()
-                return hot_results[:max_results]
-
-            # 第3層: 完全検索（データベース）
-            complete_results = self._search_complete_layer(query, max_results)
-            self.stats["complete_layer_hits"] += 1
-            self.stats["total_search_time"] += time.time() - start_time
-            self._update_average_search_time()
-
-            # 結果をキャッシュに追加（非同期）
-            if complete_results:
-                threading.Timer(0.001, self._cache_search_results, args=[query, complete_results]).start()
-
-            return complete_results
-
-        except Exception as e:
-            error_time = time.time() - start_time
-            self.stats["error_count"] += 1
-            self.stats["total_search_time"] += error_time
-            debug_logger.error(f"検索エラー: {e} ({error_time:.3f}s)")
-            print(f"⚠️ 検索エラー: {e}")
-            return []
-
-    def _cache_search_results(self, query: str, results: List[Dict[str, Any]]):
-        """検索結果をキャッシュに保存"""
-        try:
-            # 即座層キャッシュへ追加
-            if len(self.immediate_cache) < self.max_immediate_cache:
-                self.immediate_cache[query] = results.copy()
-            else:
-                # LRU的削除（最初のキーを削除）
-                oldest_key = next(iter(self.immediate_cache))
-                del self.immediate_cache[oldest_key]
-                self.immediate_cache[query] = results.copy()
-                
-        except Exception as e:
-            debug_logger.warning(f"キャッシュ保存エラー: {e}")
-
     def _update_average_search_time(self):
         """平均検索時間を更新"""
         if self.stats["search_count"] > 0:
@@ -2004,9 +1938,13 @@ class UltraFastFullCompliantSearchSystem:
                                    query: str,
                                    max_results: int = 5500,
                                    file_type_filter: str = "all") -> List[Dict[str, Any]]:
-        """最適化済み3層統合検索 - パフォーマンス重視版"""
+        """統合検索 - FTS5 DB（完全層）を唯一の真実の源とする単一ソース検索。
+
+        旧実装はメモリ上の即座層/高速層をDBに重ねて検索していたが、これらはDBと
+        重複するだけで検索を遅く・不正確（直近ファイルだけ返す等）にしていたため廃止。
+        繰り返し検索の高速化は _query_result_cache（クエリ結果LRU）が担う。
+        """
         start_time = time.time()
-        results = []
 
         # 🚀 クエリ結果キャッシュ: 同一検索（インデックス中以外）はDB検索を再実行せず即返す
         cache_key = f"{query}\x00{file_type_filter}"
@@ -2018,34 +1956,9 @@ class UltraFastFullCompliantSearchSystem:
                 return [r.copy() for r in cached][:max_results]
 
         try:
-            # インデックス中の動作制御（軽量化）
-            if self.indexing_in_progress:
-                # インデックス中はキャッシュ優先で高速検索
-                results.extend(self._search_immediate_layer(query)[:max_results // 2] or [])
-                results.extend(self._search_hot_layer(query)[:max_results // 2] or [])
-                
-                # 結果が不十分な場合のみDB検索
-                if len(results) < max_results // 4:
-                    try:
-                        db_results = self._search_complete_layer(query, max_results // 4)
-                        if db_results:
-                            results.extend(db_results)
-                    except Exception:
-                        pass  # インデックス中のDB検索エラーは無視
-                        
-            else:
-                # 通常時：最適化された3層検索
-                # 完全層優先検索（最新・正確）
-                complete_results = self._search_complete_layer(query, max_results // 2) or []
-                results.extend(complete_results)
-
-                # 即座層で補完
-                immediate_results = self._search_immediate_layer(query) or []
-                results.extend(immediate_results[:max_results // 4])
-
-                # 高速層で補完
-                hot_results = self._search_hot_layer(query) or []
-                results.extend(hot_results[:max_results // 4])
+            # FTS5 DB（完全層）を検索。インデックス中もバッチでDBへ反映されるため
+            # DB検索のみで最新・正確な結果が得られる。
+            results = self._search_complete_layer(query, max_results) or []
 
             # 重複除去とランキング（最適化版）
             unique_results = self._deduplicate_and_rank_optimized(results)
@@ -2117,139 +2030,6 @@ class UltraFastFullCompliantSearchSystem:
         with self._query_cache_lock:
             if self._query_result_cache:
                 self._query_result_cache.clear()
-
-    def _search_immediate_layer(self, query: str) -> List[Dict[str, Any]]:
-        """即座層検索 - メモリキャッシュ（半角全角対応・並列化版）"""
-        results = []
-
-        # 🚀 キャッシュされたパターンを使用（高速化）
-        half_width, full_width, normalized, query_patterns = self._get_search_patterns(query)
-
-        cache_items = list(self.immediate_cache.items())
-        
-        # 500ファイル/秒対応: 大量キャッシュ時は並列検索
-        if len(cache_items) > 1000:  # 1000件以上で並列化
-            def search_cache_chunk(chunk_items):
-                chunk_results = []
-                for key, data in chunk_items:
-                    # 即座層エントリのキーは 'content_preview'（'content'ではない）。
-                    # ファイルパスを除外してコンテンツとファイル名のみで検索
-                    preview = data.get('content_preview', data.get('content', ''))
-                    content_text = preview + ' ' + data.get('file_name', '')
-                    if enhanced_search_match(content_text, query_patterns):
-                        chunk_results.append({
-                            'file_path': data['file_path'],
-                            'file_name': data['file_name'],
-                            'content_preview': preview[:200],
-                            'layer': 'immediate',
-                            'relevance_score': 1.0
-                        })
-                return chunk_results
-
-            # チャンクサイズを動的調整
-            chunk_size = max(200, len(cache_items) // (self.optimal_threads * 2))
-            chunks = [cache_items[i:i + chunk_size] for i in range(0, len(cache_items), chunk_size)]
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.optimal_threads, 8)) as executor:
-                future_to_chunk = {executor.submit(search_cache_chunk, chunk): chunk for chunk in chunks}
-                
-                for future in concurrent.futures.as_completed(future_to_chunk):
-                    try:
-                        chunk_results = future.result(timeout=1.0)  # 500ファイル/秒対応：高速化
-                        results.extend(chunk_results)
-                    except Exception as e:
-                        print(f"⚠️ 即座層並列検索エラー: {e}")
-        else:
-            # 小規模キャッシュは従来通り
-            for key, data in cache_items:
-                # ファイルパスを除外してコンテンツとファイル名のみで検索
-                content_text = data.get('content_preview', data.get('content', '')) + ' ' + data.get('file_name', '')
-                if enhanced_search_match(content_text, query_patterns):
-                    # 🎯 高度なランキングスコア適用
-                    base_score = 1.0
-                    advanced_score = self._calculate_advanced_relevance_score(
-                        query, data['file_path'], data['file_name'], 
-                        data.get('content', ''), base_score
-                    )
-                    
-                    results.append({
-                        'file_path': data['file_path'],
-                        'file_name': data['file_name'],
-                        'content_preview': content_text[:200],
-                        'layer': 'immediate',
-                        'relevance_score': advanced_score
-                    })
-
-        return sorted(results, key=lambda x: x['relevance_score'], reverse=True)
-
-    def _search_hot_layer(self, query: str) -> List[Dict[str, Any]]:
-        """高速層検索 - 高速キャッシュ（半角全角対応・並列化版）"""
-        results = []
-
-        # 🚀 キャッシュされたパターンを使用（高速化）
-        half_width, full_width, normalized, query_patterns = self._get_search_patterns(query)
-
-        cache_items = list(self.hot_cache.items())
-        
-        # 500ファイル/秒対応: 大量キャッシュ時は並列検索
-        if len(cache_items) > 5000:  # 5000件以上で並列化
-            def search_cache_chunk(chunk_items):
-                chunk_results = []
-                for key, data in chunk_items:
-                    # ファイルパスを除外してコンテンツとファイル名のみで検索
-                    content_text = data.get('content', '') + ' ' + data.get('file_name', '')
-                    if enhanced_search_match(content_text, query_patterns):
-                        # 🎯 高度なランキングスコア適用
-                        base_score = 0.8
-                        advanced_score = self._calculate_advanced_relevance_score(
-                            query, data['file_path'], data['file_name'], 
-                            data.get('content', ''), base_score
-                        )
-                        
-                        chunk_results.append({
-                            'file_path': data['file_path'],
-                            'file_name': data['file_name'],
-                            'content_preview': data['content'][:200],
-                            'layer': 'hot',
-                            'relevance_score': advanced_score
-                        })
-                return chunk_results
-
-            # チャンクサイズを動的調整
-            chunk_size = max(500, len(cache_items) // (self.optimal_threads * 2))
-            chunks = [cache_items[i:i + chunk_size] for i in range(0, len(cache_items), chunk_size)]
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.optimal_threads, 8)) as executor:
-                future_to_chunk = {executor.submit(search_cache_chunk, chunk): chunk for chunk in chunks}
-                
-                for future in concurrent.futures.as_completed(future_to_chunk):
-                    try:
-                        chunk_results = future.result(timeout=1.5)  # 500ファイル/秒対応：高速化
-                        results.extend(chunk_results)
-                    except Exception as e:
-                        print(f"⚠️ 高速層並列検索エラー: {e}")
-        else:
-            # 小規模キャッシュは従来通り
-            for key, data in cache_items:
-                # ファイルパスを除外してコンテンツとファイル名のみで検索
-                content_text = data.get('content', '') + ' ' + data.get('file_name', '')
-                if enhanced_search_match(content_text, query_patterns):
-                    # 🎯 高度なランキングスコア適用
-                    base_score = 0.8
-                    advanced_score = self._calculate_advanced_relevance_score(
-                        query, data['file_path'], data['file_name'], 
-                        data.get('content', ''), base_score
-                    )
-                    
-                    results.append({
-                        'file_path': data['file_path'],
-                        'file_name': data['file_name'],
-                        'content_preview': data['content'][:200],
-                        'layer': 'hot',
-                        'relevance_score': advanced_score
-                    })
-
-        return sorted(results, key=lambda x: x['relevance_score'], reverse=True)
 
     def _search_complete_layer(self, query: str, max_results: int) -> List[Dict[str, Any]]:
         """完全層検索 - 8個のSQLite FTS5データベースを並列検索（半角全角対応強化）"""
@@ -2884,7 +2664,6 @@ class UltraFastFullCompliantSearchSystem:
             file_hash = hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
             debug_logger.debug(f"ハッシュ計算完了: {file_hash[:8]}...")
 
-            # 🆕 3層構造最適化
             base_data = {
                 'file_name': file_path_obj.name,
                 'file_type': file_path_obj.suffix.lower(),
@@ -2893,101 +2672,22 @@ class UltraFastFullCompliantSearchSystem:
                 'modified_time': modified_time,
             }
 
-            # 即座層へ登録（軽量メタのみ・O(1)FIFO退避）
-            def safe_truncate_utf8(text: str, max_length: int) -> str:
-                if len(text) <= max_length:
-                    return text
-                truncated = text[:max_length]
-                try:
-                    truncated.encode('utf-8')
-                    return truncated
-                except UnicodeEncodeError:
-                    return text[:max_length - 1] if max_length > 1 else ""
-
-            self.immediate_cache[str(file_path)] = {
-                'file_path': str(file_path),
-                'file_name': file_path_obj.name,
-                'content_preview': safe_truncate_utf8(content, 500),
-                'file_type': file_path_obj.suffix.lower(),
-                'size': file_size,
-                'indexed_time': time.time(),
-                'layer': 'immediate'
-            }
-            # O(1) FIFO退避
-            while len(self.immediate_cache) > self.max_immediate_cache:
-                try:
-                    del self.immediate_cache[next(iter(self.immediate_cache))]
-                except (StopIteration, KeyError):
-                    break
-
-            # 高速層へ移動
-            self._move_to_hot_layer(file_path, content)
-
-            # 完全層(DB)へバッチ書き込み
+            # 完全層(DB=FTS5)へバルク書き込み。検索の唯一の真実の源はDBで、
+            # メモリ上の即座層/高速層は廃止した（DBと重複するだけで検索を遅く・
+            # 不正確にしていたため）。繰り返し検索の高速化は _query_result_cache が担う。
             self._enqueue_complete_layer(file_path, content, base_data, file_hash)
 
             self.stats["indexed_files"] += 1
             # 差分インデックス用キャッシュを更新
             with self._index_mtime_lock:
                 self._index_mtime_cache[file_path] = modified_time
-            debug_logger.info(f"3層構造最適化インデックス完了: {file_path}")
+            debug_logger.info(f"インデックス完了(DB): {file_path}")
             return True
 
         except Exception as e:
             debug_logger.error(f"ストアエラー {file_path}: {e}")
             print(f"❌ ストアエラー {file_path}: {e}")
             return False
-
-    def _move_to_hot_layer(self, file_path: str, content: str):
-        """🔄 高速層移動（即座層から移動 - 重複削除）"""
-        try:
-            # 即座層の情報を参照（削除はしない＝即座層も残してUIで3層とも動くようにする。
-            # 検索時は file_path で重複除去されるため両層に存在しても問題ない）
-            if file_path in self.immediate_cache:
-                base_data = dict(self.immediate_cache[file_path])
-            else:
-                base_data = {
-                    'file_name': os.path.basename(file_path),
-                    'file_type': Path(file_path).suffix.lower(),
-                    'size': os.path.getsize(file_path) if os.path.exists(file_path) else 0,
-                    'indexed_time': time.time()
-                }
-
-            # 高速層データ作成（中期保存用）
-            hot_data = base_data.copy()
-            hot_data.update({
-                'file_path': file_path,
-                'content': content[:2000],  # メモリ抑制のため先頭2000文字に短縮
-                'layer': 'hot',
-                'moved_from_immediate': time.time()
-            })
-
-            self.hot_cache[file_path] = hot_data
-
-            # キャッシュサイズ制限（O(1) FIFO: 挿入順で最古を削除。min()のO(n)走査を回避）
-            while len(self.hot_cache) > self.max_hot_cache:
-                try:
-                    oldest_key = next(iter(self.hot_cache))
-                    del self.hot_cache[oldest_key]
-                except (StopIteration, KeyError):
-                    break
-
-            # キャッシュ定期保存（一括インデックス中はI/O削減のためスキップ）
-            if not getattr(self, '_bulk_indexing', False):
-                if not hasattr(self, '_last_save_time'):
-                    self._last_save_time = 0
-                current_time = time.time()
-                if current_time - self._last_save_time > 5.0 and not self.shutdown_requested:
-                    self._last_save_time = current_time
-                    timer = threading.Timer(1.0, self.save_caches)
-                    self._background_threads.append(timer)
-                    timer.start()
-
-            debug_logger.debug(f"高速層移動完了: {os.path.basename(file_path)}")
-
-        except Exception as e:
-            print(f"⚠️ 高速層移動エラー: {e}")
-            debug_logger.error(f"高速層移動エラー: {e}")
 
     def _get_flush_executor(self):
         """完全層書き込み専用の単一ワーカーExecutorを取得。
@@ -3194,60 +2894,6 @@ class UltraFastFullCompliantSearchSystem:
                 pass
         return done
 
-    def _move_to_complete_layer(self, file_path: str, content: str, file_hash: str):
-        """🔄 完全層移動（高速層から移動 - 重複削除）"""
-        try:
-            # 高速層から削除（重複削除）
-            if file_path in self.hot_cache:
-                base_data = self.hot_cache[file_path]
-                del self.hot_cache[file_path]
-                debug_logger.debug(f"高速層から削除: {os.path.basename(file_path)}")
-            else:
-                # 高速層にない場合は基本データを再構築
-                base_data = {
-                    'file_name': os.path.basename(file_path),
-                    'file_type': Path(file_path).suffix.lower(),
-                    'size': os.path.getsize(file_path) if os.path.exists(file_path) else 0,
-                    'indexed_time': time.time()
-                }
-
-            # 完全層へ移動（データベースへの永続保存）
-            self._add_to_complete_layer(file_path, content, base_data, file_hash)
-            debug_logger.debug(f"完全層移動完了: {os.path.basename(file_path)}")
-
-        except Exception as e:
-            print(f"⚠️ 完全層移動エラー: {e}")
-            debug_logger.error(f"完全層移動エラー: {e}")
-
-    def _add_to_hot_layer(self, file_path: str, content: str, base_data: Dict[str, Any]):
-        """高速層追加（キャッシュ保存機能付き）"""
-        try:
-            hot_data = base_data.copy()
-            hot_data['content'] = content[:10000]  # バッチサイズ400に合わせて拡張（最初の10000文字）
-
-            self.hot_cache[file_path] = hot_data
-
-            # キャッシュサイズ制限
-            if len(self.hot_cache) > self.max_hot_cache:
-                oldest_key = min(self.hot_cache.keys(),
-                                 key=lambda k: self.hot_cache[k]['indexed_time'])
-                del self.hot_cache[oldest_key]            # キャッシュを定期保存（バックグラウンド）- 頻度を制限
-            if not hasattr(self, '_last_save_time'):
-                self._last_save_time = 0
-            
-            current_time = time.time()
-            if current_time - self._last_save_time > 5.0 and not self.shutdown_requested:  # 5秒間隔に制限 + シャットダウンチェック
-                self._last_save_time = current_time
-                timer = threading.Timer(1.0, self.save_caches)
-                self._background_threads.append(timer)  # 追跡リストに追加
-                timer.start()
-            
-            debug_logger.debug(f"高速層追加完了: {os.path.basename(file_path)}")
-
-        except Exception as e:
-            print(f"⚠️ 高速層追加エラー: {e}")
-            debug_logger.error(f"高速層追加エラー: {e}")
-
     def _bulk_add_to_complete_layer(self, file_data_list: List[Dict[str, Any]]) -> Dict[str, int]:
         """🚀 バルクインサート版完全層追加（100倍高速化）
         
@@ -3368,334 +3014,6 @@ class UltraFastFullCompliantSearchSystem:
                 except Exception:
                     pass
             return (0, len(group_data))
-
-    def _add_to_complete_layer(self, file_path: str, content: str, base_data: Dict[str, Any],
-                               file_hash: str):
-        """🔄 完全層追加（8並列データベース版・接続強化版・重複削除対応）"""
-        debug_logger.debug(f"完全層追加開始: {file_path}")
-        
-        # ファイルのデータベースインデックスを決定
-        db_index = self._get_db_index_for_file(file_path)
-        complete_db_path = self.complete_db_paths[db_index]
-        
-        debug_logger.debug(f"使用データベース: DB{db_index} - {complete_db_path.name}")
-        debug_logger.debug(f"🔄 完全層（DB{db_index}）移行開始: {os.path.basename(file_path)}")
-
-        # データベースファイル存在確認（強化版）
-        if not complete_db_path.exists():
-            debug_logger.warning(f"データベースファイルが存在しません - 作成します: {complete_db_path}")
-            print(f"🔧 DB{db_index}ファイル作成中: {complete_db_path.name}")
-            
-            # データベースファイルを安全に作成
-            try:
-                # 親ディレクトリの存在確認・作成
-                complete_db_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                # データベース初期化
-                init_conn = sqlite3.connect(str(complete_db_path), timeout=30.0)
-                init_cursor = init_conn.cursor()
-                
-                # テーブル作成
-                init_cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS documents (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        file_path TEXT UNIQUE NOT NULL,
-                        file_name TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        file_type TEXT NOT NULL,
-                        size INTEGER,
-                        modified_time REAL,
-                        indexed_time REAL,
-                        hash TEXT
-                    )
-                ''')
-                
-                # FTS5全文検索テーブル
-                init_cursor.execute('''
-                    CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-                        file_path,
-                        file_name, 
-                        content, 
-                        file_type,
-                        tokenize='trigram'
-                    )
-                ''')
-                
-                # インデックス作成
-                init_cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_path ON documents(file_path)')
-                init_cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_type ON documents(file_type)')
-                init_cursor.execute('CREATE INDEX IF NOT EXISTS idx_modified_time ON documents(modified_time)')
-                
-                init_conn.commit()
-                init_conn.close()
-                
-                print(f"✅ DB{db_index}ファイル作成完了: {complete_db_path.name}")
-                debug_logger.info(f"データベースファイル作成成功: {complete_db_path}")
-                
-            except Exception as create_error:
-                debug_logger.error(f"データベースファイル作成エラー: {create_error}")
-                print(f"❌ DB{db_index}ファイル作成失敗: {create_error}")
-                return
-        
-        # ファイルアクセス権限確認
-        if not os.access(complete_db_path, os.R_OK | os.W_OK):
-            debug_logger.error(f"データベースファイルアクセス権限なし: {complete_db_path}")
-            print(f"❌ DB{db_index}アクセス権限エラー: {complete_db_path.name}")
-            return
-        
-        max_retries = 20  # リトライ回数を大幅増加
-        retry_delay = 0.02  # 初期遅延を短縮
-
-        for attempt in range(max_retries):
-            debug_logger.debug(f"完全層追加試行 {attempt + 1}/{max_retries}: {file_path} (DB{db_index})")
-            conn = None
-            try:
-                # データベース接続（強化版設定）
-                debug_logger.debug(f"データベース接続開始: {complete_db_path}")
-                
-                # 接続前の追加チェック
-                if not complete_db_path.exists():
-                    debug_logger.error(f"接続直前チェック: ファイル不存在 {complete_db_path}")
-                    break
-                
-                # SQLite接続（排他制御強化）
-                conn = sqlite3.connect(
-                    str(complete_db_path),  # 明示的に文字列変換
-                    timeout=120.0,  # タイムアウト延長
-                    check_same_thread=False  # スレッドセーフティ向上
-                )
-                
-                # WALモードとパフォーマンス設定（強化版）
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA cache_size=20000")  # キャッシュサイズ増加
-                conn.execute("PRAGMA temp_store=MEMORY")
-                conn.execute("PRAGMA busy_timeout=300000")  # 5分待機（大幅延長）
-                conn.execute("PRAGMA wal_autocheckpoint=1000")  # WAL自動チェックポイント
-                conn.execute("PRAGMA optimize")  # 最適化実行
-                
-                debug_logger.debug("データベース接続・最適化完了")
-
-                cursor = conn.cursor()
-
-                # 接続テスト（実際のクエリ実行）
-                cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
-                table_count = cursor.fetchone()[0]
-                debug_logger.debug(f"接続テスト成功: {table_count}テーブル存在")
-
-                # 既存チェック（安全版）
-                cursor.execute('SELECT id FROM documents WHERE file_path = ?', (file_path,))
-                existing = cursor.fetchone()
-
-                # データ検証とサニタイゼーション（強化版）
-                safe_content = content[:2000000] if content else ""  # 2MB制限に拡張
-                safe_file_name = base_data['file_name'][:500] if base_data['file_name'] else os.path.basename(file_path)
-                safe_file_type = base_data['file_type'][:100] if base_data['file_type'] else "unknown"
-                
-                # 特殊文字のエスケープ
-                safe_content = safe_content.replace('\x00', '')  # NULL文字除去
-                safe_file_name = safe_file_name.replace('\x00', '')
-                
-                debug_logger.debug(f"データ準備完了: content={len(safe_content)}文字, name='{safe_file_name}', type='{safe_file_type}'")
-
-                if existing:
-                    # 更新処理（トランザクション使用）
-                    try:
-                        conn.execute("BEGIN EXCLUSIVE")  # 排他トランザクション開始
-                        debug_logger.debug(f"排他トランザクション開始: 更新処理")
-                        
-                        # メインテーブル更新
-                        cursor.execute(
-                            '''
-                            UPDATE documents 
-                            SET content = ?, file_name = ?, file_type = ?, size = ?, 
-                                modified_time = ?, indexed_time = ?, hash = ?
-                            WHERE file_path = ?
-                        ''', (safe_content, safe_file_name, safe_file_type, base_data['size'],
-                              time.time(), time.time(), file_hash, file_path))
-
-                        # FTS更新（安全削除→追加）
-                        cursor.execute('DELETE FROM documents_fts WHERE rowid = ?', (existing[0],))
-
-                        # FTS挿入前にrowidが有効かチェック
-                        cursor.execute('SELECT id FROM documents WHERE id = ?', (existing[0],))
-                        if cursor.fetchone():
-                            cursor.execute(
-                                '''
-                                INSERT INTO documents_fts(rowid, file_path, file_name, content, file_type)
-                                VALUES (?, ?, ?, ?, ?)
-                            ''', (existing[0], file_path, safe_file_name, safe_content, safe_file_type))
-
-                        conn.commit()  # トランザクションコミット
-                        debug_logger.debug(f"文書更新完了: {file_path} (DB{db_index})")
-
-                    except sqlite3.IntegrityError as ie:
-                        conn.rollback()  # ロールバック
-                        debug_logger.error(f"更新制約エラー: {ie}")
-                        raise  # 上位に再スロー
-
-                else:
-                    # 新規追加処理（トランザクション使用）
-                    try:
-                        conn.execute("BEGIN EXCLUSIVE")  # 排他トランザクション開始
-                        debug_logger.debug(f"排他トランザクション開始: 新規追加")
-                        
-                        # メインテーブル挿入
-                        cursor.execute(
-                            '''
-                            INSERT INTO documents (file_path, file_name, content, file_type, size, 
-                                                 modified_time, indexed_time, hash)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        ''', (file_path, safe_file_name, safe_content, safe_file_type,
-                              base_data['size'], time.time(), time.time(), file_hash))
-
-                        doc_id = cursor.lastrowid
-
-                        if doc_id:  # 有効なIDが取得できた場合のみFTS挿入
-                            cursor.execute(
-                                '''
-                                INSERT INTO documents_fts(rowid, file_path, file_name, content, file_type)
-                                VALUES (?, ?, ?, ?, ?)
-                            ''', (doc_id, file_path, safe_file_name, safe_content, safe_file_type))
-
-                        conn.commit()  # トランザクションコミット
-                        debug_logger.debug(f"新規文書追加完了: {file_path} (DB{db_index})")
-
-                    except sqlite3.IntegrityError as ie:
-                        conn.rollback()  # ロールバック
-                        debug_logger.error(f"新規追加制約エラー: {ie}")
-                        # 重複チェック後に再試行
-                        cursor.execute('SELECT id FROM documents WHERE file_path = ?', (file_path,))
-                        duplicate = cursor.fetchone()
-                        if duplicate:
-                            debug_logger.warning(f"重複文書検出、更新に切り替え: {file_path}")
-                            # 更新に切り替え（再トランザクション）
-                            conn.execute("BEGIN EXCLUSIVE")
-                            cursor.execute(
-                                '''
-                                UPDATE documents 
-                                SET content = ?, file_name = ?, file_type = ?, size = ?, 
-                                    modified_time = ?, indexed_time = ?, hash = ?
-                                WHERE file_path = ?
-                            ''', (safe_content, safe_file_name, safe_file_type, base_data['size'],
-                                  time.time(), time.time(), file_hash, file_path))
-                            
-                            # FTS更新（削除→追加）
-                            cursor.execute('DELETE FROM documents_fts WHERE rowid = ?', (duplicate[0],))
-                            cursor.execute(
-                                '''
-                                INSERT INTO documents_fts(rowid, file_path, file_name, content, file_type)
-                                VALUES (?, ?, ?, ?, ?)
-                            ''', (duplicate[0], file_path, safe_file_name, safe_content, safe_file_type))
-                            
-                            conn.commit()
-
-                # 成功したらループを抜ける
-                print(f"✅ DB{db_index}完全層移行完了: {os.path.basename(file_path)}")
-                debug_logger.info(f"完全層移行成功: {file_path} (DB{db_index})")
-                break  # 成功時はループ終了
-
-            except sqlite3.OperationalError as e:
-                error_msg = str(e).lower()
-                debug_logger.error(f"DB{db_index}運用エラー試行{attempt + 1}: {e}")
-                
-                # 接続を確実に閉じる
-                if conn is not None:
-                    try:
-                        conn.close()
-                        debug_logger.debug(f"DB{db_index}接続クローズ完了")
-                    except:
-                        pass
-
-                if ("unable to open database file" in error_msg or
-                    "database is locked" in error_msg or
-                    "database is busy" in error_msg or
-                    "disk i/o error" in error_msg) and attempt < max_retries - 1:
-                    
-                    # 指数バックオフでリトライ
-                    wait_time = retry_delay * (2 ** attempt) + (attempt * 0.05)  # ジッターを追加
-                    debug_logger.warning(f"DB{db_index}リトライ待機: {wait_time:.3f}秒 (試行{attempt + 1}/{max_retries})")
-                    print(f"🔄 DB{db_index}ビジー状態 - {wait_time:.2f}秒後にリトライ {attempt + 1}/{max_retries}: {os.path.basename(file_path)}")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    debug_logger.error(f"DB{db_index}運用エラー（リトライ不可）: {e}")
-                    print(f"❌ DB{db_index}完全層追加エラー (DB): {e}")
-                    break
-
-            except sqlite3.IntegrityError as ie:
-                error_msg = str(ie).lower()
-                debug_logger.error(f"DB{db_index}制約エラー試行{attempt + 1}: {ie}")
-                
-                # 接続を確実に閉じる
-                if conn is not None:
-                    try:
-                        conn.rollback()  # ロールバック
-                        conn.close()
-                    except Exception as close_error:
-                        debug_logger.warning(f"DB{db_index}接続クローズエラー: {close_error}")
-
-                if "constraint failed" in error_msg:
-                    print(f"🔧 DB{db_index}制約エラー修復試行: {os.path.basename(file_path)}")
-                    # データベース修復を試行
-                    try:
-                        repair_conn = sqlite3.connect(str(complete_db_path), timeout=30.0)
-                        repair_cursor = repair_conn.cursor()
-
-                        # 重複データのクリーンアップ
-                        repair_cursor.execute('DELETE FROM documents WHERE file_path = ?', (file_path,))
-                        repair_cursor.execute('DELETE FROM documents_fts WHERE file_path = ?', (file_path,))
-
-                        repair_conn.commit()
-                        repair_conn.close()
-
-                        print(f"✅ DB{db_index}制約エラー修復完了: {os.path.basename(file_path)}")
-                        debug_logger.info(f"DB{db_index}制約エラー修復成功")
-                        if attempt < max_retries - 1:
-                            continue  # リトライ
-                    except Exception as repair_error:
-                        debug_logger.error(f"DB{db_index}修復エラー: {repair_error}")
-                        print(f"❌ DB{db_index}制約エラー修復失敗: {repair_error}")
-                        break
-                else:
-                    print(f"❌ DB{db_index}完全層追加エラー (制約): {ie}")
-                    break
-
-            except Exception as e:
-                debug_logger.error(f"DB{db_index}予期しないエラー試行{attempt + 1}: {e}")
-                print(f"⚠️ DB{db_index}完全層追加エラー: {e}")
-                
-                # 接続を確実に閉じる
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except:
-                        pass
-                break
-            
-            finally:
-                # finally句で確実にクリーンアップ
-                if conn is not None:
-                    try:
-                        conn.close()
-                        debug_logger.debug(f"DB{db_index}接続最終クリーンアップ完了")
-                    except Exception as cleanup_error:
-                        debug_logger.warning(f"DB{db_index}最終クリーンアップエラー: {cleanup_error}")
-        
-        # 統計更新のシグナル（GUI更新のため）- 頻度制限
-        try:
-            if hasattr(self, '_stats_update_callback') and self._stats_update_callback:
-                if not hasattr(self, '_last_stats_update_time'):
-                    self._last_stats_update_time = 0
-                
-                current_time = time.time()
-                if current_time - self._last_stats_update_time > 2.0:  # 2秒間隔に制限
-                    self._last_stats_update_time = current_time
-                    self._stats_update_callback()
-        except Exception as callback_error:
-            debug_logger.warning(f"統計更新コールバックエラー: {callback_error}")
-            pass
-
 
     def _process_text_files_batch(self, text_files: List[Path], start_time: float) -> int:
         """テキストファイルの高速バッチ処理"""
@@ -5424,37 +4742,37 @@ class UltraFastCompliantUI:
         self.stats_label = ttk.Label(stats_frame, text="統計情報を読み込み中...")
         self.stats_label.pack(anchor=tk.W)
 
-        # 3層レイヤー状況表示
-        layer_frame = ttk.LabelFrame(main_frame, text="⚡ 3層レイヤー状況", padding=10)
+        # インデックス状況表示（FTS5 DBを唯一の真実の源とする単一ソース設計）
+        layer_frame = ttk.LabelFrame(main_frame, text="⚡ インデックス状況", padding=10)
         layer_frame.pack(fill=tk.X, pady=(0, 10))
 
         # 説明テキスト
-        explanation_label = ttk.Label(layer_frame, 
-                                    text="💡 同じファイルが複数の層に存在します。実際のファイル数は完全層（データベース）の数です。",
+        explanation_label = ttk.Label(layer_frame,
+                                    text="💡 検索対象はデータベース（FTS5）です。スキャンPDFはOCRが完了次第、本文も検索可能になります。",
                                     foreground="blue", font=("", 9))
         explanation_label.pack(anchor=tk.W, pady=(0, 5))
 
         layer_info_frame = ttk.Frame(layer_frame)
         layer_info_frame.pack(fill=tk.X)
 
-        # 即座層
+        # クエリキャッシュ（繰り返し検索の高速化用LRU）
         immediate_frame = ttk.Frame(layer_info_frame)
         immediate_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        ttk.Label(immediate_frame, text="🔴 即座層(キャッシュ)", foreground="red", font=("", 10, "bold")).pack()
-        self.immediate_label = ttk.Label(immediate_frame, text="0 ファイル")
+        ttk.Label(immediate_frame, text="🔵 クエリキャッシュ", foreground="blue", font=("", 10, "bold")).pack()
+        self.immediate_label = ttk.Label(immediate_frame, text="0 件")
         self.immediate_label.pack()
 
-        # 高速層
+        # OCR待ち（背景でOCR中のスキャンPDF件数）
         hot_frame = ttk.Frame(layer_info_frame)
         hot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        ttk.Label(hot_frame, text="🟡 高速層(キャッシュ)", foreground="orange", font=("", 10, "bold")).pack()
-        self.hot_label = ttk.Label(hot_frame, text="0 ファイル")
+        ttk.Label(hot_frame, text="🟡 OCR待ち(背景処理)", foreground="orange", font=("", 10, "bold")).pack()
+        self.hot_label = ttk.Label(hot_frame, text="0 件")
         self.hot_label.pack()
 
-        # 完全層
+        # インデックス済み（DBの実ファイル数）
         complete_frame = ttk.Frame(layer_info_frame)
         complete_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        ttk.Label(complete_frame, text="🟢 完全層(実ファイル数)", foreground="green", font=("", 10, "bold")).pack()
+        ttk.Label(complete_frame, text="🟢 インデックス済み(DB)", foreground="green", font=("", 10, "bold")).pack()
         self.complete_label = ttk.Label(complete_frame, text="0 ファイル")
         self.complete_label.pack()
 
@@ -5763,24 +5081,25 @@ class UltraFastCompliantUI:
 
             debug_logger.debug("GUI統計更新開始")
 
-            # 軽量統計（即座取得）
-            immediate_count = len(self.search_system.immediate_cache)
-            hot_count = len(self.search_system.hot_cache)
-            
-            debug_logger.debug(f"キャッシュ統計: immediate={immediate_count}, hot={hot_count}")
-            
+            # 軽量統計（即座取得）: クエリキャッシュ件数とOCR待ち件数
+            query_cache_count = len(getattr(self.search_system, '_query_result_cache', {}))
+            with self.search_system._pending_ocr_lock:
+                pending_ocr_count = len(self.search_system._pending_ocr)
+
+            debug_logger.debug(f"統計: query_cache={query_cache_count}, pending_ocr={pending_ocr_count}")
+
             # インデックス状況の取得
             indexing_status = ""
             if self.search_system.indexing_in_progress:
                 indexing_status = " 📦 [インデックス作業中]"
             elif self.search_system.indexing_results_ready:
                 indexing_status = " ✅ [インデックス完了]"
-            
-            # 即座層・高速層は即座に更新
-            self.immediate_label.config(text=f"{immediate_count:,} ファイル")
-            self.hot_label.config(text=f"{hot_count:,} ファイル")
 
-            debug_logger.debug("即座層・高速層UI更新完了")
+            # クエリキャッシュ・OCR待ちは即座に更新
+            self.immediate_label.config(text=f"{query_cache_count:,} 件")
+            self.hot_label.config(text=f"{pending_ocr_count:,} 件")
+
+            debug_logger.debug("クエリキャッシュ・OCR待ちUI更新完了")
 
             # 完全層統計はバックグラウンドで取得（8並列データベース対応）
             self._update_complete_layer_stats_async(indexing_status)
@@ -5902,9 +5221,9 @@ class UltraFastCompliantUI:
                     incremental_info = " | 増分監視: 有効"
             
             if self.search_system.indexing_in_progress:
-                cache_search_info = " | 検索: キャッシュ優先"
+                cache_search_info = " | 検索: DB（インデックス中も反映）"
             elif self.search_system.indexing_results_ready:
-                cache_search_info = " | 検索: 3層フル利用"
+                cache_search_info = " | 検索: DB(FTS5)"
                 
             self.stats_label.config(
                 text=f"総インデックス数: {total_unique_files:,} ファイル{indexing_status}{parallel_info}{cache_search_info}{incremental_info}")
@@ -5936,13 +5255,13 @@ class UltraFastCompliantUI:
     def _lightweight_statistics_update(self):
         """軽量統計更新（UI応答性重視版）"""
         try:
-            # 即座層・高速層のみ更新（重い完全層統計は省略）
-            immediate_count = len(self.search_system.immediate_cache)
-            hot_count = len(self.search_system.hot_cache)
-            
-            # 即座層・高速層ラベル更新
-            self.immediate_label.config(text=f"{immediate_count:,} ファイル")
-            self.hot_label.config(text=f"{hot_count:,} ファイル")
+            # クエリキャッシュ件数とOCR待ち件数のみ更新（重いDB統計は省略）
+            query_cache_count = len(getattr(self.search_system, '_query_result_cache', {}))
+            with self.search_system._pending_ocr_lock:
+                pending_ocr_count = len(self.search_system._pending_ocr)
+
+            self.immediate_label.config(text=f"{query_cache_count:,} 件")
+            self.hot_label.config(text=f"{pending_ocr_count:,} 件")
 
             # インデックス状況表示（軽量版）
             indexing_status = ""

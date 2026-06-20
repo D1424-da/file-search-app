@@ -30,6 +30,16 @@ from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# 🚀 Tesseract OCR の OpenMP スレッド過剰（oversubscription）を抑止する。
+#   pytesseract は tesseract バイナリを呼び出すが、tesseract は 1 呼び出しあたり
+#   複数の OpenMP スレッドを使おうとする。バルクインデックスでは外側の並列
+#   (最大8) × ページOCRの内側並列 が重なり、tesseract が多数同時に起動して
+#   コア数を大きく超えるスレッドが殺到し、コンテキストスイッチで律速する。
+#   各 tesseract を 1 スレッドに固定し、並列はアプリ側の「ファイル×ページ」
+#   並列だけで取ることでクリーンなコア活用にする。
+#   ※認識精度（検索品質）には一切影響しない。環境変数が既に指定されていれば尊重。
+os.environ.setdefault('OMP_THREAD_LIMIT', '1')
+
 # --- 外部ライブラリ（条件付きインポート・可用性フラグ） ---
 try:
     import fitz  # PyMuPDF

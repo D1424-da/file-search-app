@@ -523,17 +523,33 @@ class _FileContentExtractor:
             with zipfile.ZipFile(file_path, 'r') as xlsx:
                 # 共有文字列取得
                 #   sharedStrings.xml は <si>（文字列1個）の並び。リッチテキストの
-                #   <si> は複数の <r><t> に分割されるため、<si> 単位で配下の全 <t> を
+                #   <si> は複数の <r><t> に分割されるため、<si> 単位で本文の <t> を
                 #   連結して「1要素=1文字列」にする。旧実装は全要素の text をフラットに
                 #   集めており、<si> が複数 run を持つとインデックスがずれて別セルの
                 #   文字列が表示される（文字化け/誤内容）バグがあった。
+                #   さらに重要: 日本語版Excelはセルのふりがなを <rPh><t>…</t></rPh>
+                #   として <si> 内に保存する。si.iter('t') は再帰的なので rPh 内の
+                #   読み仮名(カタカナ)まで拾い、本文末尾に「ミセキショ」等の入力に無い
+                #   カタカナが連結される。本文は <si> 直下の <t>(単純文字列)と
+                #   <r>/<t>(リッチテキストのrun)のみで構成されるため、rPh を含む
+                #   その他の <t> は対象外にする。
                 try:
                     _ns_main = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
                     shared_strings_xml = xlsx.read('xl/sharedStrings.xml')
                     shared_root = ET.fromstring(shared_strings_xml)
                     shared_strings = []
                     for si in shared_root.iter(_ns_main + 'si'):
-                        parts = [t.text for t in si.iter(_ns_main + 't') if t.text]
+                        parts = []
+                        # <si> 直下の <t>（ふりがなを持たない単純文字列）
+                        t_direct = si.find(_ns_main + 't')
+                        if t_direct is not None and t_direct.text:
+                            parts.append(t_direct.text)
+                        # <r>/<t>（リッチテキストの run 本文）。rPh は <r> 配下に
+                        # は無いためここに混入しない。
+                        for r in si.findall(_ns_main + 'r'):
+                            for t in r.findall(_ns_main + 't'):
+                                if t.text:
+                                    parts.append(t.text)
                         shared_strings.append(''.join(parts))
                 except:
                     shared_strings = []

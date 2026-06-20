@@ -22,7 +22,7 @@ from pathlib import Path
 TARGET_EXTENSIONS = [
     '.txt', '.doc', '.docx', '.pdf', '.xls', '.xlsx', '.ppt', '.pptx',
     '.rtf', '.odt', '.ods', '.odp', '.csv', '.json', '.log',
-    '.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp', '.gif',
+    '.tif', '.tiff',
     '.dot', '.dotx', '.dotm', '.docm',
     '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',
     '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',

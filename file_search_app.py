@@ -3935,6 +3935,7 @@ class UltraFastFullCompliantSearchSystem:
                 content = self._extractor._extract_file_content(file_path)
                 _ext_dt = time.time() - _ext_t0
                 self._perf_add('extract', _ext_dt)
+                self._perf_add_ext(file_path_obj.suffix.lower() or '(なし)', _ext_dt)
                 if _ext_dt > 0.5:
                     debug_logger.warning(
                         f"🔬 抽出が遅いファイル({_ext_dt*1000:.0f}ms, {file_size/1024:.0f}KB): {file_path}")

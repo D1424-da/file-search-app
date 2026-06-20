@@ -2692,7 +2692,7 @@ class UltraFastFullCompliantSearchSystem:
                         f"🔬 抽出が遅いファイル({_ext_dt*1000:.0f}ms, {file_size/1024:.0f}KB): {file_path}")
                 # 🚀 遅延OCR: スキャンPDFや画像でOCRを後回しにした場合、保留キューへ積む。
                 #   本体完了後にバックグラウンドでOCRしてDB更新する。
-                if (file_path_obj.suffix.lower() in ('.pdf',) | image_extensions
+                if (file_path_obj.suffix.lower() in ({'.pdf'} | image_extensions)
                         and getattr(self._extractor._tls, 'pdf_needs_ocr', False)):
                     with self._pending_ocr_lock:
                         self._pending_ocr.add(file_path)

@@ -1281,6 +1281,25 @@ def _init_extraction_worker() -> None:
     multiprocessing.current_process().name  # 確認用
     _proc_extractor = _FileContentExtractor()
 
+    # 🔬 診断ログ出力先の設定（重要）
+    #   抽出は spawn された子プロセスで走るため、親プロセスでの
+    #   debug_logger 注入（extraction.debug_logger = ...）は子に伝わらない。
+    #   子プロセスの debug_logger は NullHandler のままで、ここで追加した
+    #   [PDF診断]/[OCR診断]/[抽出診断] ログがすべて捨てられてしまう。
+    #   そこでワーカー起動時に専用ファイルへ追記する FileHandler を取り付け、
+    #   全ワーカーの診断ログを一箇所に集約する（pid 付きで識別可能）。
+    #   全プロセスが同一ファイルへ追記するが、診断用途では多少の行交錯は許容。
+    if not any(isinstance(h, logging.FileHandler) for h in debug_logger.handlers):
+        try:
+            fh = logging.FileHandler('extraction_diag.log', mode='a', encoding='utf-8')
+            fh.setLevel(logging.INFO)
+            fh.setFormatter(logging.Formatter(
+                '%(asctime)s - pid%(process)d - %(levelname)s - %(message)s'))
+            debug_logger.addHandler(fh)
+            debug_logger.setLevel(logging.INFO)
+        except Exception:
+            pass
+
 
 def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tuple:
     """ワーカープロセスで呼ばれる抽出関数（CPUバウンドな本文抽出のみを担当）

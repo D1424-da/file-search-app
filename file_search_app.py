@@ -1972,19 +1972,24 @@ class _FileContentExtractor:
                 debug_logger.debug(
                     f"PDF OCR対象ページを{max_ocr_pages}ページに制限: {os.path.basename(file_path)}")
 
-            # ファイル名から日本語の可能性を判定（言語選択の最適化）
-            filename_lower = os.path.basename(file_path).lower()
-            likely_japanese = any(hint in filename_lower
-                                  for hint in ['日本語', 'japanese', 'jpn', '図面', '設計', '報告', '議事'])
-
             # 200dpi相当（72dpi * 約2.78）でレンダリング（OCR精度と速度のバランス）
             zoom = 2.0
             matrix = fitz.Matrix(zoom, zoom)
 
             ocr_config = '--oem 1 --psm 6'
 
+            # 🚀 OCRは常に jpn+eng の1パスで実行する。
+            #   対象文書はほぼ日本語（一部英数字混在）。Tesseract は jpn+eng の
+            #   1回で日英両方の文字を認識できるため、ファイル名から言語を推測して
+            #   eng→jpn と最悪2回OCRしていた旧実装を廃止。誤判定による2回OCR
+            #   （最大の遅延要因）を根絶しつつ、混在文字の取りこぼしも減って
+            #   検索品質はむしろ向上する。jpn データが無い環境のみ eng に退避。
+            #   言語データの有無は全ページ共通なので一度だけ判定してキャッシュする。
+            if getattr(self, '_ocr_lang', None) is None:
+                self._ocr_lang = 'jpn+eng'
+
             def ocr_single_page(page_num: int) -> str:
-                """単一ページをレンダリングしてOCR（並列処理用）"""
+                """単一ページをレンダリングしてOCR（並列処理用・1パス）"""
                 page = doc[page_num]
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
                 image = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -1993,22 +1998,14 @@ class _FileContentExtractor:
                 if image.mode not in ('L', '1'):
                     image = image.convert('L')
 
-                # 日本語優先 or 英語優先で言語を選択
-                lang = 'jpn+eng' if likely_japanese else 'eng'
                 try:
-                    text = pytesseract.image_to_string(image, lang=lang, config=ocr_config).strip()
+                    text = pytesseract.image_to_string(
+                        image, lang=self._ocr_lang, config=ocr_config).strip()
                 except pytesseract.TesseractError:
-                    # 言語データが無い場合は英語のみで再試行
-                    text = pytesseract.image_to_string(image, lang='eng', config=ocr_config).strip()
-
-                # 英語で結果が不十分なら日本語も試行
-                if len(text) < 5 and not likely_japanese:
-                    try:
-                        jp_text = pytesseract.image_to_string(image, lang='jpn', config=ocr_config).strip()
-                        if len(jp_text) > len(text):
-                            text = jp_text
-                    except pytesseract.TesseractError:
-                        pass
+                    # jpn 言語データが無い等の場合は eng のみへ恒久的に退避
+                    self._ocr_lang = 'eng'
+                    text = pytesseract.image_to_string(
+                        image, lang='eng', config=ocr_config).strip()
 
                 return ' '.join(text.split())
 

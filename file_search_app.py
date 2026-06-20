@@ -605,13 +605,24 @@ def setup_tesseract_path():
         return False
 
 
+# 抽出ワーカー（ProcessPool spawn）として再 import された子プロセスかどうか判定。
+#   spawn ではこのモジュールが子プロセスでも import され、本ブロックも実行される。
+#   ライブラリ自動インストール（pip）を 16 ワーカーが同時に走らせるのを防ぐため、
+#   子プロセスでは自動インストールをスキップする（ライブラリは親で導入済みの前提）。
+try:
+    import multiprocessing as _mp_boot
+    _IS_EXTRACTION_WORKER = _mp_boot.parent_process() is not None
+except Exception:
+    _IS_EXTRACTION_WORKER = False
+
 # アプリ起動時の高速ライブラリチェック
 startup_timer = time.time()
-print("🚀 ファイル検索アプリケーション高速起動中...")
-start_check_time = time.time()
-ensure_required_libraries()
-check_duration = time.time() - start_check_time
-print(f"✅ ライブラリ準備完了 ({check_duration:.2f}秒)\n")
+if not _IS_EXTRACTION_WORKER:
+    print("🚀 ファイル検索アプリケーション高速起動中...")
+    start_check_time = time.time()
+    ensure_required_libraries()
+    check_duration = time.time() - start_check_time
+    print(f"✅ ライブラリ準備完了 ({check_duration:.2f}秒)\n")
 
 # OCR関連の自動セットアップ
 ocr_setup_needed = False
@@ -1137,6 +1148,1100 @@ def enhanced_search_match(text, query_patterns):
     return False
 
 
+class _FileContentExtractor:
+    """ワーカープロセス用の軽量抽出クラス（DB・UI の依存なし）"""
+    def __init__(self):
+        self._encoding_cache: dict = {}
+        self._ocr_cache: dict = {}
+
+    def _extract_file_content(self, file_path: str) -> str:
+        """ファイル内容抽出 - 全形式対応（画像OCR含む）"""
+        try:
+            file_path_obj = Path(file_path)
+            extension = file_path_obj.suffix.lower()
+
+            if extension == '.txt':
+                return self._extract_txt_content(file_path)
+            elif extension in ['.docx', '.dotx', '.dotm', '.docm']:  # Word新形式ファイル
+                return self._extract_docx_content(file_path)
+            elif extension in ['.doc', '.dot']:  # Word旧形式ファイル
+                return self._extract_doc_content(file_path)
+            elif extension in ['.xlsx', '.xltx', '.xltm', '.xlsm', '.xlsb']:  # Excel新形式ファイル
+                return self._extract_xlsx_content(file_path)
+            elif extension in ['.xls', '.xlt']:  # Excel旧形式ファイル
+                return self._extract_xls_content(file_path)
+            elif extension == '.pdf':
+                return self._extract_pdf_content(file_path)
+            elif extension == '.zip':  # ZIPファイル内のテキストファイルを処理
+                return self._extract_zip_content(file_path)
+            elif extension in ['.tif', '.tiff']:  # 画像ファイルは検索対象外
+                return ""  # 処理をスキップ
+            elif extension in ['.jwc', '.jww', '.dxf', '.sfc', '.dwg', '.dwt', '.mpp', '.mpz']:  # CAD/図面ファイル（ファイル名のみ検索対象）
+                return ""  # 内容は抽出せず、ファイル名のみインデックス
+            else:
+                # 対象外の拡張子はスキップ
+                return ""
+
+        except Exception as e:
+            print(f"⚠️ ファイル内容抽出エラー {file_path}: {e}")
+            return ""
+
+    def _extract_txt_content(self, file_path: str) -> str:
+        """テキストファイル抽出（mmap+ストリーミング最適化・90%高速化）"""
+        try:
+            # ファイルサイズチェック
+            file_size = os.path.getsize(file_path)
+            if file_size == 0:
+                return ""
+            
+            # 🚀 エンコーディングキャッシュチェック（同じ拡張子は同じエンコーディングの可能性が高い）
+            if not hasattr(self, '_encoding_cache'):
+                self._encoding_cache = {}
+            file_ext = Path(file_path).suffix.lower()
+            cached_encoding = self._encoding_cache.get(file_ext)
+            
+            # 🚀 大容量ファイル対応: 10MB以上はmmapで効率的にアクセス
+            use_mmap = file_size > 10 * 1024 * 1024
+            
+            # 🔥 超大容量ファイル（100MB以上）は最小限のみ
+            if file_size > 100 * 1024 * 1024:
+                max_read_size = 5 * 1024 * 1024  # 5MBのみ（超高速化）
+            elif file_size > 50 * 1024 * 1024:
+                max_read_size = 10 * 1024 * 1024  # 10MBまで
+            else:
+                max_read_size = min(file_size, 20 * 1024 * 1024)  # 最大20MBまで
+            
+            # バイナリで読み込んでエンコーディング検出（最適化: 4KBで検出）
+            with open(file_path, 'rb') as f:
+                sample_data = f.read(min(4096, file_size))  # 4KBで十分（10KB→4KBで高速化）
+                
+                # バイナリファイル検出（NULL文字が多い場合）
+                null_count = sample_data.count(b'\x00')
+                if null_count > len(sample_data) * 0.1:  # 10%以上NULL文字ならバイナリ
+                    return ""
+            
+            # 🚀 エンコーディング検出の最適化: キャッシュ優先、UTF-8を最初に試行
+            detected_encoding = None
+            if cached_encoding:
+                # キャッシュがあれば優先使用
+                detected_encoding = cached_encoding
+                debug_logger.debug(f"キャッシュエンコーディング使用: {detected_encoding}")
+            elif chardet:
+                try:
+                    detection = chardet.detect(sample_data)
+                    if detection and detection['confidence'] > 0.7:
+                        detected_encoding = detection['encoding']
+                        # キャッシュに保存
+                        self._encoding_cache[file_ext] = detected_encoding
+                        debug_logger.debug(f"検出エンコーディング: {detected_encoding} (信頼度: {detection['confidence']:.2f})")
+                except Exception as e:
+                    debug_logger.warning(f"エンコーディング検出エラー: {e}")
+            
+            # エンコーディング候補リスト（UTF-8優先で高速化）
+            encodings = ['utf-8']  # UTF-8を最優先
+            if detected_encoding and detected_encoding.lower() != 'utf-8':
+                encodings.insert(0, detected_encoding)
+            encodings.extend(['cp932', 'shift_jis'])  # 日本語環境の主要エンコーディング
+            
+            # 各エンコーディングで試行（高速版）
+            for encoding in encodings:
+                try:
+                    if use_mmap and file_size > 50 * 1024 * 1024:
+                        # 🚀 50MB以上: mmapで効率的にアクセス（メモリ節約）
+                        with open(file_path, 'rb') as f:
+                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
+                                # 先頭20MBのみ読み込み（全体は読まない）
+                                chunk_data = mmapped[:max_read_size]
+                                content = chunk_data.decode(encoding, errors='strict')
+                                if content and len(content.strip()) > 0:
+                                    # エンコーディングをキャッシュ
+                                    self._encoding_cache[file_ext] = encoding
+                                    debug_logger.debug(f"mmap抽出成功: {encoding}")
+                                    return normalize_extracted_text(content)
+                    else:
+                        # 通常ファイル: 標準読み込み
+                        with open(file_path, 'r', encoding=encoding, errors='strict') as f:
+                            content = f.read(max_read_size)
+                            if content and len(content.strip()) > 0:
+                                # エンコーディングをキャッシュ
+                                self._encoding_cache[file_ext] = encoding
+                                debug_logger.debug(f"テキスト抽出成功: {encoding}")
+                                return normalize_extracted_text(content)
+                except (UnicodeDecodeError, LookupError):
+                    continue
+                except Exception as e:
+                    debug_logger.warning(f"読み込みエラー ({encoding}): {e}")
+                    continue
+            
+            # すべて失敗した場合はエラーを無視して読み込み（フォールバック）
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(max_read_size)
+                    return normalize_extracted_text(content)
+            except:
+                try:
+                    with open(file_path, 'r', encoding='cp932', errors='ignore') as f:
+                        content = f.read(max_read_size)
+                        return normalize_extracted_text(content)
+                except:
+                    return ""
+                    
+        except Exception as e:
+            debug_logger.error(f"テキスト抽出エラー {file_path}: {e}")
+            return ""
+
+    def _extract_docx_content(self, file_path: str) -> str:
+        """Word文書抽出（大容量対応・部分読み込み最適化）"""
+        try:
+            # ファイル拡張子チェック
+            file_extension = os.path.splitext(file_path)[1].lower()
+            
+            # 古い形式のWordファイル（.doc）の場合は処理をスキップ
+            if file_extension in ['.doc', '.dot']:
+                print(f"⚠️ 古い形式のWordファイルはサポートされていません: {os.path.basename(file_path)}")
+                return ""
+
+            # 🚀 ファイルサイズチェック（大容量対応）
+            file_size = os.path.getsize(file_path)
+            if file_size < 100:  # 100バイト未満は無効
+                print(f"⚠️ ファイルサイズが小さすぎます: {os.path.basename(file_path)}")
+                return ""
+            
+            # 🚀 大容量ファイル（50MB以上）は部分的に処理
+            is_large_file = file_size > 50 * 1024 * 1024
+            max_paragraphs = 1000 if is_large_file else 10000  # 大容量は1000段落まで
+
+            content = []
+
+            # ZIPファイルかどうかを事前チェック
+            try:
+                with zipfile.ZipFile(file_path, 'r') as test_zip:
+                    # word/document.xmlが存在するかチェック
+                    if 'word/document.xml' not in test_zip.namelist():
+                        debug_logger.warning(f"word/document.xmlが見つかりません: {file_path}")
+                        print(f"⚠️ 有効なWordファイルではありません（破損または別形式）: {os.path.basename(file_path)}")
+                        return ""
+            except zipfile.BadZipFile:
+                debug_logger.warning(f"ZIPファイルとして開けません: {file_path}")
+                print(f"⚠️ 破損したWordファイル: {os.path.basename(file_path)}")
+                return ""  # ZIPファイルでない場合は静かに終了
+            except Exception as e:
+                debug_logger.warning(f"Word事前チェックエラー: {file_path} - {e}")
+                return ""
+
+            with zipfile.ZipFile(file_path, 'r') as docx:
+                # メイン文書の抽出
+                xml_content = docx.read('word/document.xml')
+                root = ET.fromstring(xml_content)
+                
+                # 名前空間定義
+                namespaces = {
+                    'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+                }
+
+                # 段落とテキスト要素を順序通りに抽出
+                paragraph_count = 0
+                for para in root.findall('.//w:p', namespaces):
+                    # 🚀 大容量ファイル: 段落数制限
+                    if is_large_file and paragraph_count >= max_paragraphs:
+                        debug_logger.info(f"大容量Word: {max_paragraphs}段落で処理終了")
+                        break
+                    
+                    para_text = []
+                    for text_elem in para.findall('.//w:t', namespaces):
+                        if text_elem.text:
+                            para_text.append(text_elem.text)
+                    if para_text:
+                        content.append(''.join(para_text))
+                        paragraph_count += 1
+                
+                # ヘッダーの抽出
+                try:
+                    for header_file in [f for f in docx.namelist() if 'header' in f.lower()]:
+                        header_xml = docx.read(header_file)
+                        header_root = ET.fromstring(header_xml)
+                        for text_elem in header_root.findall('.//w:t', namespaces):
+                            if text_elem.text and text_elem.text.strip():
+                                content.append(text_elem.text.strip())
+                except:
+                    pass
+                
+                # フッターの抽出
+                try:
+                    for footer_file in [f for f in docx.namelist() if 'footer' in f.lower()]:
+                        footer_xml = docx.read(footer_file)
+                        footer_root = ET.fromstring(footer_xml)
+                        for text_elem in footer_root.findall('.//w:t', namespaces):
+                            if text_elem.text and text_elem.text.strip():
+                                content.append(text_elem.text.strip())
+                except:
+                    pass
+                
+                # 脚注・コメントの抽出
+                try:
+                    for notes_file in [f for f in docx.namelist() if 'footnotes' in f.lower() or 'comments' in f.lower()]:
+                        notes_xml = docx.read(notes_file)
+                        notes_root = ET.fromstring(notes_xml)
+                        for text_elem in notes_root.findall('.//w:t', namespaces):
+                            if text_elem.text and text_elem.text.strip():
+                                content.append(text_elem.text.strip())
+                except:
+                    pass
+
+            result = ' '.join(content)
+            return normalize_extracted_text(result)
+
+        except zipfile.BadZipFile:
+            print(f"⚠️ Wordファイルが不正なZIP形式です: {os.path.basename(file_path)}")
+            return ""
+        except Exception as e:
+            # より詳細なエラー情報を提供
+            if "zip file" in str(e).lower():
+                print(f"⚠️ WordファイルのZIP形式エラー: {os.path.basename(file_path)}")
+            else:
+                print(f"⚠️ Word抽出エラー: {os.path.basename(file_path)} - {e}")
+            return ""
+
+    def _extract_xlsx_content(self, file_path: str) -> str:
+        """Excel文書抽出（大容量対応・部分読み込み最適化）"""
+        try:
+            # ファイル拡張子チェック
+            file_extension = os.path.splitext(file_path)[1].lower()
+            
+            # 古い形式のExcelファイル（.xls）の場合は処理をスキップ
+            if file_extension in ['.xls', '.xlt']:
+                print(f"⚠️ 古い形式のExcelファイルはサポートされていません: {os.path.basename(file_path)}")
+                return ""
+            
+            # 🚀 ファイルサイズチェック（大容量対応）
+            file_size = os.path.getsize(file_path)
+            is_large_file = file_size > 50 * 1024 * 1024
+            max_rows = 5000 if is_large_file else 50000  # 大容量は5000行まで
+            max_sheets = 3 if is_large_file else 10  # 大容量は3シートまで
+            
+            # ZIPファイルかどうかを事前チェック
+            try:
+                with zipfile.ZipFile(file_path, 'r') as test_zip:
+                    # Excel形式の必須ファイルが存在するかチェック
+                    if 'xl/workbook.xml' not in test_zip.namelist():
+                        print(f"⚠️ 有効なExcelファイルではありません: {os.path.basename(file_path)}")
+                        return ""
+            except zipfile.BadZipFile:
+                print(f"⚠️ ZIPファイルでないため処理をスキップ: {os.path.basename(file_path)}")
+                return ""
+            except Exception as e:
+                print(f"⚠️ Excelファイル検証エラー: {os.path.basename(file_path)} - {e}")
+                return ""
+            
+            content = []
+            with zipfile.ZipFile(file_path, 'r') as xlsx:
+                # 共有文字列取得
+                try:
+                    shared_strings_xml = xlsx.read('xl/sharedStrings.xml')
+                    shared_root = ET.fromstring(shared_strings_xml)
+                    shared_strings = [elem.text or '' for elem in shared_root.iter() if elem.text]
+                except:
+                    shared_strings = []
+
+                # ワークシート処理
+                try:
+                    workbook_xml = xlsx.read('xl/workbook.xml')
+                    wb_root = ET.fromstring(workbook_xml)
+                    
+                    # 名前空間定義
+                    ns = {'': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+
+                    sheet_files = [f for f in xlsx.namelist() if f.startswith('xl/worksheets/sheet')]
+                    
+                    # 🚀 大容量ファイル: シート数制限
+                    processed_sheets = 0
+                    for sheet_file in sheet_files:
+                        if is_large_file and processed_sheets >= max_sheets:
+                            debug_logger.info(f"大容量Excel: {max_sheets}シートで処理終了")
+                            break
+                        
+                        sheet_xml = xlsx.read(sheet_file)
+                        sheet_root = ET.fromstring(sheet_xml)
+                        
+                        # 🚀 大容量ファイル: 行数制限
+                        row_count = 0
+                        # セルを順番に処理
+                        for row in sheet_root.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'):
+                            if is_large_file and row_count >= max_rows:
+                                debug_logger.info(f"大容量Excel: シート{processed_sheets+1}で{max_rows}行処理")
+                                break
+                            row_count += 1
+                            for cell in row.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
+                                cell_type = cell.get('t', 'n')  # セルタイプ: s=文字列, n=数値, b=ブール等
+                                
+                                # セル値を取得
+                                v_elem = cell.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v')
+                                if v_elem is not None and v_elem.text:
+                                    value = v_elem.text.strip()
+                                    
+                                    if cell_type == 's':  # 共有文字列参照
+                                        try:
+                                            index = int(value)
+                                            if 0 <= index < len(shared_strings):
+                                                text = shared_strings[index]
+                                                if text and len(text) > 0:
+                                                    content.append(text)
+                                        except (ValueError, IndexError):
+                                            pass
+                                    elif cell_type == 'str':  # 数式の文字列結果
+                                        if value and len(value) > 0:
+                                            content.append(value)
+                                    elif value and not value.replace('.', '').replace('-', '').isdigit():
+                                        # 数値以外の直接値
+                                        if len(value) > 0:
+                                            content.append(value)
+                                    elif value and len(value) > 2:  # 長い数値は保持（ID等）
+                                        content.append(value)
+                        
+                        processed_sheets += 1
+
+                except Exception as e:
+                    print(f"⚠️ Excelシート処理エラー: {e}")
+
+            result = ' '.join(content)
+            return normalize_extracted_text(result)
+
+        except zipfile.BadZipFile:
+            print(f"⚠️ Excelファイルが不正なZIP形式です: {os.path.basename(file_path)}")
+            return ""
+        except Exception as e:
+            # より詳細なエラー情報を提供
+            if "zip file" in str(e).lower():
+                print(f"⚠️ ExcelファイルのZIP形式エラー: {os.path.basename(file_path)}")
+            else:
+                print(f"⚠️ Excel抽出エラー: {os.path.basename(file_path)} - {e}")
+            return ""
+
+    def _extract_zip_content(self, file_path: str) -> str:
+        """ZIPファイル内のテキストファイル抽出"""
+        try:
+            content = []
+            max_files = 50  # 処理するファイル数の上限
+            max_file_size = 1024 * 1024  # 1ファイルあたりの最大サイズ（1MB）
+            processed_files = 0
+            
+            # サポートするテキストファイル拡張子
+            text_extensions = {'.txt', '.md', '.log', '.csv', '.json', '.xml', '.html', '.htm', '.py', '.js', '.css'}
+            
+            with zipfile.ZipFile(file_path, 'r') as zip_file:
+                for file_info in zip_file.infolist():
+                    # ディレクトリをスキップ
+                    if file_info.is_dir():
+                        continue
+                    
+                    # ファイル数制限チェック
+                    if processed_files >= max_files:
+                        print(f"📦 ZIPファイル内ファイル数制限到達: {max_files}件")
+                        break
+                    
+                    # ファイル名とサイズチェック
+                    file_name = file_info.filename
+                    file_ext = os.path.splitext(file_name)[1].lower()
+                    
+                    # テキストファイルのみ処理
+                    if file_ext not in text_extensions:
+                        continue
+                    
+                    # ファイルサイズチェック
+                    if file_info.file_size > max_file_size:
+                        print(f"📦 ZIPファイル内の大きなファイルをスキップ: {file_name} ({file_info.file_size} bytes)")
+                        continue
+                    
+                    try:
+                        # ファイル内容を抽出
+                        with zip_file.open(file_info) as inner_file:
+                            # エンコーディング自動検出
+                            raw_data = inner_file.read()
+                            
+                            # UTF-8で試行
+                            try:
+                                text_content = raw_data.decode('utf-8')
+                            except UnicodeDecodeError:
+                                # Shift_JISで試行
+                                try:
+                                    text_content = raw_data.decode('shift_jis')
+                                except UnicodeDecodeError:
+                                    # chardetライブラリで自動検出
+                                    try:
+                                        import chardet
+                                        detected = chardet.detect(raw_data)
+                                        if detected['encoding']:
+                                            text_content = raw_data.decode(detected['encoding'])
+                                        else:
+                                            text_content = raw_data.decode('utf-8', errors='ignore')
+                                    except (ImportError, UnicodeDecodeError):
+                                        text_content = raw_data.decode('utf-8', errors='ignore')
+                            
+                            # テキスト内容を追加（ファイル名も含める）
+                            if text_content.strip():
+                                content.append(f"[{file_name}]\n{text_content.strip()}")
+                                processed_files += 1
+                    
+                    except Exception as inner_error:
+                        print(f"📦 ZIPファイル内ファイル処理エラー {file_name}: {inner_error}")
+                        continue
+            
+            result = '\n\n'.join(content)
+            if result:
+                print(f"📦 ZIPファイル処理完了: {processed_files}個のテキストファイルを抽出")
+            return result
+            
+        except zipfile.BadZipFile:
+            print(f"⚠️ 不正なZIPファイル: {file_path}")
+            return ""
+        except Exception as e:
+            print(f"⚠️ ZIP抽出エラー: {e}")
+            return ""
+
+    def _extract_xls_content(self, file_path: str) -> str:
+        """古い形式のExcel(.xls)ファイル抽出"""
+        try:
+            if xlrd is None:
+                print(f"⚠️ xlrdライブラリが必要です（古い形式Excel用）: {os.path.basename(file_path)}")
+                return ""
+            
+            content = []
+            
+            # xlrdでExcelファイルを開く
+            workbook = xlrd.open_workbook(file_path)
+            
+            # 全シートを処理
+            for sheet_index in range(workbook.nsheets):
+                sheet = workbook.sheet_by_index(sheet_index)
+                
+                # シート名を追加
+                sheet_name = workbook.sheet_names()[sheet_index]
+                content.append(f"[シート: {sheet_name}]")
+                
+                # 各行・列を処理
+                for row_idx in range(sheet.nrows):
+                    row_values = []
+                    for col_idx in range(sheet.ncols):
+                        cell = sheet.cell(row_idx, col_idx)
+                        
+                        # セルタイプに応じて値を取得
+                        if cell.ctype == xlrd.XL_CELL_TEXT:
+                            value = cell.value.strip()
+                        elif cell.ctype == xlrd.XL_CELL_NUMBER:
+                            # 数値の場合、整数なら整数として表示
+                            if cell.value == int(cell.value):
+                                value = str(int(cell.value))
+                            else:
+                                value = str(cell.value)
+                        elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                            value = str(bool(cell.value))
+                        elif cell.ctype == xlrd.XL_CELL_DATE:
+                            # 日付の場合
+                            date_tuple = xlrd.xldate_as_tuple(cell.value, workbook.datemode)
+                            value = f"{date_tuple[0]}/{date_tuple[1]}/{date_tuple[2]}"
+                        else:
+                            value = str(cell.value) if cell.value else ""
+                        
+                        if value and len(value.strip()) > 0:
+                            row_values.append(value.strip())
+                    
+                    if row_values:
+                        content.append(' '.join(row_values))
+            
+            result = '\n'.join(content)
+            if result:
+                print(f"📊 古い形式Excel処理完了: {os.path.basename(file_path)}")
+            return result
+            
+        except Exception as e:
+            print(f"⚠️ 古い形式Excel抽出エラー: {os.path.basename(file_path)} - {e}")
+            return ""
+
+    def _extract_doc_content(self, file_path: str) -> str:
+        """古い形式のWord(.doc)ファイル抽出"""
+        try:
+            # ファイルの存在確認
+            if not os.path.exists(file_path):
+                print(f"⚠️ DOCファイルが見つかりません: {file_path}")
+                return ""
+            
+            # ファイルサイズの確認
+            try:
+                file_size = os.path.getsize(file_path)
+                if file_size == 0:
+                    print(f"⚠️ DOCファイルが空です: {os.path.basename(file_path)}")
+                    return ""
+                elif file_size > 100 * 1024 * 1024:  # 100MB制限
+                    print(f"⚠️ DOCファイルが大きすぎます ({file_size/1024/1024:.1f}MB): {os.path.basename(file_path)}")
+                    return ""
+            except OSError as size_error:
+                print(f"⚠️ DOCファイルサイズ取得エラー: {os.path.basename(file_path)} - {size_error}")
+                return ""
+            
+            print(f"🔄 DOC処理開始: {os.path.basename(file_path)} ({file_size/1024:.1f}KB)")
+
+            base_name = os.path.basename(file_path)
+
+            # 1. OLE2形式（本物の旧.doc）かどうかを先に判定する。
+            #    OLE2なら docx2txt は必ず失敗する（.docはzipではない）ため呼ばない。
+            is_ole = False
+            if olefile is not None:
+                try:
+                    is_ole = olefile.isOleFile(file_path)
+                except Exception:
+                    is_ole = False
+
+            # 2. OLE2形式: WordDocumentストリームから本文テキストを抽出（日本語対応）
+            if is_ole and olefile is not None:
+                debug_logger.debug(f"OLE2形式のDOCを検出: {base_name}")
+                try:
+                    with olefile.OleFileIO(file_path) as ole:
+                        if ole.exists('WordDocument'):
+                            raw = ole.openstream('WordDocument').read()
+                            text = self._readable_text_from_bytes(raw)
+                            if text:
+                                text = normalize_extracted_text(text, max_length=500000)
+                                print(f"✅ OLE2 DOC本文抽出成功: {base_name} - {len(text)} 文字")
+                                return text
+                except Exception as olefile_error:
+                    debug_logger.warning(f"olefile処理エラー: {base_name} - {olefile_error}")
+
+            # 3. 非OLE2（.docx を .doc 拡張子にしている等）の場合のみ docx2txt を試行
+            elif docx2txt is not None:
+                try:
+                    content = docx2txt.process(file_path)
+                    if content and content.strip():
+                        print(f"✅ docx2txtでDOC処理成功: {base_name} - 長さ: {len(content)} 文字")
+                        return content.strip()
+                except Exception as docx2txt_error:
+                    debug_logger.debug(f"docx2txt処理スキップ: {base_name} - {docx2txt_error}")
+
+            # 4. 最後の手段: ファイル全体からの可読テキスト抽出（日本語対応）
+            try:
+                with open(file_path, 'rb') as f:
+                    data = f.read(min(file_size, 4 * 1024 * 1024))  # 最大4MB読み込み
+                text = self._readable_text_from_bytes(data)
+                if text:
+                    text = normalize_extracted_text(text, max_length=500000)
+                    print(f"✅ バイナリ解析成功: {base_name} - {len(text)} 文字")
+                    return text
+            except Exception as binary_error:
+                debug_logger.warning(f"バイナリ解析エラー: {base_name} - {binary_error}")
+
+            # 5. 全ての方法が失敗した場合は基本情報のみ（ファイル名検索は可能）
+            debug_logger.info(f"DOC内容抽出失敗、ファイル名のみインデックス: {base_name}")
+            return f"Microsoft Word文書 - {base_name}"
+            
+        except Exception as e:
+            print(f"⚠️ DOC抽出エラー: {os.path.basename(file_path)} - {e}")
+            return ""
+
+    def _readable_text_from_bytes(self, data: bytes) -> str:
+        """バイナリ(.doc等)から可読テキストを抽出（日本語対応）。
+
+        旧.docはWordDocumentストリーム内に本文をUTF-16LEで持つことが多いため、
+        UTF-16LE と CP932(Shift_JIS) の両方でデコードを試し、日本語(ひらがな・
+        カタカナ・漢字・全角)と英数字・基本記号のみを残してノイズを除去する。
+        より多くの意味のある文字が取れたデコード結果を採用する。
+        ASCIIのみを拾う旧実装と違い、日本語の.doc本文も検索対象にできる。
+        """
+        def filter_readable(text: str) -> str:
+            kept = []
+            for ch in text:
+                o = ord(ch)
+                if (ch.isalnum() or ch == ' '
+                        or 0x3000 <= o <= 0x30ff      # 句読点・ひらがな・カタカナ
+                        or 0x4e00 <= o <= 0x9fff      # 漢字（CJK統合）
+                        or 0xff00 <= o <= 0xffef      # 全角英数・半角カナ
+                        or ch in '、。・「」『』（）【】〜ー－.,!?:;()[]{}/_-'):
+                    kept.append(ch)
+                else:
+                    kept.append(' ')
+            return ' '.join(''.join(kept).split())
+
+        def quality_score(text: str) -> int:
+            # 長い連続トークン（4文字以上）の総文字数で評価する。
+            # 正しいデコードは本文が長い連続語として現れ、誤デコード(別エンコーディングでの
+            # 誤読)は短い断片が散在するため、誤読のゴミを高評価しにくい。
+            return sum(len(tok) for tok in text.split() if len(tok) >= 4)
+
+        best = ""
+        best_score = 0
+        for enc in ('utf-16-le', 'cp932'):
+            try:
+                decoded = data.decode(enc, errors='ignore')
+            except Exception:
+                continue
+            cleaned = filter_readable(decoded)
+            score = quality_score(cleaned)
+            if score > best_score:
+                best_score = score
+                best = cleaned
+
+        # 意味のある連続テキストが極端に少ない場合はノイズとみなして破棄
+        return best if best_score >= 8 else ""
+
+    def _extract_pdf_content(self, file_path: str) -> str:
+        """PDF文書抽出（ページ並列化で80%高速化）"""
+        try:
+            # ファイル存在とアクセス権限チェック
+            if not os.path.exists(file_path):
+                debug_logger.warning(f"PDFファイルが存在しません: {file_path}")
+                return ""
+
+            if not os.access(file_path, os.R_OK):
+                debug_logger.warning(f"PDFファイル読み取り権限なし: {file_path}")
+                return ""
+
+            file_size = os.path.getsize(file_path)
+            if file_size < 50:  # 50バイト未満は無効PDFとみなす
+                debug_logger.warning(f"PDFファイルサイズが小さすぎます: {file_path}")
+                return ""
+
+            # 大容量PDF対応: 200MBまで処理可能
+            if file_size > 200 * 1024 * 1024:  # 200MB以上は処理スキップ
+                print(
+                    f"⚠️ PDFファイルが大きすぎます: {os.path.basename(file_path)} ({file_size / 1024 / 1024:.1f}MB)"
+                )
+                return ""
+
+            # PyMuPDF使用を試行（ファイルパス正規化付き）
+            try:
+                import fitz
+
+                # ファイルパスの正規化（特殊文字・Unicode対応）
+                normalized_path = os.path.normpath(os.path.abspath(file_path))
+
+                # ファイルアクセステスト
+                with open(normalized_path, 'rb') as test_file:
+                    test_file.read(1024)  # 1KBテスト読み込み
+
+                # PyMuPDFでPDF開く
+                doc = fitz.open(normalized_path)
+                
+                # 🚀 ページ数に応じた処理戦略
+                total_pages = doc.page_count
+                max_pages = min(total_pages, 200)  # 最大200ページ（500→200で高速化）
+
+                # ページ番号 -> 抽出テキスト（テキスト層が無いページの検出に使用）
+                page_texts = {}
+
+                # 🚀 並列処理でページ抽出（10ページ以上の場合）
+                if max_pages >= 10:
+                    def extract_single_page(page_num: int) -> str:
+                        """単一ページ抽出（並列処理用）"""
+                        try:
+                            page = doc[page_num]
+                            # 最も高速な方法を優先（失敗時のみフォールバック）
+                            try:
+                                page_text = page.get_text("text", sort=True)
+                                if page_text and len(page_text.strip()) > 10:
+                                    return ' '.join(page_text.split())
+                            except:
+                                pass
+                            # フォールバック: ブロック単位抽出
+                            blocks = page.get_text("blocks")
+                            block_texts = [block[4].strip() for block in blocks if len(block) >= 5 and block[4].strip()]
+                            return ' '.join(block_texts)
+                        except Exception as e:
+                            debug_logger.warning(f"ページ{page_num}抽出エラー: {e}")
+                            return ""
+
+                    # 🚀 並列ページ抽出（最大4スレッド）
+                    with ThreadPoolExecutor(max_workers=4) as executor:
+                        futures = {executor.submit(extract_single_page, i): i for i in range(max_pages)}
+                        for future in as_completed(futures):
+                            page_num = futures[future]
+                            try:
+                                page_text = future.result(timeout=5.0)  # 5秒タイムアウト
+                                if page_text:
+                                    page_texts[page_num] = page_text
+                            except Exception:
+                                continue
+                else:
+                    # 少ないページは従来の同期処理
+                    for page_num in range(max_pages):
+                        try:
+                            page = doc[page_num]
+                            page_text = page.get_text("text", sort=True)
+                            if page_text and page_text.strip():
+                                normalized = ' '.join(page_text.split())
+                                if len(normalized) > 0:
+                                    page_texts[page_num] = normalized
+                        except Exception as page_error:
+                            debug_logger.warning(f"PDFページ {page_num} 読み取りエラー: {page_error}")
+                            continue
+
+                # 🔥 OCRフォールバック: テキスト層が無い（=スキャン）ページを画像化してOCR
+                # テキスト層がほぼ皆無のページのみ対象にする（短いが正規のテキスト層を持つ
+                # ページ＝章扉・ページ番号のみ等をOCR結果で上書きして劣化させないため）
+                ocr_target_pages = [p for p in range(max_pages)
+                                    if len(page_texts.get(p, "")) < 3]
+                if ocr_target_pages:
+                    ocr_results = self._ocr_pdf_pages(doc, ocr_target_pages, file_path)
+                    for page_num, ocr_text in ocr_results.items():
+                        if not ocr_text:
+                            continue
+                        existing = page_texts.get(page_num, "")
+                        # 既存のテキスト層は温存し、OCR結果を追記する
+                        page_texts[page_num] = f"{existing} {ocr_text}".strip() if existing else ocr_text
+
+                doc.close()
+
+                # ページ順に結合
+                content = [page_texts[p] for p in sorted(page_texts.keys())]
+                extracted_text = ' '.join(content)
+                
+                # 正規化処理を適用
+                extracted_text = normalize_extracted_text(extracted_text, max_length=500000)
+                
+                if content:
+                    debug_logger.debug(f"PDF抽出成功: {file_path} ({len(extracted_text)} 文字)")
+                    return extracted_text
+                else:
+                    debug_logger.warning(f"PDF内容が空です: {file_path}")
+                    return ""
+
+            except ImportError:
+                debug_logger.warning("PyMuPDF未インストール - 基本PDF抽出使用")
+            except PermissionError as pe:
+                debug_logger.error(f"PDFファイルアクセス権限エラー: {pe}")
+                return ""
+            except FileNotFoundError as fnf:
+                debug_logger.error(f"PDFファイルが見つかりません: {fnf}")
+                return ""
+            except Exception as e:
+                debug_logger.error(f"PyMuPDF抽出エラー: {e}")
+
+            # フォールバック：基本PDF抽出（ファイルアクセス安全版）
+            try:
+                with open(file_path, 'rb') as f:
+                    raw_content = f.read(1024 * 1024)  # 最初の1MBのみ読み込み
+
+                # 基本的なPDFテキスト抽出
+                import re
+                text_pattern = re.compile(rb'\(([^)]*)\)')
+                matches = text_pattern.findall(raw_content)
+                extracted_text = []
+
+                for match in matches:
+                    try:
+                        decoded = match.decode('utf-8', errors='ignore')
+                        if len(decoded.strip()) > 2:  # 意味のあるテキストのみ
+                            extracted_text.append(decoded)
+                    except:
+                        continue
+
+                return ' '.join(extracted_text)
+
+            except Exception as e:
+                print(f"⚠️ 基本PDF抽出エラー: {e}")
+                return ""
+
+        except Exception as e:
+            print(f"⚠️ PDF抽出エラー: {e}")
+            return ""
+
+    def _ocr_pdf_pages(self, doc, page_nums, file_path: str) -> dict:
+        """テキスト層の無いPDFページを画像化してOCR抽出
+
+        スキャン（画像ベース）PDF対応。各ページをPyMuPDFでレンダリングし、
+        pytesseractでテキスト抽出する。
+        戻り値: {ページ番号: 抽出テキスト}
+        """
+        results = {}
+        try:
+            # OCRライブラリの利用可能性チェック
+            if not PIL_AVAILABLE or not TESSERACT_AVAILABLE:
+                debug_logger.debug("PDF OCRフォールバック: OCRライブラリ未導入のためスキップ")
+                return results
+
+            try:
+                pytesseract.get_tesseract_version()
+            except pytesseract.TesseractNotFoundError:
+                debug_logger.debug("PDF OCRフォールバック: Tesseract未導入のためスキップ")
+                return results
+
+            import io
+            import fitz
+
+            # 処理過多防止: OCR対象ページ数を制限（速度優先）
+            max_ocr_pages = 30
+            target_pages = list(page_nums)[:max_ocr_pages]
+            if len(page_nums) > max_ocr_pages:
+                debug_logger.debug(
+                    f"PDF OCR対象ページを{max_ocr_pages}ページに制限: {os.path.basename(file_path)}")
+
+            # ファイル名から日本語の可能性を判定（言語選択の最適化）
+            filename_lower = os.path.basename(file_path).lower()
+            likely_japanese = any(hint in filename_lower
+                                  for hint in ['日本語', 'japanese', 'jpn', '図面', '設計', '報告', '議事'])
+
+            # 200dpi相当（72dpi * 約2.78）でレンダリング（OCR精度と速度のバランス）
+            zoom = 2.0
+            matrix = fitz.Matrix(zoom, zoom)
+
+            ocr_config = '--oem 1 --psm 6'
+
+            def ocr_single_page(page_num: int) -> str:
+                """単一ページをレンダリングしてOCR（並列処理用）"""
+                page = doc[page_num]
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                image = Image.open(io.BytesIO(pix.tobytes("png")))
+
+                # グレースケール化（OCR精度向上・高速化）
+                if image.mode not in ('L', '1'):
+                    image = image.convert('L')
+
+                # 日本語優先 or 英語優先で言語を選択
+                lang = 'jpn+eng' if likely_japanese else 'eng'
+                try:
+                    text = pytesseract.image_to_string(image, lang=lang, config=ocr_config).strip()
+                except pytesseract.TesseractError:
+                    # 言語データが無い場合は英語のみで再試行
+                    text = pytesseract.image_to_string(image, lang='eng', config=ocr_config).strip()
+
+                # 英語で結果が不十分なら日本語も試行
+                if len(text) < 5 and not likely_japanese:
+                    try:
+                        jp_text = pytesseract.image_to_string(image, lang='jpn', config=ocr_config).strip()
+                        if len(jp_text) > len(text):
+                            text = jp_text
+                    except pytesseract.TesseractError:
+                        pass
+
+                return ' '.join(text.split())
+
+            # 🚀 並列OCR（テキスト抽出と同じ最大4スレッド）＋ページ単位タイムアウトでハング防止
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {executor.submit(ocr_single_page, p): p for p in target_pages}
+                for future in as_completed(futures):
+                    page_num = futures[future]
+                    try:
+                        text = future.result(timeout=30.0)  # 1ページ最大30秒
+                        if len(text) >= 2:
+                            results[page_num] = text
+                    except Exception as page_error:
+                        debug_logger.warning(f"PDF OCRページ {page_num} エラー: {page_error}")
+                        continue
+
+            if results:
+                ocr_chars = sum(len(t) for t in results.values())
+                print(f"✅ PDF OCRフォールバック成功 ({os.path.basename(file_path)}): "
+                      f"{len(results)}ページ / {ocr_chars}文字")
+
+        except Exception as e:
+            debug_logger.warning(f"PDF OCRフォールバックエラー ({os.path.basename(file_path)}): {e}")
+
+        return results
+
+    def _extract_image_content(self, file_path: str) -> str:
+        """.tifファイルからOCRでテキスト抽出（超高速最適化版・キャッシュ強化）"""
+        try:
+            # 🚀 キャッシュチェック（最優先）
+            if hasattr(self, '_ocr_cache'):
+                cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
+                if cache_key in self._ocr_cache:
+                    cached_result = self._ocr_cache[cache_key]
+                    print(f"⚡ OCRキャッシュヒット: {os.path.basename(file_path)} ({len(cached_result)}文字)")
+                    return cached_result
+            else:
+                self._ocr_cache = {}
+
+            # OCRライブラリが利用可能かチェック
+            if not PIL_AVAILABLE or not TESSERACT_AVAILABLE:
+                return ""
+
+            # Tesseractエンジンの利用可能性を確認
+            try:
+                pytesseract.get_tesseract_version()
+            except pytesseract.TesseractNotFoundError:
+                return ""
+
+            # 🔥 超高速スキップ条件（ファイルサイズ最適化）
+            file_size = os.path.getsize(file_path)
+            if file_size < 1024:  # 1KB未満は処理しない
+                return ""
+            if file_size > 30 * 1024 * 1024:  # 30MB以上は処理しない（より厳格）
+                print(f"⚠️ .tif画像ファイルが大きすぎます ({file_path}): {file_size/1024/1024:.1f}MB")
+                return ""
+            
+            # 🚀 超高速画像読み込み・検証
+            try:
+                image = Image.open(file_path)
+                
+                # 画像フォーマット・モード最適化チェック
+                if image.mode not in ['L', 'RGB', 'RGBA', '1']:
+                    image = image.convert('RGB')
+                
+                # 画像サイズチェックと超高速最適化
+                width, height = image.size
+                total_pixels = width * height
+                
+                # 🔥 動的解像度調整: ファイルサイズに応じて最適な画素数を選択
+                # 小さいファイル: 高解像度でOCR精度向上
+                # 大きいファイル: 低解像度で処理速度優先
+                if file_size < 2 * 1024 * 1024:  # 2MB未満
+                    max_pixels = 1500000  # 150万画素（精度優先）
+                elif file_size < 5 * 1024 * 1024:  # 5MB未満
+                    max_pixels = 1000000  # 100万画素（バランス）
+                else:  # 5MB以上
+                    max_pixels = 600000   # 60万画素（速度優先）
+                
+                if total_pixels > max_pixels:
+                    scale_factor = (max_pixels / total_pixels) ** 0.5
+                    new_width = int(width * scale_factor)
+                    new_height = int(height * scale_factor)
+                    # 高速リサイズアルゴリズム使用
+                    image = image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+                    total_pixels = new_width * new_height
+                    debug_logger.debug(f"動的リサイズ ({os.path.basename(file_path)}): {width}x{height} -> {new_width}x{new_height}")
+                
+                # 小さすぎる画像はスキップ
+                if total_pixels < 10000:  # 100x100未満はスキップ
+                    return ""
+                
+            except Exception as e:
+                print(f"⚠️ 画像読み込みエラー ({file_path}): {e}")
+                return ""
+            
+            # 🚀 超高速OCR設定（速度最優先）
+            ultra_fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん'  # 文字制限で高速化
+            
+            # 🔥 適応型前処理: 画像特性に応じて最適な前処理を選択
+            processed_image = image
+            
+            # 前処理が必要な条件: カラー画像かつ中規模サイズ
+            needs_preprocessing = (image.mode != 'L' and 
+                                  total_pixels < 500000 and 
+                                  file_size > 500 * 1024)  # 500KB以上
+            
+            if CV2_AVAILABLE and needs_preprocessing:
+                try:
+                    import numpy as np
+                    image_array = np.array(image)
+                    
+                    # グレースケール変換（最も効果的な前処理）
+                    if len(image_array.shape) == 3:
+                        gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+                        
+                        # 小さいファイルのみ二値化を追加（OCR精度向上）
+                        if file_size < 2 * 1024 * 1024:
+                            # 適応的二値化: 照明ムラに強い
+                            gray = cv2.adaptiveThreshold(
+                                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 11, 2)
+                        
+                        processed_image = Image.fromarray(gray)
+                except Exception:
+                    processed_image = image
+            
+            # 🚀 超高速OCR実行（段階的最適化 + 言語検出）
+            text = ""
+            
+            # ファイル名から言語をヒント取得（処理の最適化）
+            filename_lower = os.path.basename(file_path).lower()
+            likely_japanese = any(hint in filename_lower for hint in ['日本語', 'japanese', 'jpn', '図面', '設計'])
+            
+            # Phase 1: 超高速英数字のみ（最も高速）
+            try:
+                if not likely_japanese:  # 日本語の可能性が低い場合のみ
+                    fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+                    text = pytesseract.image_to_string(processed_image, lang='eng', config=fast_config).strip()
+                
+                # Phase 2: 結果が不十分な場合のみ通常英語OCR
+                if len(text) < 5:
+                    text = pytesseract.image_to_string(processed_image, lang='eng', config='--oem 1 --psm 6').strip()
+                
+                # Phase 3: 最後の手段として日本語（処理時間が増加）
+                # 小さいファイルまたは日本語の可能性が高い場合のみ試行
+                if (len(text) < 3 and file_size < 5 * 1024 * 1024) or likely_japanese:
+                    try:
+                        jp_text = pytesseract.image_to_string(processed_image, lang='jpn', config='--oem 1 --psm 6').strip()
+                        if len(jp_text) > len(text):
+                            text = jp_text
+                    except pytesseract.TesseractError:
+                        pass
+                        
+            except pytesseract.TesseractError as te:
+                try:
+                    # 最終フォールバック：最小設定
+                    text = pytesseract.image_to_string(processed_image, config='--psm 6').strip()
+                except pytesseract.TesseractError:
+                    print(f"⚠️ OCR実行完全失敗 ({os.path.basename(file_path)}): {te}")
+                    return ""
+            
+            # 🔥 結果検証と最適化
+            text = text.strip()
+            
+            # 無意味な結果をフィルタリング
+            if len(text) < 2:
+                result = ""
+            elif len(set(text.replace(' ', '').replace('\n', ''))) < 3:  # 文字種類が少なすぎる
+                result = ""
+            else:
+                # テキスト正規化（高速版）
+                text = ' '.join(text.split())  # 余分な空白を削除
+                result = text[:5000]  # 最大5000文字に制限
+            
+            # 🚀 キャッシュに保存（成功・失敗を問わず）
+            cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
+            self._ocr_cache[cache_key] = result
+            
+            # キャッシュサイズ制限
+            if len(self._ocr_cache) > 1000:
+                # 古いエントリを削除（LRU的）
+                oldest_keys = list(self._ocr_cache.keys())[:100]
+                for key in oldest_keys:
+                    del self._ocr_cache[key]
+            
+            # 結果表示（成功時のみ）
+            if result and len(result) > 10:
+                print(f"✅ 超高速OCR成功 ({os.path.basename(file_path)}): {len(result)}文字")
+            
+            return result
+            
+        except Exception as e:
+            print(f"⚠️ 超高速OCR処理エラー {os.path.basename(file_path)}: {e}")
+            # エラーもキャッシュして再試行を防ぐ
+            if hasattr(self, '_ocr_cache'):
+                cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
+                self._ocr_cache[cache_key] = ""
+            return ""
+
+
+
+# --- ProcessPool 抽出ワーカー（GIL 回避） ---
+_proc_extractor: Optional['_FileContentExtractor'] = None
+
+
+def _init_extraction_worker() -> None:
+    """各ワーカープロセスで一度だけ呼ばれる初期化関数"""
+    global _proc_extractor
+    import multiprocessing
+    multiprocessing.current_process().name  # 確認用
+    _proc_extractor = _FileContentExtractor()
+
+
+def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tuple:
+    """ワーカープロセスで呼ばれる抽出関数（CPUバウンドな本文抽出のみを担当）
+
+    前処理（隠しファイル/差分スキップ/サイズ判定）は親プロセスで実施済みである
+    ことを前提とし、ここでは純粋に本文抽出だけを行う。
+
+    戻り値: (file_path, content, file_size, modified_time, extract_seconds)
+    エラー時: (file_path, None, file_size, modified_time, extract_seconds)
+    """
+    global _proc_extractor
+    if _proc_extractor is None:
+        _proc_extractor = _FileContentExtractor()
+    _t0 = time.time()
+    try:
+        content = _proc_extractor._extract_file_content(file_path)
+        return (file_path, content, file_size, modified_time, time.time() - _t0)
+    except Exception:
+        return (file_path, None, file_size, modified_time, time.time() - _t0)
+
 class UltraFastFullCompliantSearchSystem:
     """100%仕様適合 超高速全文検索システム（動的並列データベース版）"""
 
@@ -1396,6 +2501,7 @@ class UltraFastFullCompliantSearchSystem:
         
         # 🚀 OCRキャッシュ初期化（画像処理高速化）
         self._ocr_cache = {}  # OCRキャッシュ（重複処理防止）
+        self._extractor = _FileContentExtractor()
 
         self.initialize_database()
         
@@ -2792,7 +3898,7 @@ class UltraFastFullCompliantSearchSystem:
                 # ファイル内容抽出（性能診断のため時間計測）
                 debug_logger.debug(f"コンテンツ抽出開始: {file_path}")
                 _ext_t0 = time.time()
-                content = self._extract_file_content(file_path)
+                content = self._extractor._extract_file_content(file_path)
                 _ext_dt = time.time() - _ext_t0
                 self._perf_add('extract', _ext_dt)
                 if _ext_dt > 0.5:
@@ -2803,6 +3909,17 @@ class UltraFastFullCompliantSearchSystem:
                 return False
 
             debug_logger.info(f"コンテンツ抽出成功: {file_path} ({len(content)}文字)")
+            return self._store_indexed_content(file_path, content, file_size, modified_time)
+
+        except Exception as e:
+            debug_logger.error(f"ファイルインデックスエラー {file_path}: {e}")
+            print(f"❌ ファイルインデックスエラー {file_path}: {e}")
+            return False
+
+    def _store_indexed_content(self, file_path: str, content: str, file_size: int, modified_time: float) -> bool:
+        """抽出済みコンテンツをキャッシュ・DBに書き込む（ProcessPool 対応）"""
+        try:
+            file_path_obj = Path(file_path)
             file_hash = hashlib.md5(content.encode('utf-8', errors='ignore')).hexdigest()
             debug_logger.debug(f"ハッシュ計算完了: {file_hash[:8]}...")
 
@@ -2815,8 +3932,7 @@ class UltraFastFullCompliantSearchSystem:
                 'modified_time': modified_time,
             }
 
-            # 即座層へ登録（軽量メタのみ・O(1)FIFO退避）。一括/単発を問わず登録するので
-            # UIの3層レイヤー状況が常に動いて見える。重い処理はしないのでスループットへの影響は軽微。
+            # 即座層へ登録（軽量メタのみ・O(1)FIFO退避）
             def safe_truncate_utf8(text: str, max_length: int) -> str:
                 if len(text) <= max_length:
                     return text
@@ -2836,29 +3952,29 @@ class UltraFastFullCompliantSearchSystem:
                 'indexed_time': time.time(),
                 'layer': 'immediate'
             }
-            # O(1) FIFO退避（挿入順で最古を削除。sort のO(n log n)を回避）
+            # O(1) FIFO退避
             while len(self.immediate_cache) > self.max_immediate_cache:
                 try:
                     del self.immediate_cache[next(iter(self.immediate_cache))]
                 except (StopIteration, KeyError):
                     break
 
-            # 高速層へ移動（即座層から移動・本文プレビュー保持）
+            # 高速層へ移動
             self._move_to_hot_layer(file_path, content)
 
-            # 完全層(DB)へバッチ書き込み（書き込み専用スレッドでシャード並列バルクインサート）
+            # 完全層(DB)へバッチ書き込み
             self._enqueue_complete_layer(file_path, content, base_data, file_hash)
 
             self.stats["indexed_files"] += 1
-            # 差分インデックス用キャッシュを更新（次回以降の再インデックスでスキップ判定に使う）
+            # 差分インデックス用キャッシュを更新
             with self._index_mtime_lock:
                 self._index_mtime_cache[file_path] = modified_time
             debug_logger.info(f"3層構造最適化インデックス完了: {file_path}")
             return True
 
         except Exception as e:
-            debug_logger.error(f"ファイルインデックスエラー {file_path}: {e}")
-            print(f"❌ ファイルインデックスエラー {file_path}: {e}")
+            debug_logger.error(f"ストアエラー {file_path}: {e}")
+            print(f"❌ ストアエラー {file_path}: {e}")
             return False
 
     def _move_to_hot_layer(self, file_path: str, content: str):
@@ -3556,1158 +4672,6 @@ class UltraFastFullCompliantSearchSystem:
             debug_logger.warning(f"統計更新コールバックエラー: {callback_error}")
             pass
 
-    def _extract_file_content(self, file_path: str) -> str:
-        """ファイル内容抽出 - 全形式対応（画像OCR含む）"""
-        try:
-            file_path_obj = Path(file_path)
-            extension = file_path_obj.suffix.lower()
-
-            if extension == '.txt':
-                return self._extract_txt_content(file_path)
-            elif extension in ['.docx', '.dotx', '.dotm', '.docm']:  # Word新形式ファイル
-                return self._extract_docx_content(file_path)
-            elif extension in ['.doc', '.dot']:  # Word旧形式ファイル
-                return self._extract_doc_content(file_path)
-            elif extension in ['.xlsx', '.xltx', '.xltm', '.xlsm', '.xlsb']:  # Excel新形式ファイル
-                return self._extract_xlsx_content(file_path)
-            elif extension in ['.xls', '.xlt']:  # Excel旧形式ファイル
-                return self._extract_xls_content(file_path)
-            elif extension == '.pdf':
-                return self._extract_pdf_content(file_path)
-            elif extension == '.zip':  # ZIPファイル内のテキストファイルを処理
-                return self._extract_zip_content(file_path)
-            elif extension in ['.tif', '.tiff']:  # 画像ファイルは検索対象外
-                return ""  # 処理をスキップ
-            elif extension in ['.jwc', '.jww', '.dxf', '.sfc', '.dwg', '.dwt', '.mpp', '.mpz']:  # CAD/図面ファイル（ファイル名のみ検索対象）
-                return ""  # 内容は抽出せず、ファイル名のみインデックス
-            else:
-                # 対象外の拡張子はスキップ
-                return ""
-
-        except Exception as e:
-            print(f"⚠️ ファイル内容抽出エラー {file_path}: {e}")
-            return ""
-
-    def _extract_txt_content(self, file_path: str) -> str:
-        """テキストファイル抽出（mmap+ストリーミング最適化・90%高速化）"""
-        try:
-            # ファイルサイズチェック
-            file_size = os.path.getsize(file_path)
-            if file_size == 0:
-                return ""
-            
-            # 🚀 エンコーディングキャッシュチェック（同じ拡張子は同じエンコーディングの可能性が高い）
-            if not hasattr(self, '_encoding_cache'):
-                self._encoding_cache = {}
-            file_ext = Path(file_path).suffix.lower()
-            cached_encoding = self._encoding_cache.get(file_ext)
-            
-            # 🚀 大容量ファイル対応: 10MB以上はmmapで効率的にアクセス
-            use_mmap = file_size > 10 * 1024 * 1024
-            
-            # 🔥 超大容量ファイル（100MB以上）は最小限のみ
-            if file_size > 100 * 1024 * 1024:
-                max_read_size = 5 * 1024 * 1024  # 5MBのみ（超高速化）
-            elif file_size > 50 * 1024 * 1024:
-                max_read_size = 10 * 1024 * 1024  # 10MBまで
-            else:
-                max_read_size = min(file_size, 20 * 1024 * 1024)  # 最大20MBまで
-            
-            # バイナリで読み込んでエンコーディング検出（最適化: 4KBで検出）
-            with open(file_path, 'rb') as f:
-                sample_data = f.read(min(4096, file_size))  # 4KBで十分（10KB→4KBで高速化）
-                
-                # バイナリファイル検出（NULL文字が多い場合）
-                null_count = sample_data.count(b'\x00')
-                if null_count > len(sample_data) * 0.1:  # 10%以上NULL文字ならバイナリ
-                    return ""
-            
-            # 🚀 エンコーディング検出の最適化: キャッシュ優先、UTF-8を最初に試行
-            detected_encoding = None
-            if cached_encoding:
-                # キャッシュがあれば優先使用
-                detected_encoding = cached_encoding
-                debug_logger.debug(f"キャッシュエンコーディング使用: {detected_encoding}")
-            elif chardet:
-                try:
-                    detection = chardet.detect(sample_data)
-                    if detection and detection['confidence'] > 0.7:
-                        detected_encoding = detection['encoding']
-                        # キャッシュに保存
-                        self._encoding_cache[file_ext] = detected_encoding
-                        debug_logger.debug(f"検出エンコーディング: {detected_encoding} (信頼度: {detection['confidence']:.2f})")
-                except Exception as e:
-                    debug_logger.warning(f"エンコーディング検出エラー: {e}")
-            
-            # エンコーディング候補リスト（UTF-8優先で高速化）
-            encodings = ['utf-8']  # UTF-8を最優先
-            if detected_encoding and detected_encoding.lower() != 'utf-8':
-                encodings.insert(0, detected_encoding)
-            encodings.extend(['cp932', 'shift_jis'])  # 日本語環境の主要エンコーディング
-            
-            # 各エンコーディングで試行（高速版）
-            for encoding in encodings:
-                try:
-                    if use_mmap and file_size > 50 * 1024 * 1024:
-                        # 🚀 50MB以上: mmapで効率的にアクセス（メモリ節約）
-                        with open(file_path, 'rb') as f:
-                            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mmapped:
-                                # 先頭20MBのみ読み込み（全体は読まない）
-                                chunk_data = mmapped[:max_read_size]
-                                content = chunk_data.decode(encoding, errors='strict')
-                                if content and len(content.strip()) > 0:
-                                    # エンコーディングをキャッシュ
-                                    self._encoding_cache[file_ext] = encoding
-                                    debug_logger.debug(f"mmap抽出成功: {encoding}")
-                                    return normalize_extracted_text(content)
-                    else:
-                        # 通常ファイル: 標準読み込み
-                        with open(file_path, 'r', encoding=encoding, errors='strict') as f:
-                            content = f.read(max_read_size)
-                            if content and len(content.strip()) > 0:
-                                # エンコーディングをキャッシュ
-                                self._encoding_cache[file_ext] = encoding
-                                debug_logger.debug(f"テキスト抽出成功: {encoding}")
-                                return normalize_extracted_text(content)
-                except (UnicodeDecodeError, LookupError):
-                    continue
-                except Exception as e:
-                    debug_logger.warning(f"読み込みエラー ({encoding}): {e}")
-                    continue
-            
-            # すべて失敗した場合はエラーを無視して読み込み（フォールバック）
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read(max_read_size)
-                    return normalize_extracted_text(content)
-            except:
-                try:
-                    with open(file_path, 'r', encoding='cp932', errors='ignore') as f:
-                        content = f.read(max_read_size)
-                        return normalize_extracted_text(content)
-                except:
-                    return ""
-                    
-        except Exception as e:
-            debug_logger.error(f"テキスト抽出エラー {file_path}: {e}")
-            return ""
-
-    def _extract_docx_content(self, file_path: str) -> str:
-        """Word文書抽出（大容量対応・部分読み込み最適化）"""
-        try:
-            # ファイル拡張子チェック
-            file_extension = os.path.splitext(file_path)[1].lower()
-            
-            # 古い形式のWordファイル（.doc）の場合は処理をスキップ
-            if file_extension in ['.doc', '.dot']:
-                print(f"⚠️ 古い形式のWordファイルはサポートされていません: {os.path.basename(file_path)}")
-                return ""
-
-            # 🚀 ファイルサイズチェック（大容量対応）
-            file_size = os.path.getsize(file_path)
-            if file_size < 100:  # 100バイト未満は無効
-                print(f"⚠️ ファイルサイズが小さすぎます: {os.path.basename(file_path)}")
-                return ""
-            
-            # 🚀 大容量ファイル（50MB以上）は部分的に処理
-            is_large_file = file_size > 50 * 1024 * 1024
-            max_paragraphs = 1000 if is_large_file else 10000  # 大容量は1000段落まで
-
-            content = []
-
-            # ZIPファイルかどうかを事前チェック
-            try:
-                with zipfile.ZipFile(file_path, 'r') as test_zip:
-                    # word/document.xmlが存在するかチェック
-                    if 'word/document.xml' not in test_zip.namelist():
-                        debug_logger.warning(f"word/document.xmlが見つかりません: {file_path}")
-                        print(f"⚠️ 有効なWordファイルではありません（破損または別形式）: {os.path.basename(file_path)}")
-                        return ""
-            except zipfile.BadZipFile:
-                debug_logger.warning(f"ZIPファイルとして開けません: {file_path}")
-                print(f"⚠️ 破損したWordファイル: {os.path.basename(file_path)}")
-                return ""  # ZIPファイルでない場合は静かに終了
-            except Exception as e:
-                debug_logger.warning(f"Word事前チェックエラー: {file_path} - {e}")
-                return ""
-
-            with zipfile.ZipFile(file_path, 'r') as docx:
-                # メイン文書の抽出
-                xml_content = docx.read('word/document.xml')
-                root = ET.fromstring(xml_content)
-                
-                # 名前空間定義
-                namespaces = {
-                    'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-                }
-
-                # 段落とテキスト要素を順序通りに抽出
-                paragraph_count = 0
-                for para in root.findall('.//w:p', namespaces):
-                    # 🚀 大容量ファイル: 段落数制限
-                    if is_large_file and paragraph_count >= max_paragraphs:
-                        debug_logger.info(f"大容量Word: {max_paragraphs}段落で処理終了")
-                        break
-                    
-                    para_text = []
-                    for text_elem in para.findall('.//w:t', namespaces):
-                        if text_elem.text:
-                            para_text.append(text_elem.text)
-                    if para_text:
-                        content.append(''.join(para_text))
-                        paragraph_count += 1
-                
-                # ヘッダーの抽出
-                try:
-                    for header_file in [f for f in docx.namelist() if 'header' in f.lower()]:
-                        header_xml = docx.read(header_file)
-                        header_root = ET.fromstring(header_xml)
-                        for text_elem in header_root.findall('.//w:t', namespaces):
-                            if text_elem.text and text_elem.text.strip():
-                                content.append(text_elem.text.strip())
-                except:
-                    pass
-                
-                # フッターの抽出
-                try:
-                    for footer_file in [f for f in docx.namelist() if 'footer' in f.lower()]:
-                        footer_xml = docx.read(footer_file)
-                        footer_root = ET.fromstring(footer_xml)
-                        for text_elem in footer_root.findall('.//w:t', namespaces):
-                            if text_elem.text and text_elem.text.strip():
-                                content.append(text_elem.text.strip())
-                except:
-                    pass
-                
-                # 脚注・コメントの抽出
-                try:
-                    for notes_file in [f for f in docx.namelist() if 'footnotes' in f.lower() or 'comments' in f.lower()]:
-                        notes_xml = docx.read(notes_file)
-                        notes_root = ET.fromstring(notes_xml)
-                        for text_elem in notes_root.findall('.//w:t', namespaces):
-                            if text_elem.text and text_elem.text.strip():
-                                content.append(text_elem.text.strip())
-                except:
-                    pass
-
-            result = ' '.join(content)
-            return normalize_extracted_text(result)
-
-        except zipfile.BadZipFile:
-            print(f"⚠️ Wordファイルが不正なZIP形式です: {os.path.basename(file_path)}")
-            return ""
-        except Exception as e:
-            # より詳細なエラー情報を提供
-            if "zip file" in str(e).lower():
-                print(f"⚠️ WordファイルのZIP形式エラー: {os.path.basename(file_path)}")
-            else:
-                print(f"⚠️ Word抽出エラー: {os.path.basename(file_path)} - {e}")
-            return ""
-
-    def _extract_xlsx_content(self, file_path: str) -> str:
-        """Excel文書抽出（大容量対応・部分読み込み最適化）"""
-        try:
-            # ファイル拡張子チェック
-            file_extension = os.path.splitext(file_path)[1].lower()
-            
-            # 古い形式のExcelファイル（.xls）の場合は処理をスキップ
-            if file_extension in ['.xls', '.xlt']:
-                print(f"⚠️ 古い形式のExcelファイルはサポートされていません: {os.path.basename(file_path)}")
-                return ""
-            
-            # 🚀 ファイルサイズチェック（大容量対応）
-            file_size = os.path.getsize(file_path)
-            is_large_file = file_size > 50 * 1024 * 1024
-            max_rows = 5000 if is_large_file else 50000  # 大容量は5000行まで
-            max_sheets = 3 if is_large_file else 10  # 大容量は3シートまで
-            
-            # ZIPファイルかどうかを事前チェック
-            try:
-                with zipfile.ZipFile(file_path, 'r') as test_zip:
-                    # Excel形式の必須ファイルが存在するかチェック
-                    if 'xl/workbook.xml' not in test_zip.namelist():
-                        print(f"⚠️ 有効なExcelファイルではありません: {os.path.basename(file_path)}")
-                        return ""
-            except zipfile.BadZipFile:
-                print(f"⚠️ ZIPファイルでないため処理をスキップ: {os.path.basename(file_path)}")
-                return ""
-            except Exception as e:
-                print(f"⚠️ Excelファイル検証エラー: {os.path.basename(file_path)} - {e}")
-                return ""
-            
-            content = []
-            with zipfile.ZipFile(file_path, 'r') as xlsx:
-                # 共有文字列取得
-                try:
-                    shared_strings_xml = xlsx.read('xl/sharedStrings.xml')
-                    shared_root = ET.fromstring(shared_strings_xml)
-                    shared_strings = [elem.text or '' for elem in shared_root.iter() if elem.text]
-                except:
-                    shared_strings = []
-
-                # ワークシート処理
-                try:
-                    workbook_xml = xlsx.read('xl/workbook.xml')
-                    wb_root = ET.fromstring(workbook_xml)
-                    
-                    # 名前空間定義
-                    ns = {'': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-
-                    sheet_files = [f for f in xlsx.namelist() if f.startswith('xl/worksheets/sheet')]
-                    
-                    # 🚀 大容量ファイル: シート数制限
-                    processed_sheets = 0
-                    for sheet_file in sheet_files:
-                        if is_large_file and processed_sheets >= max_sheets:
-                            debug_logger.info(f"大容量Excel: {max_sheets}シートで処理終了")
-                            break
-                        
-                        sheet_xml = xlsx.read(sheet_file)
-                        sheet_root = ET.fromstring(sheet_xml)
-                        
-                        # 🚀 大容量ファイル: 行数制限
-                        row_count = 0
-                        # セルを順番に処理
-                        for row in sheet_root.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'):
-                            if is_large_file and row_count >= max_rows:
-                                debug_logger.info(f"大容量Excel: シート{processed_sheets+1}で{max_rows}行処理")
-                                break
-                            row_count += 1
-                            for cell in row.iter('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c'):
-                                cell_type = cell.get('t', 'n')  # セルタイプ: s=文字列, n=数値, b=ブール等
-                                
-                                # セル値を取得
-                                v_elem = cell.find('{http://schemas.openxmlformats.org/spreadsheetml/2006/main}v')
-                                if v_elem is not None and v_elem.text:
-                                    value = v_elem.text.strip()
-                                    
-                                    if cell_type == 's':  # 共有文字列参照
-                                        try:
-                                            index = int(value)
-                                            if 0 <= index < len(shared_strings):
-                                                text = shared_strings[index]
-                                                if text and len(text) > 0:
-                                                    content.append(text)
-                                        except (ValueError, IndexError):
-                                            pass
-                                    elif cell_type == 'str':  # 数式の文字列結果
-                                        if value and len(value) > 0:
-                                            content.append(value)
-                                    elif value and not value.replace('.', '').replace('-', '').isdigit():
-                                        # 数値以外の直接値
-                                        if len(value) > 0:
-                                            content.append(value)
-                                    elif value and len(value) > 2:  # 長い数値は保持（ID等）
-                                        content.append(value)
-                        
-                        processed_sheets += 1
-
-                except Exception as e:
-                    print(f"⚠️ Excelシート処理エラー: {e}")
-
-            result = ' '.join(content)
-            return normalize_extracted_text(result)
-
-        except zipfile.BadZipFile:
-            print(f"⚠️ Excelファイルが不正なZIP形式です: {os.path.basename(file_path)}")
-            return ""
-        except Exception as e:
-            # より詳細なエラー情報を提供
-            if "zip file" in str(e).lower():
-                print(f"⚠️ ExcelファイルのZIP形式エラー: {os.path.basename(file_path)}")
-            else:
-                print(f"⚠️ Excel抽出エラー: {os.path.basename(file_path)} - {e}")
-            return ""
-
-    def _extract_zip_content(self, file_path: str) -> str:
-        """ZIPファイル内のテキストファイル抽出"""
-        try:
-            content = []
-            max_files = 50  # 処理するファイル数の上限
-            max_file_size = 1024 * 1024  # 1ファイルあたりの最大サイズ（1MB）
-            processed_files = 0
-            
-            # サポートするテキストファイル拡張子
-            text_extensions = {'.txt', '.md', '.log', '.csv', '.json', '.xml', '.html', '.htm', '.py', '.js', '.css'}
-            
-            with zipfile.ZipFile(file_path, 'r') as zip_file:
-                for file_info in zip_file.infolist():
-                    # ディレクトリをスキップ
-                    if file_info.is_dir():
-                        continue
-                    
-                    # ファイル数制限チェック
-                    if processed_files >= max_files:
-                        print(f"📦 ZIPファイル内ファイル数制限到達: {max_files}件")
-                        break
-                    
-                    # ファイル名とサイズチェック
-                    file_name = file_info.filename
-                    file_ext = os.path.splitext(file_name)[1].lower()
-                    
-                    # テキストファイルのみ処理
-                    if file_ext not in text_extensions:
-                        continue
-                    
-                    # ファイルサイズチェック
-                    if file_info.file_size > max_file_size:
-                        print(f"📦 ZIPファイル内の大きなファイルをスキップ: {file_name} ({file_info.file_size} bytes)")
-                        continue
-                    
-                    try:
-                        # ファイル内容を抽出
-                        with zip_file.open(file_info) as inner_file:
-                            # エンコーディング自動検出
-                            raw_data = inner_file.read()
-                            
-                            # UTF-8で試行
-                            try:
-                                text_content = raw_data.decode('utf-8')
-                            except UnicodeDecodeError:
-                                # Shift_JISで試行
-                                try:
-                                    text_content = raw_data.decode('shift_jis')
-                                except UnicodeDecodeError:
-                                    # chardetライブラリで自動検出
-                                    try:
-                                        import chardet
-                                        detected = chardet.detect(raw_data)
-                                        if detected['encoding']:
-                                            text_content = raw_data.decode(detected['encoding'])
-                                        else:
-                                            text_content = raw_data.decode('utf-8', errors='ignore')
-                                    except (ImportError, UnicodeDecodeError):
-                                        text_content = raw_data.decode('utf-8', errors='ignore')
-                            
-                            # テキスト内容を追加（ファイル名も含める）
-                            if text_content.strip():
-                                content.append(f"[{file_name}]\n{text_content.strip()}")
-                                processed_files += 1
-                    
-                    except Exception as inner_error:
-                        print(f"📦 ZIPファイル内ファイル処理エラー {file_name}: {inner_error}")
-                        continue
-            
-            result = '\n\n'.join(content)
-            if result:
-                print(f"📦 ZIPファイル処理完了: {processed_files}個のテキストファイルを抽出")
-            return result
-            
-        except zipfile.BadZipFile:
-            print(f"⚠️ 不正なZIPファイル: {file_path}")
-            return ""
-        except Exception as e:
-            print(f"⚠️ ZIP抽出エラー: {e}")
-            return ""
-
-    def _extract_xls_content(self, file_path: str) -> str:
-        """古い形式のExcel(.xls)ファイル抽出"""
-        try:
-            if xlrd is None:
-                print(f"⚠️ xlrdライブラリが必要です（古い形式Excel用）: {os.path.basename(file_path)}")
-                return ""
-            
-            content = []
-            
-            # xlrdでExcelファイルを開く
-            workbook = xlrd.open_workbook(file_path)
-            
-            # 全シートを処理
-            for sheet_index in range(workbook.nsheets):
-                sheet = workbook.sheet_by_index(sheet_index)
-                
-                # シート名を追加
-                sheet_name = workbook.sheet_names()[sheet_index]
-                content.append(f"[シート: {sheet_name}]")
-                
-                # 各行・列を処理
-                for row_idx in range(sheet.nrows):
-                    row_values = []
-                    for col_idx in range(sheet.ncols):
-                        cell = sheet.cell(row_idx, col_idx)
-                        
-                        # セルタイプに応じて値を取得
-                        if cell.ctype == xlrd.XL_CELL_TEXT:
-                            value = cell.value.strip()
-                        elif cell.ctype == xlrd.XL_CELL_NUMBER:
-                            # 数値の場合、整数なら整数として表示
-                            if cell.value == int(cell.value):
-                                value = str(int(cell.value))
-                            else:
-                                value = str(cell.value)
-                        elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
-                            value = str(bool(cell.value))
-                        elif cell.ctype == xlrd.XL_CELL_DATE:
-                            # 日付の場合
-                            date_tuple = xlrd.xldate_as_tuple(cell.value, workbook.datemode)
-                            value = f"{date_tuple[0]}/{date_tuple[1]}/{date_tuple[2]}"
-                        else:
-                            value = str(cell.value) if cell.value else ""
-                        
-                        if value and len(value.strip()) > 0:
-                            row_values.append(value.strip())
-                    
-                    if row_values:
-                        content.append(' '.join(row_values))
-            
-            result = '\n'.join(content)
-            if result:
-                print(f"📊 古い形式Excel処理完了: {os.path.basename(file_path)}")
-            return result
-            
-        except Exception as e:
-            print(f"⚠️ 古い形式Excel抽出エラー: {os.path.basename(file_path)} - {e}")
-            return ""
-
-    def _extract_doc_content(self, file_path: str) -> str:
-        """古い形式のWord(.doc)ファイル抽出"""
-        try:
-            # ファイルの存在確認
-            if not os.path.exists(file_path):
-                print(f"⚠️ DOCファイルが見つかりません: {file_path}")
-                return ""
-            
-            # ファイルサイズの確認
-            try:
-                file_size = os.path.getsize(file_path)
-                if file_size == 0:
-                    print(f"⚠️ DOCファイルが空です: {os.path.basename(file_path)}")
-                    return ""
-                elif file_size > 100 * 1024 * 1024:  # 100MB制限
-                    print(f"⚠️ DOCファイルが大きすぎます ({file_size/1024/1024:.1f}MB): {os.path.basename(file_path)}")
-                    return ""
-            except OSError as size_error:
-                print(f"⚠️ DOCファイルサイズ取得エラー: {os.path.basename(file_path)} - {size_error}")
-                return ""
-            
-            print(f"🔄 DOC処理開始: {os.path.basename(file_path)} ({file_size/1024:.1f}KB)")
-
-            base_name = os.path.basename(file_path)
-
-            # 1. OLE2形式（本物の旧.doc）かどうかを先に判定する。
-            #    OLE2なら docx2txt は必ず失敗する（.docはzipではない）ため呼ばない。
-            is_ole = False
-            if olefile is not None:
-                try:
-                    is_ole = olefile.isOleFile(file_path)
-                except Exception:
-                    is_ole = False
-
-            # 2. OLE2形式: WordDocumentストリームから本文テキストを抽出（日本語対応）
-            if is_ole and olefile is not None:
-                debug_logger.debug(f"OLE2形式のDOCを検出: {base_name}")
-                try:
-                    with olefile.OleFileIO(file_path) as ole:
-                        if ole.exists('WordDocument'):
-                            raw = ole.openstream('WordDocument').read()
-                            text = self._readable_text_from_bytes(raw)
-                            if text:
-                                text = normalize_extracted_text(text, max_length=500000)
-                                print(f"✅ OLE2 DOC本文抽出成功: {base_name} - {len(text)} 文字")
-                                return text
-                except Exception as olefile_error:
-                    debug_logger.warning(f"olefile処理エラー: {base_name} - {olefile_error}")
-
-            # 3. 非OLE2（.docx を .doc 拡張子にしている等）の場合のみ docx2txt を試行
-            elif docx2txt is not None:
-                try:
-                    content = docx2txt.process(file_path)
-                    if content and content.strip():
-                        print(f"✅ docx2txtでDOC処理成功: {base_name} - 長さ: {len(content)} 文字")
-                        return content.strip()
-                except Exception as docx2txt_error:
-                    debug_logger.debug(f"docx2txt処理スキップ: {base_name} - {docx2txt_error}")
-
-            # 4. 最後の手段: ファイル全体からの可読テキスト抽出（日本語対応）
-            try:
-                with open(file_path, 'rb') as f:
-                    data = f.read(min(file_size, 4 * 1024 * 1024))  # 最大4MB読み込み
-                text = self._readable_text_from_bytes(data)
-                if text:
-                    text = normalize_extracted_text(text, max_length=500000)
-                    print(f"✅ バイナリ解析成功: {base_name} - {len(text)} 文字")
-                    return text
-            except Exception as binary_error:
-                debug_logger.warning(f"バイナリ解析エラー: {base_name} - {binary_error}")
-
-            # 5. 全ての方法が失敗した場合は基本情報のみ（ファイル名検索は可能）
-            debug_logger.info(f"DOC内容抽出失敗、ファイル名のみインデックス: {base_name}")
-            return f"Microsoft Word文書 - {base_name}"
-            
-        except Exception as e:
-            print(f"⚠️ DOC抽出エラー: {os.path.basename(file_path)} - {e}")
-            return ""
-
-    def _readable_text_from_bytes(self, data: bytes) -> str:
-        """バイナリ(.doc等)から可読テキストを抽出（日本語対応）。
-
-        旧.docはWordDocumentストリーム内に本文をUTF-16LEで持つことが多いため、
-        UTF-16LE と CP932(Shift_JIS) の両方でデコードを試し、日本語(ひらがな・
-        カタカナ・漢字・全角)と英数字・基本記号のみを残してノイズを除去する。
-        より多くの意味のある文字が取れたデコード結果を採用する。
-        ASCIIのみを拾う旧実装と違い、日本語の.doc本文も検索対象にできる。
-        """
-        def filter_readable(text: str) -> str:
-            kept = []
-            for ch in text:
-                o = ord(ch)
-                if (ch.isalnum() or ch == ' '
-                        or 0x3000 <= o <= 0x30ff      # 句読点・ひらがな・カタカナ
-                        or 0x4e00 <= o <= 0x9fff      # 漢字（CJK統合）
-                        or 0xff00 <= o <= 0xffef      # 全角英数・半角カナ
-                        or ch in '、。・「」『』（）【】〜ー－.,!?:;()[]{}/_-'):
-                    kept.append(ch)
-                else:
-                    kept.append(' ')
-            return ' '.join(''.join(kept).split())
-
-        def quality_score(text: str) -> int:
-            # 長い連続トークン（4文字以上）の総文字数で評価する。
-            # 正しいデコードは本文が長い連続語として現れ、誤デコード(別エンコーディングでの
-            # 誤読)は短い断片が散在するため、誤読のゴミを高評価しにくい。
-            return sum(len(tok) for tok in text.split() if len(tok) >= 4)
-
-        best = ""
-        best_score = 0
-        for enc in ('utf-16-le', 'cp932'):
-            try:
-                decoded = data.decode(enc, errors='ignore')
-            except Exception:
-                continue
-            cleaned = filter_readable(decoded)
-            score = quality_score(cleaned)
-            if score > best_score:
-                best_score = score
-                best = cleaned
-
-        # 意味のある連続テキストが極端に少ない場合はノイズとみなして破棄
-        return best if best_score >= 8 else ""
-
-    def _extract_pdf_content(self, file_path: str) -> str:
-        """PDF文書抽出（ページ並列化で80%高速化）"""
-        try:
-            # ファイル存在とアクセス権限チェック
-            if not os.path.exists(file_path):
-                debug_logger.warning(f"PDFファイルが存在しません: {file_path}")
-                return ""
-
-            if not os.access(file_path, os.R_OK):
-                debug_logger.warning(f"PDFファイル読み取り権限なし: {file_path}")
-                return ""
-
-            file_size = os.path.getsize(file_path)
-            if file_size < 50:  # 50バイト未満は無効PDFとみなす
-                debug_logger.warning(f"PDFファイルサイズが小さすぎます: {file_path}")
-                return ""
-
-            # 大容量PDF対応: 200MBまで処理可能
-            if file_size > 200 * 1024 * 1024:  # 200MB以上は処理スキップ
-                print(
-                    f"⚠️ PDFファイルが大きすぎます: {os.path.basename(file_path)} ({file_size / 1024 / 1024:.1f}MB)"
-                )
-                return ""
-
-            # PyMuPDF使用を試行（ファイルパス正規化付き）
-            try:
-                import fitz
-
-                # ファイルパスの正規化（特殊文字・Unicode対応）
-                normalized_path = os.path.normpath(os.path.abspath(file_path))
-
-                # ファイルアクセステスト
-                with open(normalized_path, 'rb') as test_file:
-                    test_file.read(1024)  # 1KBテスト読み込み
-
-                # PyMuPDFでPDF開く
-                doc = fitz.open(normalized_path)
-                
-                # 🚀 ページ数に応じた処理戦略
-                total_pages = doc.page_count
-                max_pages = min(total_pages, 200)  # 最大200ページ（500→200で高速化）
-
-                # ページ番号 -> 抽出テキスト（テキスト層が無いページの検出に使用）
-                page_texts = {}
-
-                # 🚀 並列処理でページ抽出（10ページ以上の場合）
-                if max_pages >= 10:
-                    def extract_single_page(page_num: int) -> str:
-                        """単一ページ抽出（並列処理用）"""
-                        try:
-                            page = doc[page_num]
-                            # 最も高速な方法を優先（失敗時のみフォールバック）
-                            try:
-                                page_text = page.get_text("text", sort=True)
-                                if page_text and len(page_text.strip()) > 10:
-                                    return ' '.join(page_text.split())
-                            except:
-                                pass
-                            # フォールバック: ブロック単位抽出
-                            blocks = page.get_text("blocks")
-                            block_texts = [block[4].strip() for block in blocks if len(block) >= 5 and block[4].strip()]
-                            return ' '.join(block_texts)
-                        except Exception as e:
-                            debug_logger.warning(f"ページ{page_num}抽出エラー: {e}")
-                            return ""
-
-                    # 🚀 並列ページ抽出（最大4スレッド）
-                    with ThreadPoolExecutor(max_workers=4) as executor:
-                        futures = {executor.submit(extract_single_page, i): i for i in range(max_pages)}
-                        for future in as_completed(futures):
-                            page_num = futures[future]
-                            try:
-                                page_text = future.result(timeout=5.0)  # 5秒タイムアウト
-                                if page_text:
-                                    page_texts[page_num] = page_text
-                            except Exception:
-                                continue
-                else:
-                    # 少ないページは従来の同期処理
-                    for page_num in range(max_pages):
-                        try:
-                            page = doc[page_num]
-                            page_text = page.get_text("text", sort=True)
-                            if page_text and page_text.strip():
-                                normalized = ' '.join(page_text.split())
-                                if len(normalized) > 0:
-                                    page_texts[page_num] = normalized
-                        except Exception as page_error:
-                            debug_logger.warning(f"PDFページ {page_num} 読み取りエラー: {page_error}")
-                            continue
-
-                # 🔥 OCRフォールバック: テキスト層が無い（=スキャン）ページを画像化してOCR
-                # テキスト層がほぼ皆無のページのみ対象にする（短いが正規のテキスト層を持つ
-                # ページ＝章扉・ページ番号のみ等をOCR結果で上書きして劣化させないため）
-                ocr_target_pages = [p for p in range(max_pages)
-                                    if len(page_texts.get(p, "")) < 3]
-                if ocr_target_pages:
-                    ocr_results = self._ocr_pdf_pages(doc, ocr_target_pages, file_path)
-                    for page_num, ocr_text in ocr_results.items():
-                        if not ocr_text:
-                            continue
-                        existing = page_texts.get(page_num, "")
-                        # 既存のテキスト層は温存し、OCR結果を追記する
-                        page_texts[page_num] = f"{existing} {ocr_text}".strip() if existing else ocr_text
-
-                doc.close()
-
-                # ページ順に結合
-                content = [page_texts[p] for p in sorted(page_texts.keys())]
-                extracted_text = ' '.join(content)
-                
-                # 正規化処理を適用
-                extracted_text = normalize_extracted_text(extracted_text, max_length=500000)
-                
-                if content:
-                    debug_logger.debug(f"PDF抽出成功: {file_path} ({len(extracted_text)} 文字)")
-                    return extracted_text
-                else:
-                    debug_logger.warning(f"PDF内容が空です: {file_path}")
-                    return ""
-
-            except ImportError:
-                debug_logger.warning("PyMuPDF未インストール - 基本PDF抽出使用")
-            except PermissionError as pe:
-                debug_logger.error(f"PDFファイルアクセス権限エラー: {pe}")
-                return ""
-            except FileNotFoundError as fnf:
-                debug_logger.error(f"PDFファイルが見つかりません: {fnf}")
-                return ""
-            except Exception as e:
-                debug_logger.error(f"PyMuPDF抽出エラー: {e}")
-
-            # フォールバック：基本PDF抽出（ファイルアクセス安全版）
-            try:
-                with open(file_path, 'rb') as f:
-                    raw_content = f.read(1024 * 1024)  # 最初の1MBのみ読み込み
-
-                # 基本的なPDFテキスト抽出
-                import re
-                text_pattern = re.compile(rb'\(([^)]*)\)')
-                matches = text_pattern.findall(raw_content)
-                extracted_text = []
-
-                for match in matches:
-                    try:
-                        decoded = match.decode('utf-8', errors='ignore')
-                        if len(decoded.strip()) > 2:  # 意味のあるテキストのみ
-                            extracted_text.append(decoded)
-                    except:
-                        continue
-
-                return ' '.join(extracted_text)
-
-            except Exception as e:
-                print(f"⚠️ 基本PDF抽出エラー: {e}")
-                return ""
-
-        except Exception as e:
-            print(f"⚠️ PDF抽出エラー: {e}")
-            return ""
-
-    def _ocr_pdf_pages(self, doc, page_nums, file_path: str) -> dict:
-        """テキスト層の無いPDFページを画像化してOCR抽出
-
-        スキャン（画像ベース）PDF対応。各ページをPyMuPDFでレンダリングし、
-        pytesseractでテキスト抽出する。
-        戻り値: {ページ番号: 抽出テキスト}
-        """
-        results = {}
-        try:
-            # OCRライブラリの利用可能性チェック
-            if not PIL_AVAILABLE or not TESSERACT_AVAILABLE:
-                debug_logger.debug("PDF OCRフォールバック: OCRライブラリ未導入のためスキップ")
-                return results
-
-            try:
-                pytesseract.get_tesseract_version()
-            except pytesseract.TesseractNotFoundError:
-                debug_logger.debug("PDF OCRフォールバック: Tesseract未導入のためスキップ")
-                return results
-
-            import io
-            import fitz
-
-            # 処理過多防止: OCR対象ページ数を制限（速度優先）
-            max_ocr_pages = 30
-            target_pages = list(page_nums)[:max_ocr_pages]
-            if len(page_nums) > max_ocr_pages:
-                debug_logger.debug(
-                    f"PDF OCR対象ページを{max_ocr_pages}ページに制限: {os.path.basename(file_path)}")
-
-            # ファイル名から日本語の可能性を判定（言語選択の最適化）
-            filename_lower = os.path.basename(file_path).lower()
-            likely_japanese = any(hint in filename_lower
-                                  for hint in ['日本語', 'japanese', 'jpn', '図面', '設計', '報告', '議事'])
-
-            # 200dpi相当（72dpi * 約2.78）でレンダリング（OCR精度と速度のバランス）
-            zoom = 2.0
-            matrix = fitz.Matrix(zoom, zoom)
-
-            ocr_config = '--oem 1 --psm 6'
-
-            def ocr_single_page(page_num: int) -> str:
-                """単一ページをレンダリングしてOCR（並列処理用）"""
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                image = Image.open(io.BytesIO(pix.tobytes("png")))
-
-                # グレースケール化（OCR精度向上・高速化）
-                if image.mode not in ('L', '1'):
-                    image = image.convert('L')
-
-                # 日本語優先 or 英語優先で言語を選択
-                lang = 'jpn+eng' if likely_japanese else 'eng'
-                try:
-                    text = pytesseract.image_to_string(image, lang=lang, config=ocr_config).strip()
-                except pytesseract.TesseractError:
-                    # 言語データが無い場合は英語のみで再試行
-                    text = pytesseract.image_to_string(image, lang='eng', config=ocr_config).strip()
-
-                # 英語で結果が不十分なら日本語も試行
-                if len(text) < 5 and not likely_japanese:
-                    try:
-                        jp_text = pytesseract.image_to_string(image, lang='jpn', config=ocr_config).strip()
-                        if len(jp_text) > len(text):
-                            text = jp_text
-                    except pytesseract.TesseractError:
-                        pass
-
-                return ' '.join(text.split())
-
-            # 🚀 並列OCR（テキスト抽出と同じ最大4スレッド）＋ページ単位タイムアウトでハング防止
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {executor.submit(ocr_single_page, p): p for p in target_pages}
-                for future in as_completed(futures):
-                    page_num = futures[future]
-                    try:
-                        text = future.result(timeout=30.0)  # 1ページ最大30秒
-                        if len(text) >= 2:
-                            results[page_num] = text
-                    except Exception as page_error:
-                        debug_logger.warning(f"PDF OCRページ {page_num} エラー: {page_error}")
-                        continue
-
-            if results:
-                ocr_chars = sum(len(t) for t in results.values())
-                print(f"✅ PDF OCRフォールバック成功 ({os.path.basename(file_path)}): "
-                      f"{len(results)}ページ / {ocr_chars}文字")
-
-        except Exception as e:
-            debug_logger.warning(f"PDF OCRフォールバックエラー ({os.path.basename(file_path)}): {e}")
-
-        return results
-
-    def _extract_image_content(self, file_path: str) -> str:
-        """.tifファイルからOCRでテキスト抽出（超高速最適化版・キャッシュ強化）"""
-        try:
-            # 🚀 キャッシュチェック（最優先）
-            if hasattr(self, '_ocr_cache'):
-                cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
-                if cache_key in self._ocr_cache:
-                    cached_result = self._ocr_cache[cache_key]
-                    print(f"⚡ OCRキャッシュヒット: {os.path.basename(file_path)} ({len(cached_result)}文字)")
-                    return cached_result
-            else:
-                self._ocr_cache = {}
-
-            # OCRライブラリが利用可能かチェック
-            if not PIL_AVAILABLE or not TESSERACT_AVAILABLE:
-                return ""
-
-            # Tesseractエンジンの利用可能性を確認
-            try:
-                pytesseract.get_tesseract_version()
-            except pytesseract.TesseractNotFoundError:
-                return ""
-
-            # 🔥 超高速スキップ条件（ファイルサイズ最適化）
-            file_size = os.path.getsize(file_path)
-            if file_size < 1024:  # 1KB未満は処理しない
-                return ""
-            if file_size > 30 * 1024 * 1024:  # 30MB以上は処理しない（より厳格）
-                print(f"⚠️ .tif画像ファイルが大きすぎます ({file_path}): {file_size/1024/1024:.1f}MB")
-                return ""
-            
-            # 🚀 超高速画像読み込み・検証
-            try:
-                image = Image.open(file_path)
-                
-                # 画像フォーマット・モード最適化チェック
-                if image.mode not in ['L', 'RGB', 'RGBA', '1']:
-                    image = image.convert('RGB')
-                
-                # 画像サイズチェックと超高速最適化
-                width, height = image.size
-                total_pixels = width * height
-                
-                # 🔥 動的解像度調整: ファイルサイズに応じて最適な画素数を選択
-                # 小さいファイル: 高解像度でOCR精度向上
-                # 大きいファイル: 低解像度で処理速度優先
-                if file_size < 2 * 1024 * 1024:  # 2MB未満
-                    max_pixels = 1500000  # 150万画素（精度優先）
-                elif file_size < 5 * 1024 * 1024:  # 5MB未満
-                    max_pixels = 1000000  # 100万画素（バランス）
-                else:  # 5MB以上
-                    max_pixels = 600000   # 60万画素（速度優先）
-                
-                if total_pixels > max_pixels:
-                    scale_factor = (max_pixels / total_pixels) ** 0.5
-                    new_width = int(width * scale_factor)
-                    new_height = int(height * scale_factor)
-                    # 高速リサイズアルゴリズム使用
-                    image = image.resize((new_width, new_height), Image.Resampling.BILINEAR)
-                    total_pixels = new_width * new_height
-                    debug_logger.debug(f"動的リサイズ ({os.path.basename(file_path)}): {width}x{height} -> {new_width}x{new_height}")
-                
-                # 小さすぎる画像はスキップ
-                if total_pixels < 10000:  # 100x100未満はスキップ
-                    return ""
-                
-            except Exception as e:
-                print(f"⚠️ 画像読み込みエラー ({file_path}): {e}")
-                return ""
-            
-            # 🚀 超高速OCR設定（速度最優先）
-            ultra_fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん'  # 文字制限で高速化
-            
-            # 🔥 適応型前処理: 画像特性に応じて最適な前処理を選択
-            processed_image = image
-            
-            # 前処理が必要な条件: カラー画像かつ中規模サイズ
-            needs_preprocessing = (image.mode != 'L' and 
-                                  total_pixels < 500000 and 
-                                  file_size > 500 * 1024)  # 500KB以上
-            
-            if CV2_AVAILABLE and needs_preprocessing:
-                try:
-                    import numpy as np
-                    image_array = np.array(image)
-                    
-                    # グレースケール変換（最も効果的な前処理）
-                    if len(image_array.shape) == 3:
-                        gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-                        
-                        # 小さいファイルのみ二値化を追加（OCR精度向上）
-                        if file_size < 2 * 1024 * 1024:
-                            # 適応的二値化: 照明ムラに強い
-                            gray = cv2.adaptiveThreshold(
-                                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 11, 2)
-                        
-                        processed_image = Image.fromarray(gray)
-                except Exception:
-                    processed_image = image
-            
-            # 🚀 超高速OCR実行（段階的最適化 + 言語検出）
-            text = ""
-            
-            # ファイル名から言語をヒント取得（処理の最適化）
-            filename_lower = os.path.basename(file_path).lower()
-            likely_japanese = any(hint in filename_lower for hint in ['日本語', 'japanese', 'jpn', '図面', '設計'])
-            
-            # Phase 1: 超高速英数字のみ（最も高速）
-            try:
-                if not likely_japanese:  # 日本語の可能性が低い場合のみ
-                    fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-                    text = pytesseract.image_to_string(processed_image, lang='eng', config=fast_config).strip()
-                
-                # Phase 2: 結果が不十分な場合のみ通常英語OCR
-                if len(text) < 5:
-                    text = pytesseract.image_to_string(processed_image, lang='eng', config='--oem 1 --psm 6').strip()
-                
-                # Phase 3: 最後の手段として日本語（処理時間が増加）
-                # 小さいファイルまたは日本語の可能性が高い場合のみ試行
-                if (len(text) < 3 and file_size < 5 * 1024 * 1024) or likely_japanese:
-                    try:
-                        jp_text = pytesseract.image_to_string(processed_image, lang='jpn', config='--oem 1 --psm 6').strip()
-                        if len(jp_text) > len(text):
-                            text = jp_text
-                    except pytesseract.TesseractError:
-                        pass
-                        
-            except pytesseract.TesseractError as te:
-                try:
-                    # 最終フォールバック：最小設定
-                    text = pytesseract.image_to_string(processed_image, config='--psm 6').strip()
-                except pytesseract.TesseractError:
-                    print(f"⚠️ OCR実行完全失敗 ({os.path.basename(file_path)}): {te}")
-                    return ""
-            
-            # 🔥 結果検証と最適化
-            text = text.strip()
-            
-            # 無意味な結果をフィルタリング
-            if len(text) < 2:
-                result = ""
-            elif len(set(text.replace(' ', '').replace('\n', ''))) < 3:  # 文字種類が少なすぎる
-                result = ""
-            else:
-                # テキスト正規化（高速版）
-                text = ' '.join(text.split())  # 余分な空白を削除
-                result = text[:5000]  # 最大5000文字に制限
-            
-            # 🚀 キャッシュに保存（成功・失敗を問わず）
-            cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
-            self._ocr_cache[cache_key] = result
-            
-            # キャッシュサイズ制限
-            if len(self._ocr_cache) > 1000:
-                # 古いエントリを削除（LRU的）
-                oldest_keys = list(self._ocr_cache.keys())[:100]
-                for key in oldest_keys:
-                    del self._ocr_cache[key]
-            
-            # 結果表示（成功時のみ）
-            if result and len(result) > 10:
-                print(f"✅ 超高速OCR成功 ({os.path.basename(file_path)}): {len(result)}文字")
-            
-            return result
-            
-        except Exception as e:
-            print(f"⚠️ 超高速OCR処理エラー {os.path.basename(file_path)}: {e}")
-            # エラーもキャッシュして再試行を防ぐ
-            if hasattr(self, '_ocr_cache'):
-                cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
-                self._ocr_cache[cache_key] = ""
-            return ""
-
-    # CAD/図面ファイルの内容抽出は無効化（ファイル名のみ検索対象）
-    # 将来的に必要になった場合のために、コードは残しておく
-    """
-    def _extract_cad_content(self, file_path: str) -> str:
-        \"\"\"CAD/図面ファイル（JWC, JWW, DXF, SFC）からテキスト抽出 - 現在は無効\"\"\"
-        try:
-            extension = os.path.splitext(file_path)[1].lower()
-            
-            # ファイルサイズチェック（大きすぎるファイルはスキップ）
-            file_size = os.path.getsize(file_path)
-            if file_size > 50 * 1024 * 1024:  # 50MB以上はスキップ
-                print(f"⚠️ CADファイルが大きすぎます ({file_path}): {file_size/1024/1024:.1f}MB")
-                return ""
-            
-            # DXFファイルの処理（テキストベースのASCII形式）
-            if extension == '.dxf':
-                try:
-                    # DXFはテキストベースなので直接読み取り
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read(100000)  # 最初の100KB
-                        # テキストエンティティや属性を抽出
-                        lines = content.split('\\n')
-                        text_parts = []
-                        for i, line in enumerate(lines):
-                            if line.strip() in ['TEXT', 'MTEXT', 'ATTRIB', 'ATTDEF']:
-                                # テキストデータを探す
-                                for j in range(i+1, min(i+20, len(lines))):
-                                    if lines[j].strip() and not lines[j].strip().isdigit():
-                                        text_parts.append(lines[j].strip())
-                        return ' '.join(text_parts[:1000])  # 最大1000要素
-                except UnicodeDecodeError:
-                    # バイナリ形式のDXFの場合
-                    try:
-                        with open(file_path, 'r', encoding='cp932', errors='ignore') as f:
-                            content = f.read(50000)
-                            return content[:5000]
-                    except:
-                        return ""
-            
-            # JWW/JWC/SFCファイル（バイナリベース）
-            elif extension in ['.jww', '.jwc', '.sfc']:
-                try:
-                    # バイナリから可能な限りテキスト部分を抽出
-                    with open(file_path, 'rb') as f:
-                        data = f.read(100000)  # 最初の100KB
-                        
-                        # Shift-JISまたはUTF-8でデコード可能な部分を探す
-                        text_parts = []
-                        
-                        # バイト列から連続する印刷可能文字を探す
-                        current_text = bytearray()
-                        for byte in data:
-                            # 印刷可能なASCII文字、または日本語の可能性がある範囲
-                            if (32 <= byte <= 126) or (byte >= 0x80):
-                                current_text.append(byte)
-                            else:
-                                if len(current_text) > 3:  # 3バイト以上の連続
-                                    try:
-                                        decoded = current_text.decode('cp932', errors='ignore')
-                                        if len(decoded.strip()) > 2:
-                                            text_parts.append(decoded.strip())
-                                    except:
-                                        try:
-                                            decoded = current_text.decode('utf-8', errors='ignore')
-                                            if len(decoded.strip()) > 2:
-                                                text_parts.append(decoded.strip())
-                                        except:
-                                            pass
-                                current_text = bytearray()
-                        
-                        # 最後の部分も処理
-                        if len(current_text) > 3:
-                            try:
-                                decoded = current_text.decode('cp932', errors='ignore')
-                                if len(decoded.strip()) > 2:
-                                    text_parts.append(decoded.strip())
-                            except:
-                                pass
-                        
-                        # テキスト部分を結合
-                        result = ' '.join(text_parts[:500])  # 最大500要素
-                        
-                        if len(result) > 10:
-                            print(f"✅ CADファイル ({extension}) テキスト抽出: {os.path.basename(file_path)} ({len(result)}文字)")
-                        
-                        return result[:5000]  # 最大5000文字
-                        
-                except Exception as e:
-                    print(f"⚠️ CADファイル読み取りエラー ({file_path}): {e}")
-                    return ""
-            
-            return ""
-            
-        except Exception as e:
-            print(f"⚠️ CADファイル処理エラー {file_path}: {e}")
-            return ""
-    """
 
     def _process_text_files_batch(self, text_files: List[Path], start_time: float) -> int:
         """テキストファイルの高速バッチ処理"""
@@ -4946,24 +4910,39 @@ class UltraFastFullCompliantSearchSystem:
             
             # バッチ処理でパフォーマンス向上
             batch_size = min(self.batch_size // 4, 500)  # 適度なバッチサイズ
-            
-            for i in range(0, total_files, batch_size):
-                # キャンセルチェック
-                if hasattr(self, 'indexing_cancelled') and self.indexing_cancelled:
-                    print("⏹️ インデックス処理がキャンセルされました")
-                    return {
-                        'total_files': total_files,
-                        'success_count': success_count,
-                        'error_count': error_count,
-                        'total_time': time.time() - start_time,
-                        'files_per_second': 0,
-                        'cancelled': True
-                    }
-                
-                batch_files = all_files[i:i + batch_size]
-                batch_results = self._process_file_batch_optimized(batch_files, progress_callback)
-                success_count += batch_results['success']
-                error_count += batch_results['errors']
+
+            # 🚀 抽出用 ProcessPool を一括処理全体で 1 度だけ生成して再利用する。
+            #   バッチごとに生成・破棄すると、特に Windows(spawn) ではワーカーが
+            #   重いモジュールを毎回 re-import するため致命的なオーバーヘッドになる。
+            import os as _os
+            cpu_count = max(1, (_os.cpu_count() or 4) - 1)  # UI に 1 コア残す
+            pool_workers = min(cpu_count, 16)
+            extract_pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=pool_workers,
+                initializer=_init_extraction_worker)
+            print(f"🚀 抽出ProcessPool起動: {pool_workers}プロセス (GIL回避・全コア活用)")
+
+            try:
+                for i in range(0, total_files, batch_size):
+                    # キャンセルチェック
+                    if hasattr(self, 'indexing_cancelled') and self.indexing_cancelled:
+                        print("⏹️ インデックス処理がキャンセルされました")
+                        return {
+                            'total_files': total_files,
+                            'success_count': success_count,
+                            'error_count': error_count,
+                            'total_time': time.time() - start_time,
+                            'files_per_second': 0,
+                            'cancelled': True
+                        }
+
+                    batch_files = all_files[i:i + batch_size]
+                    batch_results = self._process_file_batch_optimized(
+                        batch_files, progress_callback, proc_pool=extract_pool)
+                    success_count += batch_results['success']
+                    error_count += batch_results['errors']
+            finally:
+                extract_pool.shutdown(wait=True)
             
             # 処理完了
             total_time = time.time() - start_time
@@ -5007,8 +4986,12 @@ class UltraFastFullCompliantSearchSystem:
             print(f"⚠️ ファイル収集エラー ({extension}): {e}")
             return []
     
-    def _process_file_batch_optimized(self, batch_files: List[Path], progress_callback=None) -> Dict[str, int]:
-        """最適化版バッチファイル処理（ファイルサイズ別優先度付き）"""
+    def _process_file_batch_optimized(self, batch_files: List[Path], progress_callback=None, proc_pool=None) -> Dict[str, int]:
+        """最適化版バッチファイル処理（ファイルサイズ別優先度付き）
+
+        proc_pool: 抽出用の ProcessPoolExecutor。一括処理全体で使い回すため呼び出し側が
+                   生成して渡す。None の場合はこのバッチ専用に一時生成する（後方互換）。
+        """
         success_count = 0
         error_count = 0
         
@@ -5024,48 +5007,108 @@ class UltraFastFullCompliantSearchSystem:
         # 小さいファイルを優先してソート
         sorted_files.sort(key=lambda x: x[1])
         prioritized_files = [f[0] for f in sorted_files]
-        
-        # 🚀 動的スレッド数調整: ファイル数とサイズに応じて最適化
-        # 小さいファイルが多い場合はスレッド数を増やす
-        small_file_ratio = sum(1 for _, size in sorted_files if size < 3*1024*1024) / max(len(sorted_files), 1)
-        if small_file_ratio > 0.7:  # 70%以上が小ファイル（3MB未満）
-            dynamic_workers = min(self.optimal_threads * 4, len(batch_files), 128)  # 最大128並列
-        else:
-            dynamic_workers = min(self.optimal_threads * 2, len(batch_files), 64)  # 最大64並列
-        
-        debug_logger.info(f"バッチ処理開始: {len(prioritized_files)}ファイル, {dynamic_workers}スレッド")
-        
-        with ThreadPoolExecutor(max_workers=dynamic_workers) as executor:
-            # 各ファイルを並列処理
-            futures = {executor.submit(self._process_single_file_with_progress, 
-                                     file_path, progress_callback): file_path 
-                      for file_path in prioritized_files}
-            
-            for future in as_completed(futures):
-                file_path = futures[future]
-                try:
-                    # 🔥 ファイルサイズに応じた動的タイムアウト
-                    file_size = file_path.stat().st_size if file_path.exists() else 0
-                    if file_size >= 3 * 1024 * 1024:  # 3MB以上（タイトルのみ）
-                        timeout = 3  # 超高速
-                    elif file_size < 1 * 1024 * 1024:  # 1MB未満
-                        timeout = 5
-                    else:  # 1-3MB
-                        timeout = 10
-                    
-                    result = future.result(timeout=timeout)
-                    if result:
+
+        import os as _os
+
+        # 🚀 親プロセスでの安価な事前フィルタ（重い抽出だけをワーカーへ送る）
+        #   live_progressive_index_file と同等のスキップ/サイズ判定をここで実施し、
+        #   ・隠し/システム/画像ファイルのスキップ
+        #   ・差分インデックス（未更新ファイルのスキップ）
+        #   ・500MB超のスキップ / 3MB以上のファイル名のみインデックス
+        #   を ProcessPool 経由でも維持する。
+        image_extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+        extract_targets = []  # (path_str, size, mtime) 実際に本文抽出が要るファイル
+
+        for fp in prioritized_files:
+            try:
+                name = fp.name
+                if name.startswith('._') or name.startswith('.DS_Store') or name.startswith('Thumbs.db'):
+                    continue
+                if fp.suffix.lower() in image_extensions:
+                    continue
+                if not fp.exists():
+                    continue
+
+                st = fp.stat()
+                size = st.st_size
+                mtime = st.st_mtime
+                fp_str = str(fp)
+
+                # 差分インデックス: 既にインデックス済みで更新時刻が一致するならスキップ
+                cached_mtime = self._index_mtime_cache.get(fp_str)
+                if cached_mtime is not None and abs(cached_mtime - mtime) <= 1.0:
+                    success_count += 1  # 未更新は成功扱い
+                    if progress_callback:
+                        progress_callback(fp_str, "unchanged", True)
+                    continue
+
+                # 500MB超は早期スキップ
+                if size > 500 * 1024 * 1024:
+                    debug_logger.warning(f"超大容量ファイルをスキップ: {fp_str} ({size/(1024*1024):.1f}MB)")
+                    continue
+
+                # 3MB以上はファイル名のみインデックス（抽出不要・親プロセスで即書込）
+                if size >= 3 * 1024 * 1024:
+                    if self._store_indexed_content(fp_str, name, size, mtime):
                         success_count += 1
                     else:
                         error_count += 1
-                except concurrent.futures.TimeoutError:
-                    error_count += 1
-                    debug_logger.warning(f"タイムアウト: {file_path}")
+                    if progress_callback:
+                        progress_callback(fp_str, "title_only", True)
+                    continue
+
+                extract_targets.append((fp_str, size, mtime))
+            except Exception as e:
+                error_count += 1
+                debug_logger.error(f"事前フィルタエラー: {fp} - {e}")
+
+        if not extract_targets:
+            return {'success': success_count, 'errors': error_count}
+
+        # プールが渡されなければバッチ専用に一時生成（後方互換）
+        own_pool = False
+        if proc_pool is None:
+            cpu_count = max(1, (_os.cpu_count() or 4) - 1)
+            max_proc = min(cpu_count, len(extract_targets), 16)
+            proc_pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_proc, initializer=_init_extraction_worker)
+            own_pool = True
+
+        debug_logger.info(f"バッチ処理開始: {len(extract_targets)}ファイル抽出 (ProcessPool)")
+
+        try:
+            # 抽出をワーカープロセスへ投入（本文抽出のみ）
+            future_to_path = {
+                proc_pool.submit(_worker_extract, fp_str, size, mtime): fp_str
+                for (fp_str, size, mtime) in extract_targets
+            }
+
+            for future in concurrent.futures.as_completed(future_to_path):
+                fp_str = future_to_path[future]
+                try:
+                    file_path_str, content, file_size, modified_time, extract_secs = future.result(timeout=300)
+                    # 抽出時間を性能診断へ記録（ボトルネック計測の継続性を維持）
+                    self._perf_add('extract', extract_secs)
+                    if content:
+                        ok = self._store_indexed_content(
+                            file_path_str, content, file_size, modified_time)
+                        if ok:
+                            success_count += 1
+                        else:
+                            error_count += 1
+                    else:
+                        error_count += 1
+                    if progress_callback:
+                        progress_callback(file_path_str, "light", bool(content))
                 except Exception as e:
                     error_count += 1
-                    debug_logger.error(f"バッチ処理エラー: {file_path} - {e}")
-                    
+                    debug_logger.error(f"ProcessPool エラー: {fp_str} - {e}")
+        finally:
+            if own_pool:
+                proc_pool.shutdown(wait=True)
+
         return {'success': success_count, 'errors': error_count}
+
     
     def _process_single_file_with_progress(self, file_path: Path, progress_callback=None) -> bool:
         """進捗コールバック付き単一ファイル処理"""
@@ -9699,6 +9742,18 @@ class UltraFastCompliantUI:
 
 def main():
     """メイン関数 - 最大パフォーマンス版アプリケーション起動"""
+    import multiprocessing
+    multiprocessing.freeze_support()  # EXE 化対応
+    # spawn を全プラットフォームで強制する。
+    #   本アプリは Tkinter mainloop や書込専用スレッド等を多数抱える多スレッド構成で、
+    #   Linux/macOS 既定の fork ではロック保持中の fork により子プロセスがデッドロック
+    #   し得る。spawn は安全（抽出プールは一括処理全体で 1 度だけ生成するため、
+    #   ワーカーの re-import コストは事実上無視できる）。
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # 既に開始方式が確定している場合は無視
+        pass
     try:
         print("🚀 100%仕様適合 最大パフォーマンス全文検索アプリ起動開始")
         debug_logger.info("最大パフォーマンス版アプリケーション起動開始")

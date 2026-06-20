@@ -2629,7 +2629,8 @@ class UltraFastFullCompliantSearchSystem:
 
             # 画像ファイル(.tif等)はOCRで本文を検索対象にする。一括時は遅延OCRで
             # 背景処理されるため、ここではスキップしない。
-            image_extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+            # 画像はtiff(.tif/.tiff)のみをOCR/検索対象とする。
+            image_extensions = {'.tif', '.tiff'}
 
             if not file_path_obj.exists():
                 debug_logger.warning(f"ファイルが存在しません: {file_path}")
@@ -3416,7 +3417,7 @@ class UltraFastFullCompliantSearchSystem:
         #   ・差分インデックス（未更新ファイルのスキップ）
         #   ・500MB超のスキップ / 3MB以上のファイル名のみインデックス
         #   を ProcessPool 経由でも維持する。
-        image_extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+        image_extensions = {'.tif', '.tiff'}
         extract_targets = []  # (path_str, size, mtime) 実際に本文抽出が要るファイル
 
         for fp in prioritized_files:
@@ -3579,7 +3580,7 @@ class UltraFastFullCompliantSearchSystem:
                              '.zip',  # ZIPファイル追加
                              '.jwc', '.dxf', '.sfc', '.jww',  # CADファイル追加
                              '.dwg', '.dwt', '.mpp', '.mpz']  # 追加CADファイル
-            # 画像ファイル(.tif, .tiff, .jpg, .png等)は検索対象外
+            # 画像はtiff(.tif/.tiff)のみOCR対象。jpg/png等は収集・索引しない
 
         start_time = time.time()
         directory_path = Path(directory)
@@ -3812,8 +3813,8 @@ class UltraFastFullCompliantSearchSystem:
             print(f"🔄 動的スレッド調整: 有効 (初期: {self.optimal_threads}, 最大: 16)")
 
         try:
-            # 画像ファイルは検索対象外として除外
-            image_extensions = ['.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp']
+            # 画像ファイル(.tif/.tiff)はテキスト処理経路から除外（OCRは別経路で処理）
+            image_extensions = ['.tif', '.tiff']
             excluded_count = 0
             text_files = []
             
@@ -3824,7 +3825,7 @@ class UltraFastFullCompliantSearchSystem:
                     text_files.append(file_path)
             
             if excluded_count > 0:
-                print(f"⏭️  画像ファイル除外: {excluded_count:,}ファイル (.tif, .tiff, .jpg, .png等)")
+                print(f"⏭️  画像ファイル除外: {excluded_count:,}ファイル (.tif, .tiff)")
             
             # 対象ファイル数を更新
             total_files = len(text_files)
@@ -7361,7 +7362,7 @@ class UltraFastCompliantUI:
                 
                 target_extensions = ['.txt', '.doc', '.docx', '.pdf', '.xls', '.xlsx', '.ppt', '.pptx', 
                                    '.rtf', '.odt', '.ods', '.odp', '.csv', '.json', '.log',
-                                   '.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp', '.gif',
+                                   '.tif', '.tiff',
                                    '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
                                    '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
                                    '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',  # CAD/図面ファイル追加
@@ -7681,7 +7682,7 @@ class UltraFastCompliantUI:
             # ファイル収集（メモリ使用量制限版）
             target_extensions = ['.txt', '.doc', '.docx', '.pdf', '.xls', '.xlsx', '.ppt', '.pptx', 
                                '.rtf', '.odt', '.ods', '.odp', '.csv', '.json', '.log',
-                               '.tif', '.tiff', '.png', '.jpg', '.jpeg', '.bmp', '.gif',
+                               '.tif', '.tiff',
                                '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
                                '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
                                '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',  # CAD/図面ファイル追加

@@ -848,6 +848,8 @@ class _FileContentExtractor:
                 # ページ番号 -> 抽出テキスト（テキスト層が無いページの検出に使用）
                 page_texts = {}
 
+                _t_text_start = time.time()
+
                 # 🚀 並列処理でページ抽出（10ページ以上の場合）
                 if max_pages >= 10:
                     def extract_single_page(page_num: int) -> str:
@@ -894,11 +896,21 @@ class _FileContentExtractor:
                             debug_logger.warning(f"PDFページ {page_num} 読み取りエラー: {page_error}")
                             continue
 
+                _t_text_elapsed = time.time() - _t_text_start
+                _text_pages = len(page_texts)
+
                 # 🔥 OCRフォールバック: テキスト層が無い（=スキャン）ページを画像化してOCR
                 # テキスト層がほぼ皆無のページのみ対象にする（短いが正規のテキスト層を持つ
                 # ページ＝章扉・ページ番号のみ等をOCR結果で上書きして劣化させないため）
                 ocr_target_pages = [p for p in range(max_pages)
                                     if len(page_texts.get(p, "")) < 3]
+                debug_logger.info(
+                    f"[PDF診断] {os.path.basename(file_path)}: "
+                    f"総ページ={total_pages} 処理={max_pages} "
+                    f"テキスト層={_text_pages}p OCR対象={len(ocr_target_pages)}p "
+                    f"テキスト抽出={_t_text_elapsed:.2f}s"
+                )
+                _t_ocr_start = time.time()
                 if ocr_target_pages:
                     ocr_results = self._ocr_pdf_pages(doc, ocr_target_pages, file_path)
                     for page_num, ocr_text in ocr_results.items():
@@ -907,6 +919,14 @@ class _FileContentExtractor:
                         existing = page_texts.get(page_num, "")
                         # 既存のテキスト層は温存し、OCR結果を追記する
                         page_texts[page_num] = f"{existing} {ocr_text}".strip() if existing else ocr_text
+
+                _t_ocr_elapsed = time.time() - _t_ocr_start
+                if ocr_target_pages:
+                    debug_logger.info(
+                        f"[PDF診断] {os.path.basename(file_path)}: "
+                        f"OCR完了={_t_ocr_elapsed:.2f}s "
+                        f"OCR対象{len(ocr_target_pages)}p中{len(ocr_results)}p取得"
+                    )
 
                 doc.close()
 
@@ -1032,17 +1052,37 @@ class _FileContentExtractor:
                 return ' '.join(text.split())
 
             # 🚀 並列OCR（テキスト抽出と同じ最大4スレッド）＋ページ単位タイムアウトでハング防止
+            _ocr_page_times: list[float] = []
+            _timeout_count = 0
+            _t_ocr_all = time.time()
             with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {executor.submit(ocr_single_page, p): p for p in target_pages}
                 for future in as_completed(futures):
                     page_num = futures[future]
+                    _tp_start = time.time()
                     try:
                         text = future.result(timeout=30.0)  # 1ページ最大30秒
+                        _ocr_page_times.append(time.time() - _tp_start)
                         if len(text) >= 2:
                             results[page_num] = text
+                    except TimeoutError:
+                        _timeout_count += 1
+                        debug_logger.warning(f"PDF OCRページ {page_num} タイムアウト(30s): {os.path.basename(file_path)}")
+                        continue
                     except Exception as page_error:
+                        _ocr_page_times.append(time.time() - _tp_start)
                         debug_logger.warning(f"PDF OCRページ {page_num} エラー: {page_error}")
                         continue
+
+            _ocr_total = time.time() - _t_ocr_all
+            if _ocr_page_times:
+                _avg = sum(_ocr_page_times) / len(_ocr_page_times)
+                _max = max(_ocr_page_times)
+                debug_logger.info(
+                    f"[OCR診断] {os.path.basename(file_path)}: "
+                    f"対象{len(target_pages)}p 成功{len(results)}p タイムアウト{_timeout_count}p "
+                    f"ページ平均={_avg:.2f}s 最大={_max:.2f}s 合計={_ocr_total:.2f}s"
+                )
 
             if results:
                 ocr_chars = sum(len(t) for t in results.values())
@@ -1255,8 +1295,20 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
     if _proc_extractor is None:
         _proc_extractor = _FileContentExtractor()
     _t0 = time.time()
+    import os as _os
+    _ext = Path(file_path).suffix.lower()
+    _pid = _os.getpid()
     try:
         content = _proc_extractor._extract_file_content(file_path)
-        return (file_path, content, file_size, modified_time, time.time() - _t0)
-    except Exception:
-        return (file_path, None, file_size, modified_time, time.time() - _t0)
+        _elapsed = time.time() - _t0
+        if _elapsed > 5.0:
+            debug_logger.info(
+                f"[抽出診断] pid={_pid} ext={_ext} {_elapsed:.2f}s "
+                f"size={file_size//1024}KB chars={len(content) if content else 0} "
+                f"{os.path.basename(file_path)}"
+            )
+        return (file_path, content, file_size, modified_time, _elapsed)
+    except Exception as _e:
+        _elapsed = time.time() - _t0
+        debug_logger.warning(f"[抽出診断] pid={_pid} ext={_ext} ERROR {_elapsed:.2f}s {file_path}: {_e}")
+        return (file_path, None, file_size, modified_time, _elapsed)

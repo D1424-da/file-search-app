@@ -605,13 +605,24 @@ def setup_tesseract_path():
         return False
 
 
+# 抽出ワーカー（ProcessPool spawn）として再 import された子プロセスかどうか判定。
+#   spawn ではこのモジュールが子プロセスでも import され、本ブロックも実行される。
+#   ライブラリ自動インストール（pip）を 16 ワーカーが同時に走らせるのを防ぐため、
+#   子プロセスでは自動インストールをスキップする（ライブラリは親で導入済みの前提）。
+try:
+    import multiprocessing as _mp_boot
+    _IS_EXTRACTION_WORKER = _mp_boot.parent_process() is not None
+except Exception:
+    _IS_EXTRACTION_WORKER = False
+
 # アプリ起動時の高速ライブラリチェック
 startup_timer = time.time()
-print("🚀 ファイル検索アプリケーション高速起動中...")
-start_check_time = time.time()
-ensure_required_libraries()
-check_duration = time.time() - start_check_time
-print(f"✅ ライブラリ準備完了 ({check_duration:.2f}秒)\n")
+if not _IS_EXTRACTION_WORKER:
+    print("🚀 ファイル検索アプリケーション高速起動中...")
+    start_check_time = time.time()
+    ensure_required_libraries()
+    check_duration = time.time() - start_check_time
+    print(f"✅ ライブラリ準備完了 ({check_duration:.2f}秒)\n")
 
 # OCR関連の自動セットアップ
 ocr_setup_needed = False
@@ -2212,21 +2223,24 @@ def _init_extraction_worker() -> None:
     _proc_extractor = _FileContentExtractor()
 
 
-def _worker_extract(file_path: str) -> tuple:
-    """ワーカープロセスで呼ばれる抽出関数
-    戻り値: (file_path, content, file_size, modified_time)
-    エラー時: (file_path, None, 0, 0.0)
+def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tuple:
+    """ワーカープロセスで呼ばれる抽出関数（CPUバウンドな本文抽出のみを担当）
+
+    前処理（隠しファイル/差分スキップ/サイズ判定）は親プロセスで実施済みである
+    ことを前提とし、ここでは純粋に本文抽出だけを行う。
+
+    戻り値: (file_path, content, file_size, modified_time, extract_seconds)
+    エラー時: (file_path, None, file_size, modified_time, extract_seconds)
     """
     global _proc_extractor
     if _proc_extractor is None:
         _proc_extractor = _FileContentExtractor()
+    _t0 = time.time()
     try:
-        p = Path(file_path)
-        stat = p.stat()
         content = _proc_extractor._extract_file_content(file_path)
-        return (file_path, content, stat.st_size, stat.st_mtime)
+        return (file_path, content, file_size, modified_time, time.time() - _t0)
     except Exception:
-        return (file_path, None, 0, 0.0)
+        return (file_path, None, file_size, modified_time, time.time() - _t0)
 
 class UltraFastFullCompliantSearchSystem:
     """100%仕様適合 超高速全文検索システム（動的並列データベース版）"""
@@ -4896,24 +4910,39 @@ class UltraFastFullCompliantSearchSystem:
             
             # バッチ処理でパフォーマンス向上
             batch_size = min(self.batch_size // 4, 500)  # 適度なバッチサイズ
-            
-            for i in range(0, total_files, batch_size):
-                # キャンセルチェック
-                if hasattr(self, 'indexing_cancelled') and self.indexing_cancelled:
-                    print("⏹️ インデックス処理がキャンセルされました")
-                    return {
-                        'total_files': total_files,
-                        'success_count': success_count,
-                        'error_count': error_count,
-                        'total_time': time.time() - start_time,
-                        'files_per_second': 0,
-                        'cancelled': True
-                    }
-                
-                batch_files = all_files[i:i + batch_size]
-                batch_results = self._process_file_batch_optimized(batch_files, progress_callback)
-                success_count += batch_results['success']
-                error_count += batch_results['errors']
+
+            # 🚀 抽出用 ProcessPool を一括処理全体で 1 度だけ生成して再利用する。
+            #   バッチごとに生成・破棄すると、特に Windows(spawn) ではワーカーが
+            #   重いモジュールを毎回 re-import するため致命的なオーバーヘッドになる。
+            import os as _os
+            cpu_count = max(1, (_os.cpu_count() or 4) - 1)  # UI に 1 コア残す
+            pool_workers = min(cpu_count, 16)
+            extract_pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=pool_workers,
+                initializer=_init_extraction_worker)
+            print(f"🚀 抽出ProcessPool起動: {pool_workers}プロセス (GIL回避・全コア活用)")
+
+            try:
+                for i in range(0, total_files, batch_size):
+                    # キャンセルチェック
+                    if hasattr(self, 'indexing_cancelled') and self.indexing_cancelled:
+                        print("⏹️ インデックス処理がキャンセルされました")
+                        return {
+                            'total_files': total_files,
+                            'success_count': success_count,
+                            'error_count': error_count,
+                            'total_time': time.time() - start_time,
+                            'files_per_second': 0,
+                            'cancelled': True
+                        }
+
+                    batch_files = all_files[i:i + batch_size]
+                    batch_results = self._process_file_batch_optimized(
+                        batch_files, progress_callback, proc_pool=extract_pool)
+                    success_count += batch_results['success']
+                    error_count += batch_results['errors']
+            finally:
+                extract_pool.shutdown(wait=True)
             
             # 処理完了
             total_time = time.time() - start_time
@@ -4957,8 +4986,12 @@ class UltraFastFullCompliantSearchSystem:
             print(f"⚠️ ファイル収集エラー ({extension}): {e}")
             return []
     
-    def _process_file_batch_optimized(self, batch_files: List[Path], progress_callback=None) -> Dict[str, int]:
-        """最適化版バッチファイル処理（ファイルサイズ別優先度付き）"""
+    def _process_file_batch_optimized(self, batch_files: List[Path], progress_callback=None, proc_pool=None) -> Dict[str, int]:
+        """最適化版バッチファイル処理（ファイルサイズ別優先度付き）
+
+        proc_pool: 抽出用の ProcessPoolExecutor。一括処理全体で使い回すため呼び出し側が
+                   生成して渡す。None の場合はこのバッチ専用に一時生成する（後方互換）。
+        """
         success_count = 0
         error_count = 0
         
@@ -4974,29 +5007,88 @@ class UltraFastFullCompliantSearchSystem:
         # 小さいファイルを優先してソート
         sorted_files.sort(key=lambda x: x[1])
         prioritized_files = [f[0] for f in sorted_files]
-        
-        import multiprocessing
+
         import os as _os
 
-        # CPU コア数を上限にプロセス数を決定（UI スレッドを 1 コア残す）
-        cpu_count = max(1, (_os.cpu_count() or 4) - 1)
-        max_proc = min(cpu_count, len(prioritized_files), 16)  # 最大 16 プロセス
+        # 🚀 親プロセスでの安価な事前フィルタ（重い抽出だけをワーカーへ送る）
+        #   live_progressive_index_file と同等のスキップ/サイズ判定をここで実施し、
+        #   ・隠し/システム/画像ファイルのスキップ
+        #   ・差分インデックス（未更新ファイルのスキップ）
+        #   ・500MB超のスキップ / 3MB以上のファイル名のみインデックス
+        #   を ProcessPool 経由でも維持する。
+        image_extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp'}
+        extract_targets = []  # (path_str, size, mtime) 実際に本文抽出が要るファイル
 
-        debug_logger.info(f"バッチ処理開始: {len(prioritized_files)}ファイル, {max_proc}プロセス (ProcessPool)")
+        for fp in prioritized_files:
+            try:
+                name = fp.name
+                if name.startswith('._') or name.startswith('.DS_Store') or name.startswith('Thumbs.db'):
+                    continue
+                if fp.suffix.lower() in image_extensions:
+                    continue
+                if not fp.exists():
+                    continue
 
-        with concurrent.futures.ProcessPoolExecutor(
-                max_workers=max_proc,
-                initializer=_init_extraction_worker) as proc_pool:
-            # 抽出をワーカープロセスへ投入
+                st = fp.stat()
+                size = st.st_size
+                mtime = st.st_mtime
+                fp_str = str(fp)
+
+                # 差分インデックス: 既にインデックス済みで更新時刻が一致するならスキップ
+                cached_mtime = self._index_mtime_cache.get(fp_str)
+                if cached_mtime is not None and abs(cached_mtime - mtime) <= 1.0:
+                    success_count += 1  # 未更新は成功扱い
+                    if progress_callback:
+                        progress_callback(fp_str, "unchanged", True)
+                    continue
+
+                # 500MB超は早期スキップ
+                if size > 500 * 1024 * 1024:
+                    debug_logger.warning(f"超大容量ファイルをスキップ: {fp_str} ({size/(1024*1024):.1f}MB)")
+                    continue
+
+                # 3MB以上はファイル名のみインデックス（抽出不要・親プロセスで即書込）
+                if size >= 3 * 1024 * 1024:
+                    if self._store_indexed_content(fp_str, name, size, mtime):
+                        success_count += 1
+                    else:
+                        error_count += 1
+                    if progress_callback:
+                        progress_callback(fp_str, "title_only", True)
+                    continue
+
+                extract_targets.append((fp_str, size, mtime))
+            except Exception as e:
+                error_count += 1
+                debug_logger.error(f"事前フィルタエラー: {fp} - {e}")
+
+        if not extract_targets:
+            return {'success': success_count, 'errors': error_count}
+
+        # プールが渡されなければバッチ専用に一時生成（後方互換）
+        own_pool = False
+        if proc_pool is None:
+            cpu_count = max(1, (_os.cpu_count() or 4) - 1)
+            max_proc = min(cpu_count, len(extract_targets), 16)
+            proc_pool = concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_proc, initializer=_init_extraction_worker)
+            own_pool = True
+
+        debug_logger.info(f"バッチ処理開始: {len(extract_targets)}ファイル抽出 (ProcessPool)")
+
+        try:
+            # 抽出をワーカープロセスへ投入（本文抽出のみ）
             future_to_path = {
-                proc_pool.submit(_worker_extract, str(fp)): fp
-                for fp in prioritized_files
+                proc_pool.submit(_worker_extract, fp_str, size, mtime): fp_str
+                for (fp_str, size, mtime) in extract_targets
             }
 
             for future in concurrent.futures.as_completed(future_to_path):
-                fp = future_to_path[future]
+                fp_str = future_to_path[future]
                 try:
-                    file_path_str, content, file_size, modified_time = future.result(timeout=300)
+                    file_path_str, content, file_size, modified_time, extract_secs = future.result(timeout=300)
+                    # 抽出時間を性能診断へ記録（ボトルネック計測の継続性を維持）
+                    self._perf_add('extract', extract_secs)
                     if content:
                         ok = self._store_indexed_content(
                             file_path_str, content, file_size, modified_time)
@@ -5006,9 +5098,14 @@ class UltraFastFullCompliantSearchSystem:
                             error_count += 1
                     else:
                         error_count += 1
+                    if progress_callback:
+                        progress_callback(file_path_str, "light", bool(content))
                 except Exception as e:
                     error_count += 1
-                    debug_logger.error(f"ProcessPool エラー: {fp} - {e}")
+                    debug_logger.error(f"ProcessPool エラー: {fp_str} - {e}")
+        finally:
+            if own_pool:
+                proc_pool.shutdown(wait=True)
 
         return {'success': success_count, 'errors': error_count}
 
@@ -9647,8 +9744,16 @@ def main():
     """メイン関数 - 最大パフォーマンス版アプリケーション起動"""
     import multiprocessing
     multiprocessing.freeze_support()  # EXE 化対応
-    if sys.platform == 'win32':
+    # spawn を全プラットフォームで強制する。
+    #   本アプリは Tkinter mainloop や書込専用スレッド等を多数抱える多スレッド構成で、
+    #   Linux/macOS 既定の fork ではロック保持中の fork により子プロセスがデッドロック
+    #   し得る。spawn は安全（抽出プールは一括処理全体で 1 度だけ生成するため、
+    #   ワーカーの re-import コストは事実上無視できる）。
+    try:
         multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        # 既に開始方式が確定している場合は無視
+        pass
     try:
         print("🚀 100%仕様適合 最大パフォーマンス全文検索アプリ起動開始")
         debug_logger.info("最大パフォーマンス版アプリケーション起動開始")

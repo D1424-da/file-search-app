@@ -175,6 +175,16 @@ class _FileContentExtractor:
     def __init__(self):
         self._encoding_cache: dict = {}
         self._ocr_cache: dict = {}
+        # 🚀 バルクモード（ProcessPool 抽出）では外側のプロセス並列だけでコアが
+        #   埋まるため、PDF内のページ並列（テキスト抽出/OCR）は 1 に落として
+        #   オーバーサブスクリプション（8プロセス×4スレッド=32 が 8コアを奪い合う）
+        #   を解消する。ライブ単一ファイル処理では従来どおり 4 並列でページを処理。
+        #   ※OCRの解像度・言語・前処理は変えないので認識精度は完全に同一。
+        self._bulk_mode: bool = False
+
+    def _page_workers(self) -> int:
+        """PDFページ処理（テキスト抽出/OCR）の並列スレッド数を返す。"""
+        return 1 if self._bulk_mode else 4
 
     def _extract_file_content(self, file_path: str) -> str:
         """ファイル内容抽出 - 全形式対応（画像OCR含む）"""
@@ -876,8 +886,8 @@ class _FileContentExtractor:
                             debug_logger.warning(f"ページ{page_num}抽出エラー: {e}")
                             return ""
 
-                    # 🚀 並列ページ抽出（最大4スレッド）
-                    with ThreadPoolExecutor(max_workers=4) as executor:
+                    # 🚀 並列ページ抽出（バルク時は1、ライブ単一処理時は4）
+                    with ThreadPoolExecutor(max_workers=self._page_workers()) as executor:
                         futures = {executor.submit(extract_single_page, i): i for i in range(max_pages)}
                         for future in as_completed(futures):
                             page_num = futures[future]
@@ -1063,11 +1073,12 @@ class _FileContentExtractor:
 
                 return ' '.join(text.split()), time.time() - _ps
 
-            # 🚀 並列OCR（テキスト抽出と同じ最大4スレッド）＋ページ単位タイムアウトでハング防止
+            # 🚀 並列OCR（バルク時は1=オーバーサブスクリプション解消、ライブ時は4）
+            #   ＋ページ単位タイムアウトでハング防止
             _ocr_page_times: list[float] = []
             _timeout_count = 0
             _t_ocr_all = time.time()
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=self._page_workers()) as executor:
                 futures = {executor.submit(ocr_single_page, p): p for p in target_pages}
                 for future in as_completed(futures):
                     page_num = futures[future]
@@ -1290,6 +1301,9 @@ def _init_extraction_worker() -> None:
     import multiprocessing
     multiprocessing.current_process().name  # 確認用
     _proc_extractor = _FileContentExtractor()
+    # ProcessPool ワーカー = バルク抽出。PDFページ並列を1に落として
+    # 外側プロセス並列とのオーバーサブスクリプションを解消する（精度は不変）。
+    _proc_extractor._bulk_mode = True
 
     # 🔬 診断ログ出力先の設定（重要）
     #   抽出は spawn された子プロセスで走るため、親プロセスでの
@@ -1324,6 +1338,7 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
     global _proc_extractor
     if _proc_extractor is None:
         _proc_extractor = _FileContentExtractor()
+        _proc_extractor._bulk_mode = True  # ProcessPool 抽出はバルク扱い
     _t0 = time.time()
     import os as _os
     _ext = Path(file_path).suffix.lower()

@@ -2031,6 +2031,64 @@ class UltraFastFullCompliantSearchSystem:
             if self._query_result_cache:
                 self._query_result_cache.clear()
 
+    def get_file_content_for_preview(self, file_path: str, max_chars: int = 3000) -> str:
+        """プレビューペイン用に、対象ファイルの本文先頭を該当シャードDBから取得する。"""
+        if not file_path:
+            return ""
+        try:
+            db_index = self._get_db_index_for_file(file_path)
+            conn = self._get_search_connection(db_index)
+            row = conn.execute(
+                "SELECT substr(content, 1, ?) FROM documents WHERE file_path = ? LIMIT 1",
+                (max_chars, file_path)).fetchone()
+            return row[0] if row and row[0] else ""
+        except Exception as e:
+            debug_logger.debug(f"プレビュー本文取得エラー: {e}")
+            return ""
+
+    def _make_preview_snippet(self, content_head: str, query: str,
+                              before: int = 40, after: int = 150) -> str:
+        """検索結果プレビューを「一致キーワード中心＋前後の文」のスニペットにする。
+
+        一致語は 【】 で囲んで目立たせる。旧実装は本文先頭200字を出すだけで一致語を
+        含まないことが多く「なぜヒットしたか分からない」状態だった。一致が先頭
+        （取得済みの content_head 範囲）に無い場合は従来どおり先頭を返す。
+        """
+        if not content_head:
+            return ""
+        text = content_head
+        low = text.lower()
+        # 一致候補: 元クエリ → 各検索パターン（長い順で優先）
+        candidates = [query.strip()]
+        try:
+            _, _, _, patterns = self._get_search_patterns(query)
+            candidates += sorted({p for p in patterns if p and p.strip()},
+                                 key=len, reverse=True)
+        except Exception:
+            pass
+        pos, matched = -1, ""
+        for cand in candidates:
+            c = cand.strip().lower()
+            if not c:
+                continue
+            i = low.find(c)
+            if i != -1:
+                pos, matched = i, text[i:i + len(cand.strip())]
+                break
+        if pos == -1:
+            return text[:200]
+        start = max(0, pos - before)
+        end = min(len(text), pos + len(matched) + after)
+        snippet = text[start:end]
+        try:
+            snippet = re.sub('(' + re.escape(matched) + ')', r'【\1】',
+                             snippet, count=1, flags=re.IGNORECASE)
+        except Exception:
+            pass
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if end < len(text) else ""
+        return f"{prefix}{snippet}{suffix}"
+
     def _search_complete_layer(self, query: str, max_results: int) -> List[Dict[str, Any]]:
         """完全層検索 - 8個のSQLite FTS5データベースを並列検索（半角全角対応強化）"""
         results = []
@@ -2112,7 +2170,7 @@ class UltraFastFullCompliantSearchSystem:
                                         result = {
                                             'file_path': row[0],
                                             'file_name': row[1],
-                                            'content_preview': content_head[:200],
+                                            'content_preview': self._make_preview_snippet(content_head, query),
                                             'layer': f'complete_db_{db_index}_like',
                                             'file_type': row[3],
                                             'size': row[4] if row[4] else 0,
@@ -2203,7 +2261,7 @@ class UltraFastFullCompliantSearchSystem:
                                         result = {
                                             'file_path': row[0],
                                             'file_name': row[1],
-                                            'content_preview': content_head[:200],
+                                            'content_preview': self._make_preview_snippet(content_head, query),
                                             'layer': f'complete_db_{db_index}',
                                             'file_type': row[3],
                                             'size': row[5] if len(row) > 5 and row[5] else 0,
@@ -2569,11 +2627,9 @@ class UltraFastFullCompliantSearchSystem:
                 debug_logger.debug(f"システムファイルをスキップ: {file_path_obj.name}")
                 return False
 
-            # 画像ファイルをスキップ（検索対象外）
+            # 画像ファイル(.tif等)はOCRで本文を検索対象にする。一括時は遅延OCRで
+            # 背景処理されるため、ここではスキップしない。
             image_extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp'}
-            if file_path_obj.suffix.lower() in image_extensions:
-                debug_logger.debug(f"画像ファイルをスキップ: {file_path_obj.name}")
-                return False
 
             if not file_path_obj.exists():
                 debug_logger.warning(f"ファイルが存在しません: {file_path}")
@@ -2634,9 +2690,9 @@ class UltraFastFullCompliantSearchSystem:
                 if _ext_dt > 0.5:
                     debug_logger.warning(
                         f"🔬 抽出が遅いファイル({_ext_dt*1000:.0f}ms, {file_size/1024:.0f}KB): {file_path}")
-                # 🚀 遅延OCR: このPDFがスキャン（OCR必要）でOCRを後回しにした場合、
-                #   保留キューへ積む。本体完了後にバックグラウンドでOCRしてDB更新する。
-                if (file_path_obj.suffix.lower() == '.pdf'
+                # 🚀 遅延OCR: スキャンPDFや画像でOCRを後回しにした場合、保留キューへ積む。
+                #   本体完了後にバックグラウンドでOCRしてDB更新する。
+                if (file_path_obj.suffix.lower() in ('.pdf',) | image_extensions
                         and getattr(self._extractor._tls, 'pdf_needs_ocr', False)):
                     with self._pending_ocr_lock:
                         self._pending_ocr.add(file_path)
@@ -4755,13 +4811,6 @@ class UltraFastCompliantUI:
         layer_info_frame = ttk.Frame(layer_frame)
         layer_info_frame.pack(fill=tk.X)
 
-        # クエリキャッシュ（繰り返し検索の高速化用LRU）
-        immediate_frame = ttk.Frame(layer_info_frame)
-        immediate_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        ttk.Label(immediate_frame, text="🔵 クエリキャッシュ", foreground="blue", font=("", 10, "bold")).pack()
-        self.immediate_label = ttk.Label(immediate_frame, text="0 件")
-        self.immediate_label.pack()
-
         # OCR待ち（背景でOCR中のスキャンPDF件数）
         hot_frame = ttk.Frame(layer_info_frame)
         hot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
@@ -4816,6 +4865,19 @@ class UltraFastCompliantUI:
         # マウスホバー効果を追加（視覚的フィードバック向上）
         self.results_tree.bind("<Motion>", self._on_tree_motion)
         self.results_tree.bind("<Leave>", self._on_tree_leave)
+
+        # 🔎 プレビューペイン: 選択行の本文を表示し、一致キーワードを色付き強調する
+        preview_frame = ttk.LabelFrame(main_frame, text="🔎 プレビュー（一致キーワードを強調）", padding=6)
+        preview_frame.pack(fill=tk.X, pady=(0, 10))
+        self.preview_text = tk.Text(preview_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
+        pv_scroll = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=self.preview_text.yview)
+        self.preview_text.configure(yscrollcommand=pv_scroll.set)
+        self.preview_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        pv_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # 一致語ハイライト用タグ（黄色背景）
+        self.preview_text.tag_configure('kw', background='#FFE135', foreground='#000000')
+        # 行を選択するとプレビューを更新
+        self.results_tree.bind("<<TreeviewSelect>>", self._on_result_select)
 
         # 制御ボタンフレーム
         control_frame = ttk.Frame(main_frame)
@@ -5012,12 +5074,10 @@ class UltraFastCompliantUI:
         for i, result in enumerate(display_results):
             layer_color = {'immediate': '🔴', 'hot': '🟡', 'complete': '🟢'}.get(result['layer'], '⚪')
 
-            # UTF-8対応の安全なプレビュー表示（キーワードハイライト適用）
+            # プレビューは検索時に「一致語【】＋前後文」のスニペット化済み。
+            # ここでは表示長のみ制限する（一致語を含む十分な前後文を表示）。
             raw_preview = result.get('content_preview', '')
-            # まずキーワードハイライトを適用
-            highlighted_preview = highlight_keywords_in_text(raw_preview, current_query)
-            # 次に長さ制限を適用
-            preview_text = safe_truncate_utf8_display(highlighted_preview, 150)  # ハイライト分を考慮して長めに
+            preview_text = safe_truncate_utf8_display(raw_preview, 200)
             
             # ファイル種類に応じたタグを設定
             file_ext = os.path.splitext(result['file_name'])[1].lower()
@@ -5081,12 +5141,9 @@ class UltraFastCompliantUI:
 
             debug_logger.debug("GUI統計更新開始")
 
-            # 軽量統計（即座取得）: クエリキャッシュ件数とOCR待ち件数
-            query_cache_count = len(getattr(self.search_system, '_query_result_cache', {}))
+            # 軽量統計（即座取得）: OCR待ち件数
             with self.search_system._pending_ocr_lock:
                 pending_ocr_count = len(self.search_system._pending_ocr)
-
-            debug_logger.debug(f"統計: query_cache={query_cache_count}, pending_ocr={pending_ocr_count}")
 
             # インデックス状況の取得
             indexing_status = ""
@@ -5095,11 +5152,10 @@ class UltraFastCompliantUI:
             elif self.search_system.indexing_results_ready:
                 indexing_status = " ✅ [インデックス完了]"
 
-            # クエリキャッシュ・OCR待ちは即座に更新
-            self.immediate_label.config(text=f"{query_cache_count:,} 件")
+            # OCR待ちを即座に更新
             self.hot_label.config(text=f"{pending_ocr_count:,} 件")
 
-            debug_logger.debug("クエリキャッシュ・OCR待ちUI更新完了")
+            debug_logger.debug("OCR待ちUI更新完了")
 
             # 完全層統計はバックグラウンドで取得（8並列データベース対応）
             self._update_complete_layer_stats_async(indexing_status)
@@ -5203,9 +5259,6 @@ class UltraFastCompliantUI:
             self.complete_label.config(text=f"{complete_count:,} ファイル")
 
             # 総合統計更新
-            immediate_count = len(self.search_system.immediate_cache)
-            hot_count = len(self.search_system.hot_cache)
-            
             total_unique_files = complete_count  # 完全層が実際のユニークファイル数
             parallel_info = f" | 並列処理: {self.search_system.optimal_threads}スレッド"
             cache_search_info = ""
@@ -5228,8 +5281,7 @@ class UltraFastCompliantUI:
             self.stats_label.config(
                 text=f"総インデックス数: {total_unique_files:,} ファイル{indexing_status}{parallel_info}{cache_search_info}{incremental_info}")
 
-            debug_logger.debug(
-                f"UI統計更新完了: 即座層={immediate_count}, 高速層={hot_count}, 完全層={complete_count}")
+            debug_logger.debug(f"UI統計更新完了: 完全層(DB)={complete_count}")
 
         except Exception as e:
             logging.error(f"UI統計更新エラー: {e}")
@@ -5255,12 +5307,10 @@ class UltraFastCompliantUI:
     def _lightweight_statistics_update(self):
         """軽量統計更新（UI応答性重視版）"""
         try:
-            # クエリキャッシュ件数とOCR待ち件数のみ更新（重いDB統計は省略）
-            query_cache_count = len(getattr(self.search_system, '_query_result_cache', {}))
+            # OCR待ち件数のみ更新（重いDB統計は省略）
             with self.search_system._pending_ocr_lock:
                 pending_ocr_count = len(self.search_system._pending_ocr)
 
-            self.immediate_label.config(text=f"{query_cache_count:,} 件")
             self.hot_label.config(text=f"{pending_ocr_count:,} 件")
 
             # インデックス状況表示（軽量版）
@@ -5273,16 +5323,14 @@ class UltraFastCompliantUI:
             # 完全層(実ファイル数=緑ラベル)もバックグラウンドで更新する。
             # 従来は完全層ラベルが定期更新されず「0 ファイル」のまま動かなかった。
             self._update_complete_layer_stats_async(indexing_status)
-            
+
             # 軽量統計表示
             parallel_info = f" | 並列: {getattr(self.search_system, 'optimal_threads', 8)}スレッド"
-            cache_info = f" | キャッシュ: 即座{immediate_count}+高速{hot_count}"
-            
+            ocr_info = f" | OCR待ち: {pending_ocr_count:,}件" if pending_ocr_count else ""
+
             self.stats_label.config(
-                text=f"軽量統計{indexing_status}{parallel_info}{cache_info}")
-            
-            debug_logger.debug(f"軽量統計更新完了: 即座層={immediate_count}, 高速層={hot_count}")
-            
+                text=f"軽量統計{indexing_status}{parallel_info}{ocr_info}")
+
         except Exception as e:
             logging.error(f"軽量統計更新エラー: {e}")
             self.stats_label.config(text="軽量統計エラー")
@@ -5474,54 +5522,77 @@ class UltraFastCompliantUI:
             debug_logger.info("🔍 [INTEGRATED_COMPLETE] 統合ハイライト処理完了")
 
     def _highlight_selected_result_safe(self, item_id):
-        """検索結果行を確実・目立つ形でハイライト（永続・自動スクロール版）。
+        """ダブルクリックした行を選択状態にして画面内に表示する。
 
-        従来は2秒で色が戻り「対象が分かりにくい」状態だった。次に別の行を
-        ダブルクリックするまでハイライトを保持し、選択・フォーカス・スクロールも
-        行って対象ファイルを目立たせる。
+        以前はファイル種別タグを 'highlight' で上書きして濃いオレンジに永続着色
+        していたが、ネイティブの選択表示と重複し、行の種別色も失われて分かりにくい
+        ため廃止。OSネイティブの選択・フォーカス・スクロールのみ行う。
         """
         try:
             tree = self.results_tree
-
-            # 直前のハイライト行を元のタグに戻す（1行だけを強調状態に保つ）
-            prev = getattr(self, '_highlighted_item', None)
-            if prev and prev != item_id:
-                try:
-                    if prev in tree.get_children():
-                        tree.item(prev, tags=getattr(self, '_highlighted_item_orig_tags', ()))
-                except Exception:
-                    pass
-
-            # 今回の行の元タグを保存（後で復元できるように）
-            self._highlighted_item_orig_tags = tree.item(item_id, 'tags')
-
-            # 目立つ濃いオレンジ＋白字＋太字でハイライト
-            tree.tag_configure('highlight', background='#FF6D00', foreground='#FFFFFF')
-            try:
-                # 太字フォント（環境にフォントが無い場合も例外で無視）
-                import tkinter.font as tkfont
-                base_font = tkfont.nametofont("TkDefaultFont")
-                bold_font = (base_font.actual('family'), base_font.actual('size'), 'bold')
-                tree.tag_configure('highlight', font=bold_font)
-            except Exception:
-                pass
-
-            tree.item(item_id, tags=['highlight'])
-
-            # 選択・フォーカス・スクロールで対象を確実に画面内に出す
-            try:
-                tree.selection_set(item_id)
-                tree.focus(item_id)
-                tree.see(item_id)
-            except Exception:
-                pass
-
-            self._highlighted_item = item_id
-            print("✨ 検索結果行をハイライト表示しました（永続）")
-
+            tree.selection_set(item_id)
+            tree.focus(item_id)
+            tree.see(item_id)
         except Exception as e:
-            print(f"⚠️ 検索結果ハイライト表示エラー: {e}")
+            debug_logger.debug(f"検索結果行の選択表示エラー: {e}")
     
+    def _on_result_select(self, event=None):
+        """選択中の検索結果の本文をプレビューペインに表示し、一致語を色付き強調する。"""
+        try:
+            sel = self.results_tree.selection()
+            if not sel:
+                return
+            values = self.results_tree.item(sel[0], 'values')
+            # columns = (layer, file_name, file_path, relevance, preview)
+            file_path = values[2] if len(values) > 2 else ''
+            query = self.search_var.get().strip()
+
+            # DBから本文の先頭を取得（無ければツリーのスニペットで代替）
+            content = self.search_system.get_file_content_for_preview(file_path, max_chars=3000)
+            if not content:
+                snippet = values[4] if len(values) > 4 else ''
+                content = snippet.replace('【', '').replace('】', '')
+
+            self.preview_text.config(state=tk.NORMAL)
+            self.preview_text.delete('1.0', tk.END)
+            self.preview_text.insert('1.0', content)
+            self._highlight_preview_matches(query)
+            self.preview_text.config(state=tk.DISABLED)
+
+            # 最初の一致箇所までスクロール
+            first = self.preview_text.tag_ranges('kw')
+            if first:
+                self.preview_text.see(first[0])
+        except Exception as e:
+            debug_logger.debug(f"プレビュー更新エラー: {e}")
+
+    def _highlight_preview_matches(self, query: str):
+        """プレビューText内の一致キーワード（元クエリ＋検索パターン）を 'kw' タグで強調。"""
+        if not query:
+            return
+        tw = self.preview_text
+        tw.tag_remove('kw', '1.0', tk.END)
+        terms = [query]
+        try:
+            _, _, _, patterns = self.search_system._get_search_patterns(query)
+            terms += [p for p in patterns if p and p.strip()]
+        except Exception:
+            pass
+        seen = set()
+        for term in terms:
+            t = term.strip()
+            if not t or t.lower() in seen:
+                continue
+            seen.add(t.lower())
+            start = '1.0'
+            while True:
+                pos = tw.search(t, start, tk.END, nocase=True)
+                if not pos:
+                    break
+                end = f"{pos}+{len(t)}c"
+                tw.tag_add('kw', pos, end)
+                start = end
+
     def _get_file_type_tag(self, file_ext: str) -> str:
         """ファイル拡張子に基づいてタグを決定"""
         file_type_map = {

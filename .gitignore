@@ -24,3 +24,7 @@ build/
 dist/
 *.exe
 *.spec.bak
+
+# Claude Code ローカル設定・ワークツリー（ローカル固有スクラッチ）
+.claude/settings.local.json
+.claude/worktrees/

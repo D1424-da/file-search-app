@@ -176,6 +176,10 @@ class _FileContentExtractor:
     def __init__(self):
         self._encoding_cache: dict = {}
         self._ocr_cache: dict = {}
+        # 一括インデックス中はファイル単位で多並列に走るため、ページ内並列を
+        # 絞って Tesseract のオーバーサブスクリプション（CPUコア超過の奪い合い）
+        # を防ぐ。bulk_index_worker 開始/終了時に切り替える。
+        self.bulk_mode: bool = False
         # 🔬 PDFのテキスト層抽出時間/OCR時間をスレッドセーフに記録する。
         #   live 経路では複数スレッドが同一 extractor を共有するため、インスタンス
         #   属性に直書きすると別ファイルの計測値と競合する。スレッドローカルに置く。
@@ -184,13 +188,18 @@ class _FileContentExtractor:
     def _page_workers(self) -> int:
         """PDFページ処理（テキスト抽出/OCR）の並列スレッド数を返す。
 
-        4 が実測で最良。実際のバルク経路（bulk_index_worker）はファイル単位で
-        既に多並列（最大14）に走るため、ここを 1 に絞ると大型スキャンPDF
-        （例: 22ページ）の各ページが逐次化して終盤に長い尻尾を作り、かえって
-        全体が遅くなることを確認済み。各PDF内も 4 ページ並列を維持して大型PDFの
-        ページOCRを並列化し、尻尾を短くする。
+        一括インデックス中はファイル単位で既に多並列に走るため、各PDF内でも
+        4ページ並列にすると「ファイル並列 × ページ並列」で Tesseract が CPU
+        コア数を大きく超えて起動し、互いに奪い合って急減速する（オーバー
+        サブスクリプション）。そこでバルク時はページ並列を 2 に絞り、全体の
+        同時 OCR 数を CPU コア数付近に抑える。大型スキャンPDFの「尻尾」を
+        短くするため 1 ではなく 2 を残す。
+        ライブ（単一ファイル）処理時は他に並列が無いので 4 まで使う。
+        いずれも CPU コア数を上限にする。
         """
-        return 4
+        cpu = os.cpu_count() or 4
+        target = 2 if self.bulk_mode else 4
+        return max(1, min(target, cpu))
 
     def _extract_file_content(self, file_path: str) -> str:
         """ファイル内容抽出 - 全形式対応（画像OCR含む）"""
@@ -930,7 +939,7 @@ class _FileContentExtractor:
                 # ページ＝章扉・ページ番号のみ等をOCR結果で上書きして劣化させないため）
                 ocr_target_pages = [p for p in range(max_pages)
                                     if len(page_texts.get(p, "")) < 3]
-                print(
+                debug_logger.debug(
                     f"[PDF診断] {os.path.basename(file_path)}: "
                     f"総ページ={total_pages} 処理={max_pages} "
                     f"テキスト層={_text_pages}p OCR対象={len(ocr_target_pages)}p "
@@ -949,7 +958,7 @@ class _FileContentExtractor:
                 _t_ocr_elapsed = time.time() - _t_ocr_start
                 self._tls.pdf_ocr_secs = _t_ocr_elapsed
                 if ocr_target_pages:
-                    print(
+                    debug_logger.debug(
                         f"[PDF診断] {os.path.basename(file_path)}: "
                         f"OCR完了={_t_ocr_elapsed:.2f}s "
                         f"OCR対象{len(ocr_target_pages)}p中{len(ocr_results)}p取得"
@@ -1099,7 +1108,8 @@ class _FileContentExtractor:
                             results[page_num] = text
                     except TimeoutError:
                         _timeout_count += 1
-                        print(f"[OCR診断] タイムアウト(30s) ページ{page_num}: {os.path.basename(file_path)}")
+                        debug_logger.warning(
+                            f"[OCR診断] タイムアウト(30s) ページ{page_num}: {os.path.basename(file_path)}")
                         continue
                     except Exception as page_error:
                         debug_logger.warning(f"PDF OCRページ {page_num} エラー: {page_error}")
@@ -1109,7 +1119,7 @@ class _FileContentExtractor:
             if _ocr_page_times:
                 _avg = sum(_ocr_page_times) / len(_ocr_page_times)
                 _max = max(_ocr_page_times)
-                print(
+                debug_logger.debug(
                     f"[OCR診断] {os.path.basename(file_path)}: "
                     f"対象{len(target_pages)}p 成功{len(results)}p タイムアウト{_timeout_count}p "
                     f"ページ平均={_avg:.2f}s 最大={_max:.2f}s 合計={_ocr_total:.2f}s"
@@ -1117,8 +1127,8 @@ class _FileContentExtractor:
 
             if results:
                 ocr_chars = sum(len(t) for t in results.values())
-                print(f"✅ PDF OCRフォールバック成功 ({os.path.basename(file_path)}): "
-                      f"{len(results)}ページ / {ocr_chars}文字")
+                debug_logger.debug(f"✅ PDF OCRフォールバック成功 ({os.path.basename(file_path)}): "
+                                   f"{len(results)}ページ / {ocr_chars}文字")
 
         except Exception as e:
             debug_logger.warning(f"PDF OCRフォールバックエラー ({os.path.basename(file_path)}): {e}")
@@ -1322,12 +1332,15 @@ def _init_extraction_worker() -> None:
     #   全プロセスが同一ファイルへ追記するが、診断用途では多少の行交錯は許容。
     if not any(isinstance(h, logging.FileHandler) for h in debug_logger.handlers):
         try:
+            # 既定は WARNING（診断ログの追記 I/O を抑制）。FILESEARCH_DEBUG=1 の
+            # ときだけ INFO 診断を extraction_diag.log へ出力する。
+            diag_level = logging.INFO if os.environ.get('FILESEARCH_DEBUG') else logging.WARNING
             fh = logging.FileHandler('extraction_diag.log', mode='a', encoding='utf-8')
-            fh.setLevel(logging.INFO)
+            fh.setLevel(diag_level)
             fh.setFormatter(logging.Formatter(
                 '%(asctime)s - pid%(process)d - %(levelname)s - %(message)s'))
             debug_logger.addHandler(fh)
-            debug_logger.setLevel(logging.INFO)
+            debug_logger.setLevel(diag_level)
         except Exception:
             pass
 

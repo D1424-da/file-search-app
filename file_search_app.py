@@ -1678,10 +1678,15 @@ class UltraFastFullCompliantSearchSystem:
                         except sqlite3.Error:
                             pass  # 設定済みの場合は無視
                     
+                    # FTS5設定INSERTで開いた暗黙トランザクションを確定してから
+                    # PRAGMAを変更する（トランザクション内ではsynchronous/journal_modeを
+                    # 変更できず "Safety level may not be changed inside a transaction" となるため）
+                    conn.commit()
+
                     # 設定を本番モードに戻す
                     cursor.execute("PRAGMA synchronous=NORMAL")
                     cursor.execute("PRAGMA journal_mode=WAL")
-                    
+
                     conn.commit()
                     conn.close()
                     
@@ -1704,7 +1709,7 @@ class UltraFastFullCompliantSearchSystem:
                             debug_logger.debug(f"DB{db_index}初期化成功")
                         else:
                             debug_logger.error(f"DB{db_index}初期化失敗: {message}")
-                            print(f"❌ データベース {db_index+1} 初期化エラー")
+                            print(f"❌ データベース {db_index+1} 初期化エラー: {message}")
                     except Exception as e:
                         print(f"❌ データベース初期化タイムアウト: {e}")
 

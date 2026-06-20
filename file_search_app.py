@@ -5455,53 +5455,19 @@ class UltraFastCompliantUI:
             debug_logger.info("🔍 [INTEGRATED_COMPLETE] 統合ハイライト処理完了")
 
     def _highlight_selected_result_safe(self, item_id):
-        """検索結果行を確実・目立つ形でハイライト（永続・自動スクロール版）。
+        """ダブルクリックした行を選択状態にして画面内に表示する。
 
-        従来は2秒で色が戻り「対象が分かりにくい」状態だった。次に別の行を
-        ダブルクリックするまでハイライトを保持し、選択・フォーカス・スクロールも
-        行って対象ファイルを目立たせる。
+        以前はファイル種別タグを 'highlight' で上書きして濃いオレンジに永続着色
+        していたが、ネイティブの選択表示と重複し、行の種別色も失われて分かりにくい
+        ため廃止。OSネイティブの選択・フォーカス・スクロールのみ行う。
         """
         try:
             tree = self.results_tree
-
-            # 直前のハイライト行を元のタグに戻す（1行だけを強調状態に保つ）
-            prev = getattr(self, '_highlighted_item', None)
-            if prev and prev != item_id:
-                try:
-                    if prev in tree.get_children():
-                        tree.item(prev, tags=getattr(self, '_highlighted_item_orig_tags', ()))
-                except Exception:
-                    pass
-
-            # 今回の行の元タグを保存（後で復元できるように）
-            self._highlighted_item_orig_tags = tree.item(item_id, 'tags')
-
-            # 目立つ濃いオレンジ＋白字＋太字でハイライト
-            tree.tag_configure('highlight', background='#FF6D00', foreground='#FFFFFF')
-            try:
-                # 太字フォント（環境にフォントが無い場合も例外で無視）
-                import tkinter.font as tkfont
-                base_font = tkfont.nametofont("TkDefaultFont")
-                bold_font = (base_font.actual('family'), base_font.actual('size'), 'bold')
-                tree.tag_configure('highlight', font=bold_font)
-            except Exception:
-                pass
-
-            tree.item(item_id, tags=['highlight'])
-
-            # 選択・フォーカス・スクロールで対象を確実に画面内に出す
-            try:
-                tree.selection_set(item_id)
-                tree.focus(item_id)
-                tree.see(item_id)
-            except Exception:
-                pass
-
-            self._highlighted_item = item_id
-            print("✨ 検索結果行をハイライト表示しました（永続）")
-
+            tree.selection_set(item_id)
+            tree.focus(item_id)
+            tree.see(item_id)
         except Exception as e:
-            print(f"⚠️ 検索結果ハイライト表示エラー: {e}")
+            debug_logger.debug(f"検索結果行の選択表示エラー: {e}")
     
     def _get_file_type_tag(self, file_ext: str) -> str:
         """ファイル拡張子に基づいてタグを決定"""

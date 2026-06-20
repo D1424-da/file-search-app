@@ -486,10 +486,19 @@ class _FileContentExtractor:
             content = []
             with zipfile.ZipFile(file_path, 'r') as xlsx:
                 # 共有文字列取得
+                #   sharedStrings.xml は <si>（文字列1個）の並び。リッチテキストの
+                #   <si> は複数の <r><t> に分割されるため、<si> 単位で配下の全 <t> を
+                #   連結して「1要素=1文字列」にする。旧実装は全要素の text をフラットに
+                #   集めており、<si> が複数 run を持つとインデックスがずれて別セルの
+                #   文字列が表示される（文字化け/誤内容）バグがあった。
                 try:
+                    _ns_main = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
                     shared_strings_xml = xlsx.read('xl/sharedStrings.xml')
                     shared_root = ET.fromstring(shared_strings_xml)
-                    shared_strings = [elem.text or '' for elem in shared_root.iter() if elem.text]
+                    shared_strings = []
+                    for si in shared_root.iter(_ns_main + 'si'):
+                        parts = [t.text for t in si.iter(_ns_main + 't') if t.text]
+                        shared_strings.append(''.join(parts))
                 except:
                     shared_strings = []
 

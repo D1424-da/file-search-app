@@ -2640,6 +2640,8 @@ class UltraFastFullCompliantSearchSystem:
             f"平均={p.get('extract_t',0)/ex_n*1000:.1f}ms 最大={p.get('extract_max',0)*1000:.0f}ms\n"
             f"  抽出スループット理論値: {p.get('extract_n',0)/max(1e-6,p.get('extract_t',0)):.1f} files/s (抽出のみ・並列考慮前)\n"
             + ext_lines +
+            f"  PDF内訳: テキスト層={p.get('pdf_text_t',0):.1f}s / OCR={p.get('pdf_ocr_t',0):.1f}s "
+            f"（OCRが支配的ならスキャンPDFが律速）\n" +
             f"  完全層書込: 件数={fl_files:,} バッチ={p.get('flush_batches',0)} 合計={p.get('flush_t',0):.1f}s "
             f"平均バッチ={p.get('flush_t',0)/fl_batches*1000:.0f}ms 最大={p.get('flush_max',0)*1000:.0f}ms\n"
             f"  シャード書込: 回数={p.get('shard_n',0)} 合計={p.get('shard_t',0):.1f}s 平均={p.get('shard_t',0)/sh_n*1000:.0f}ms\n"
@@ -3986,10 +3988,15 @@ class UltraFastFullCompliantSearchSystem:
             for future in concurrent.futures.as_completed(future_to_path):
                 fp_str = future_to_path[future]
                 try:
-                    file_path_str, content, file_size, modified_time, extract_secs = future.result(timeout=300)
+                    (file_path_str, content, file_size, modified_time, extract_secs,
+                     pdf_text_secs, pdf_ocr_secs) = future.result(timeout=300)
                     # 抽出時間を性能診断へ記録（ボトルネック計測の継続性を維持）
                     self._perf_add('extract', extract_secs)
                     self._perf_add_ext(Path(file_path_str).suffix.lower() or '(なし)', extract_secs)
+                    # 🔬 PDFのテキスト層抽出 vs OCR の内訳を集約（最大の遅延要因の切り分け）
+                    if pdf_text_secs or pdf_ocr_secs:
+                        self._perf_add('pdf_text', pdf_text_secs)
+                        self._perf_add('pdf_ocr', pdf_ocr_secs)
                     if content:
                         ok = self._store_indexed_content(
                             file_path_str, content, file_size, modified_time)

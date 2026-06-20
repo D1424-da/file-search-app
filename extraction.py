@@ -805,6 +805,11 @@ class _FileContentExtractor:
 
     def _extract_pdf_content(self, file_path: str) -> str:
         """PDF文書抽出（ページ並列化で80%高速化）"""
+        # 🔬 PDF抽出のテキスト層抽出時間とOCR時間を分けて記録する。
+        #   _worker_extract がこれを読み取り、親プロセスの性能診断へ集約する。
+        #   （ワーカー内 print だけでは全PDFの合算が見えないため）
+        self._last_pdf_text_secs = 0.0
+        self._last_pdf_ocr_secs = 0.0
         try:
             # ファイル存在とアクセス権限チェック
             if not os.path.exists(file_path):
@@ -897,6 +902,7 @@ class _FileContentExtractor:
                             continue
 
                 _t_text_elapsed = time.time() - _t_text_start
+                self._last_pdf_text_secs = _t_text_elapsed
                 _text_pages = len(page_texts)
 
                 # 🔥 OCRフォールバック: テキスト層が無い（=スキャン）ページを画像化してOCR
@@ -921,6 +927,7 @@ class _FileContentExtractor:
                         page_texts[page_num] = f"{existing} {ocr_text}".strip() if existing else ocr_text
 
                 _t_ocr_elapsed = time.time() - _t_ocr_start
+                self._last_pdf_ocr_secs = _t_ocr_elapsed
                 if ocr_target_pages:
                     print(
                         f"[PDF診断] {os.path.basename(file_path)}: "
@@ -1030,8 +1037,13 @@ class _FileContentExtractor:
             if getattr(self, '_ocr_lang', None) is None:
                 self._ocr_lang = 'jpn+eng'
 
-            def ocr_single_page(page_num: int) -> str:
-                """単一ページをレンダリングしてOCR（並列処理用・1パス）"""
+            def ocr_single_page(page_num: int) -> tuple:
+                """単一ページをレンダリングしてOCR（並列処理用・1パス）
+
+                戻り値: (テキスト, 所要秒) ※実時間はワーカー内で計測する。
+                as_completed 側で計測すると既に完了済みのため 0 になってしまう。
+                """
+                _ps = time.time()
                 page = doc[page_num]
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
                 image = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -1049,7 +1061,7 @@ class _FileContentExtractor:
                     text = pytesseract.image_to_string(
                         image, lang='eng', config=ocr_config).strip()
 
-                return ' '.join(text.split())
+                return ' '.join(text.split()), time.time() - _ps
 
             # 🚀 並列OCR（テキスト抽出と同じ最大4スレッド）＋ページ単位タイムアウトでハング防止
             _ocr_page_times: list[float] = []
@@ -1059,10 +1071,9 @@ class _FileContentExtractor:
                 futures = {executor.submit(ocr_single_page, p): p for p in target_pages}
                 for future in as_completed(futures):
                     page_num = futures[future]
-                    _tp_start = time.time()
                     try:
-                        text = future.result(timeout=30.0)  # 1ページ最大30秒
-                        _ocr_page_times.append(time.time() - _tp_start)
+                        text, _page_secs = future.result(timeout=30.0)  # 1ページ最大30秒
+                        _ocr_page_times.append(_page_secs)
                         if len(text) >= 2:
                             results[page_num] = text
                     except TimeoutError:
@@ -1070,7 +1081,6 @@ class _FileContentExtractor:
                         print(f"[OCR診断] タイムアウト(30s) ページ{page_num}: {os.path.basename(file_path)}")
                         continue
                     except Exception as page_error:
-                        _ocr_page_times.append(time.time() - _tp_start)
                         debug_logger.warning(f"PDF OCRページ {page_num} エラー: {page_error}")
                         continue
 
@@ -1307,8 +1317,9 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
     前処理（隠しファイル/差分スキップ/サイズ判定）は親プロセスで実施済みである
     ことを前提とし、ここでは純粋に本文抽出だけを行う。
 
-    戻り値: (file_path, content, file_size, modified_time, extract_seconds)
-    エラー時: (file_path, None, file_size, modified_time, extract_seconds)
+    戻り値: (file_path, content, file_size, modified_time, extract_seconds,
+             pdf_text_seconds, pdf_ocr_seconds)
+    エラー時: content=None。PDF以外では pdf_* は 0.0。
     """
     global _proc_extractor
     if _proc_extractor is None:
@@ -1317,17 +1328,24 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
     import os as _os
     _ext = Path(file_path).suffix.lower()
     _pid = _os.getpid()
+    # PDFのテキスト/OCR内訳はインスタンスに残るので毎回リセットして読む
+    _proc_extractor._last_pdf_text_secs = 0.0
+    _proc_extractor._last_pdf_ocr_secs = 0.0
     try:
         content = _proc_extractor._extract_file_content(file_path)
         _elapsed = time.time() - _t0
+        _pdf_text = getattr(_proc_extractor, '_last_pdf_text_secs', 0.0)
+        _pdf_ocr = getattr(_proc_extractor, '_last_pdf_ocr_secs', 0.0)
         if _elapsed > 5.0:
             print(
                 f"[抽出診断] pid={_pid} ext={_ext} {_elapsed:.2f}s "
+                f"(text={_pdf_text:.2f}s ocr={_pdf_ocr:.2f}s) "
                 f"size={file_size//1024}KB chars={len(content) if content else 0} "
                 f"{os.path.basename(file_path)}"
             )
-        return (file_path, content, file_size, modified_time, _elapsed)
+        return (file_path, content, file_size, modified_time, _elapsed,
+                _pdf_text, _pdf_ocr)
     except Exception as _e:
         _elapsed = time.time() - _t0
         print(f"[抽出診断] pid={_pid} ext={_ext} ERROR {_elapsed:.2f}s {file_path}: {_e}")
-        return (file_path, None, file_size, modified_time, _elapsed)
+        return (file_path, None, file_size, modified_time, _elapsed, 0.0, 0.0)

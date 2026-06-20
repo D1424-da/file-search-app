@@ -2647,6 +2647,66 @@ class UltraFastFullCompliantSearchSystem:
             f"  実効スループット    : {fl_files/wall:.1f} files/s"
         )
 
+    def _verify_layers_persisted(self, sample: int = 30) -> str:
+        """即座層/高速層に残るファイルが完全層(DB)に保存されているか検証して文字列で返す。
+
+        各層の最新サンプルを取り出し、対応するシャードDBに file_path が存在するか照合。
+        インデックス完了後に呼び、3層の整合性を診断する。
+        """
+        try:
+            imm_keys = list(self.immediate_cache.keys())
+            hot_keys = list(self.hot_cache.keys())
+
+            # 完全層(DB)の総件数
+            complete_total = 0
+            for db_path in self.complete_db_paths:
+                try:
+                    if os.path.exists(db_path) and os.path.getsize(db_path) > 1024:
+                        conn = sqlite3.connect(str(db_path), timeout=5.0)
+                        complete_total += conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+                        conn.close()
+                except Exception:
+                    pass
+
+            def check_membership(keys):
+                """最新サンプルが完全層に存在するか (found, missing_list) を返す。"""
+                targets = keys[-sample:] if len(keys) > sample else keys
+                found = 0
+                missing = []
+                for fp in targets:
+                    try:
+                        db_index = self._get_db_index_for_file(fp)
+                        conn = sqlite3.connect(str(self.complete_db_paths[db_index]), timeout=5.0)
+                        row = conn.execute(
+                            "SELECT 1 FROM documents WHERE file_path = ? LIMIT 1", (fp,)).fetchone()
+                        conn.close()
+                        if row:
+                            found += 1
+                        else:
+                            missing.append(fp)
+                    except Exception as e:
+                        missing.append(f"{fp} (照合エラー: {e})")
+                return found, missing, len(targets)
+
+            imm_found, imm_missing, imm_checked = check_membership(imm_keys)
+            hot_found, hot_missing, hot_checked = check_membership(hot_keys)
+
+            lines = [
+                "🔬 3層整合性チェック（完全層への保存確認）:",
+                f"  即座層: {len(imm_keys):,}件 / 高速層: {len(hot_keys):,}件 / 完全層(DB): {complete_total:,}件",
+                f"  即座層サンプル照合: {imm_found}/{imm_checked} がDBに存在",
+                f"  高速層サンプル照合: {hot_found}/{hot_checked} がDBに存在",
+            ]
+            if imm_missing or hot_missing:
+                lines.append(f"  ⚠️ 未保存サンプル(即座層{len(imm_missing)}/高速層{len(hot_missing)}):")
+                for m in (imm_missing + hot_missing)[:5]:
+                    lines.append(f"     - {m}")
+            else:
+                lines.append("  ✅ サンプルは全て完全層(DB)に保存済み")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"🔬 3層整合性チェック失敗: {e}"
+
     def _load_index_mtime_cache(self):
         """差分インデックス用に、全DBの (file_path -> modified_time) をメモリへ読み込む。
 
@@ -5396,6 +5456,14 @@ class UltraFastFullCompliantSearchSystem:
                 summary = self._perf_summary()
                 print(summary)
                 debug_logger.info(summary)
+            except Exception:
+                pass
+
+            # 🔬 3層整合性チェック（即座層/高速層のファイルが完全層に保存されたか）
+            try:
+                verify = self._verify_layers_persisted()
+                print(verify)
+                debug_logger.info(verify)
             except Exception:
                 pass
 
@@ -9434,6 +9502,14 @@ class UltraFastCompliantUI:
                 summary = self.search_system._perf_summary()
                 print(summary)
                 debug_logger.info(summary)
+            except Exception:
+                pass
+
+            # 🔬 3層整合性チェック（即座層/高速層のファイルが完全層に保存されたか）
+            try:
+                verify = self.search_system._verify_layers_persisted()
+                print(verify)
+                debug_logger.info(verify)
             except Exception:
                 pass
 

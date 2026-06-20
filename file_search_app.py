@@ -2031,6 +2031,49 @@ class UltraFastFullCompliantSearchSystem:
             if self._query_result_cache:
                 self._query_result_cache.clear()
 
+    def _make_preview_snippet(self, content_head: str, query: str,
+                              before: int = 40, after: int = 150) -> str:
+        """検索結果プレビューを「一致キーワード中心＋前後の文」のスニペットにする。
+
+        一致語は 【】 で囲んで目立たせる。旧実装は本文先頭200字を出すだけで一致語を
+        含まないことが多く「なぜヒットしたか分からない」状態だった。一致が先頭
+        （取得済みの content_head 範囲）に無い場合は従来どおり先頭を返す。
+        """
+        if not content_head:
+            return ""
+        text = content_head
+        low = text.lower()
+        # 一致候補: 元クエリ → 各検索パターン（長い順で優先）
+        candidates = [query.strip()]
+        try:
+            _, _, _, patterns = self._get_search_patterns(query)
+            candidates += sorted({p for p in patterns if p and p.strip()},
+                                 key=len, reverse=True)
+        except Exception:
+            pass
+        pos, matched = -1, ""
+        for cand in candidates:
+            c = cand.strip().lower()
+            if not c:
+                continue
+            i = low.find(c)
+            if i != -1:
+                pos, matched = i, text[i:i + len(cand.strip())]
+                break
+        if pos == -1:
+            return text[:200]
+        start = max(0, pos - before)
+        end = min(len(text), pos + len(matched) + after)
+        snippet = text[start:end]
+        try:
+            snippet = re.sub('(' + re.escape(matched) + ')', r'【\1】',
+                             snippet, count=1, flags=re.IGNORECASE)
+        except Exception:
+            pass
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if end < len(text) else ""
+        return f"{prefix}{snippet}{suffix}"
+
     def _search_complete_layer(self, query: str, max_results: int) -> List[Dict[str, Any]]:
         """完全層検索 - 8個のSQLite FTS5データベースを並列検索（半角全角対応強化）"""
         results = []
@@ -2112,7 +2155,7 @@ class UltraFastFullCompliantSearchSystem:
                                         result = {
                                             'file_path': row[0],
                                             'file_name': row[1],
-                                            'content_preview': content_head[:200],
+                                            'content_preview': self._make_preview_snippet(content_head, query),
                                             'layer': f'complete_db_{db_index}_like',
                                             'file_type': row[3],
                                             'size': row[4] if row[4] else 0,
@@ -2203,7 +2246,7 @@ class UltraFastFullCompliantSearchSystem:
                                         result = {
                                             'file_path': row[0],
                                             'file_name': row[1],
-                                            'content_preview': content_head[:200],
+                                            'content_preview': self._make_preview_snippet(content_head, query),
                                             'layer': f'complete_db_{db_index}',
                                             'file_type': row[3],
                                             'size': row[5] if len(row) > 5 and row[5] else 0,
@@ -5005,12 +5048,10 @@ class UltraFastCompliantUI:
         for i, result in enumerate(display_results):
             layer_color = {'immediate': '🔴', 'hot': '🟡', 'complete': '🟢'}.get(result['layer'], '⚪')
 
-            # UTF-8対応の安全なプレビュー表示（キーワードハイライト適用）
+            # プレビューは検索時に「一致語【】＋前後文」のスニペット化済み。
+            # ここでは表示長のみ制限する（一致語を含む十分な前後文を表示）。
             raw_preview = result.get('content_preview', '')
-            # まずキーワードハイライトを適用
-            highlighted_preview = highlight_keywords_in_text(raw_preview, current_query)
-            # 次に長さ制限を適用
-            preview_text = safe_truncate_utf8_display(highlighted_preview, 150)  # ハイライト分を考慮して長めに
+            preview_text = safe_truncate_utf8_display(raw_preview, 200)
             
             # ファイル種類に応じたタグを設定
             file_ext = os.path.splitext(result['file_name'])[1].lower()

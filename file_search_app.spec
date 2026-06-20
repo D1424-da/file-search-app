@@ -13,6 +13,7 @@ a = Analysis(
         ('cache', 'cache'),
     ],
     hiddenimports=[
+        'extraction',
         'tkinter',
         'tkinter.filedialog',
         'tkinter.ttk',

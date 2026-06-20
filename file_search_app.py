@@ -830,11 +830,15 @@ def setup_debug_logger():
     if logger.handlers:
         logger.handlers.clear()
 
-    logger.setLevel(logging.DEBUG)
+    # 🚀 ホットパス高速化: 既定は WARNING。インデックス1件ごとに走る
+    #   debug/info のファイル書き込み（毎回 I/O＋ロック）がスループットを律速して
+    #   いたため抑制する。詳細診断が要るときだけ環境変数で DEBUG へ引き上げる。
+    log_level = logging.DEBUG if os.environ.get('FILESEARCH_DEBUG') else logging.WARNING
+    logger.setLevel(log_level)
 
     # ファイルハンドラー（上書きモード）
     file_handler = logging.FileHandler('file_search_app.log', mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(log_level)
 
     # フォーマッター（シンプル版）
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -3292,9 +3296,8 @@ class UltraFastFullCompliantSearchSystem:
         complete_db_path = self.complete_db_paths[db_index]
         
         debug_logger.debug(f"使用データベース: DB{db_index} - {complete_db_path.name}")
-        
-        print(f"🔄 完全層（DB{db_index}）移行開始: {os.path.basename(file_path)}")
-        
+        debug_logger.debug(f"🔄 完全層（DB{db_index}）移行開始: {os.path.basename(file_path)}")
+
         # データベースファイル存在確認（強化版）
         if not complete_db_path.exists():
             debug_logger.warning(f"データベースファイルが存在しません - 作成します: {complete_db_path}")
@@ -8171,6 +8174,11 @@ class UltraFastCompliantUI:
 
             # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
             self.search_system._bulk_indexing = True
+            # 抽出側にもバルクを通知（ページ内OCR並列を絞りオーバーサブスクリプション抑制）
+            try:
+                self.search_system._extractor.bulk_mode = True
+            except Exception:
+                pass
             # 🔬 性能診断カウンタをリセット
             self.search_system._perf_reset()
 
@@ -8416,6 +8424,10 @@ class UltraFastCompliantUI:
             
             # 一括インデックスモード解除＋完全層バッファの最終フラッシュ（バルク書き込み）
             self.search_system._bulk_indexing = False
+            try:
+                self.search_system._extractor.bulk_mode = False
+            except Exception:
+                pass
             try:
                 self.search_system.flush_complete_buffer()
             except Exception as flush_err:

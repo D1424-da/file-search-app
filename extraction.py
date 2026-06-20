@@ -24,6 +24,7 @@ import json
 import mmap
 import logging
 import zipfile
+import threading
 import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -181,6 +182,10 @@ class _FileContentExtractor:
         #   を解消する。ライブ単一ファイル処理では従来どおり 4 並列でページを処理。
         #   ※OCRの解像度・言語・前処理は変えないので認識精度は完全に同一。
         self._bulk_mode: bool = False
+        # 🔬 PDFのテキスト層抽出時間/OCR時間をスレッドセーフに記録する。
+        #   live 経路では複数スレッドが同一 extractor を共有するため、インスタンス
+        #   属性に直書きすると別ファイルの計測値と競合する。スレッドローカルに置く。
+        self._tls = threading.local()
 
     def _page_workers(self) -> int:
         """PDFページ処理（テキスト抽出/OCR）の並列スレッド数を返す。"""
@@ -815,11 +820,10 @@ class _FileContentExtractor:
 
     def _extract_pdf_content(self, file_path: str) -> str:
         """PDF文書抽出（ページ並列化で80%高速化）"""
-        # 🔬 PDF抽出のテキスト層抽出時間とOCR時間を分けて記録する。
-        #   _worker_extract がこれを読み取り、親プロセスの性能診断へ集約する。
-        #   （ワーカー内 print だけでは全PDFの合算が見えないため）
-        self._last_pdf_text_secs = 0.0
-        self._last_pdf_ocr_secs = 0.0
+        # 🔬 PDF抽出のテキスト層抽出時間とOCR時間を分けて記録する（スレッドローカル）。
+        #   親プロセス/呼び出し側が pdf_text_secs/pdf_ocr_secs を読み取り、性能診断へ集約。
+        self._tls.pdf_text_secs = 0.0
+        self._tls.pdf_ocr_secs = 0.0
         try:
             # ファイル存在とアクセス権限チェック
             if not os.path.exists(file_path):
@@ -917,7 +921,7 @@ class _FileContentExtractor:
                             continue
 
                 _t_text_elapsed = time.time() - _t_text_start
-                self._last_pdf_text_secs = _t_text_elapsed
+                self._tls.pdf_text_secs = _t_text_elapsed
                 _text_pages = len(page_texts)
 
                 # 🔥 OCRフォールバック: テキスト層が無い（=スキャン）ページを画像化してOCR
@@ -942,7 +946,7 @@ class _FileContentExtractor:
                         page_texts[page_num] = f"{existing} {ocr_text}".strip() if existing else ocr_text
 
                 _t_ocr_elapsed = time.time() - _t_ocr_start
-                self._last_pdf_ocr_secs = _t_ocr_elapsed
+                self._tls.pdf_ocr_secs = _t_ocr_elapsed
                 if ocr_target_pages:
                     print(
                         f"[PDF診断] {os.path.basename(file_path)}: "
@@ -1348,14 +1352,14 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
     import os as _os
     _ext = Path(file_path).suffix.lower()
     _pid = _os.getpid()
-    # PDFのテキスト/OCR内訳はインスタンスに残るので毎回リセットして読む
-    _proc_extractor._last_pdf_text_secs = 0.0
-    _proc_extractor._last_pdf_ocr_secs = 0.0
+    # PDFのテキスト/OCR内訳はスレッドローカルに残る（PDF以外なら0のまま）
+    _proc_extractor._tls.pdf_text_secs = 0.0
+    _proc_extractor._tls.pdf_ocr_secs = 0.0
     try:
         content = _proc_extractor._extract_file_content(file_path)
         _elapsed = time.time() - _t0
-        _pdf_text = getattr(_proc_extractor, '_last_pdf_text_secs', 0.0)
-        _pdf_ocr = getattr(_proc_extractor, '_last_pdf_ocr_secs', 0.0)
+        _pdf_text = getattr(_proc_extractor._tls, 'pdf_text_secs', 0.0)
+        _pdf_ocr = getattr(_proc_extractor._tls, 'pdf_ocr_secs', 0.0)
         if _elapsed > 5.0:
             print(
                 f"[抽出診断] pid={_pid} ext={_ext} {_elapsed:.2f}s "

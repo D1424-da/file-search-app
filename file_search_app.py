@@ -2801,6 +2801,14 @@ class UltraFastFullCompliantSearchSystem:
                 _ext_dt = time.time() - _ext_t0
                 self._perf_add('extract', _ext_dt)
                 self._perf_add_ext(file_path_obj.suffix.lower() or '(なし)', _ext_dt)
+                # 🔬 PDFのテキスト層抽出 vs OCR の内訳を集約（live 経路でも計測）
+                #   スレッドローカルから読む（複数スレッドが extractor を共有するため）。
+                #   PDF以外では TLS に前回PDFの値が残るので、拡張子で判定して加算する。
+                if file_path_obj.suffix.lower() == '.pdf':
+                    _pt = getattr(self._extractor._tls, 'pdf_text_secs', 0.0)
+                    _po = getattr(self._extractor._tls, 'pdf_ocr_secs', 0.0)
+                    self._perf_add('pdf_text', _pt)
+                    self._perf_add('pdf_ocr', _po)
                 if _ext_dt > 0.5:
                     debug_logger.warning(
                         f"🔬 抽出が遅いファイル({_ext_dt*1000:.0f}ms, {file_size/1024:.0f}KB): {file_path}")
@@ -8133,6 +8141,14 @@ class UltraFastCompliantUI:
 
             # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
             self.search_system._bulk_indexing = True
+            # 🚀 バルク時はPDFページ並列を1に落としてオーバーサブスクリプション解消。
+            #   この経路は複数スレッドが同時にファイル処理するため、各PDFがさらに
+            #   4ページ並列を張ると 8スレッド×4=32 がコアを奪い合う。外側の
+            #   ファイル並列だけでコアを埋め、内側は逐次にする（精度は不変）。
+            try:
+                self.search_system._extractor._bulk_mode = True
+            except Exception:
+                pass
             # 🔬 性能診断カウンタをリセット
             self.search_system._perf_reset()
 
@@ -8378,6 +8394,11 @@ class UltraFastCompliantUI:
             
             # 一括インデックスモード解除＋完全層バッファの最終フラッシュ（バルク書き込み）
             self.search_system._bulk_indexing = False
+            # バルク用のページ並列1モードを解除（ライブ単一処理は4並列に戻す）
+            try:
+                self.search_system._extractor._bulk_mode = False
+            except Exception:
+                pass
             try:
                 self.search_system.flush_complete_buffer()
             except Exception as flush_err:

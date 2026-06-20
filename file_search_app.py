@@ -5890,13 +5890,11 @@ class UltraFastFullCompliantSearchSystem:
                     debug_logger.warning(f"Executor shutdown error: {e}")
             self._active_executors.clear()
             
-            # 最終キャッシュ保存（同期処理で確実に実行）
+            # 即座層/高速層はセッション限りのため永続化しない（完全層DBが永続）
             try:
-                print("💾 最終キャッシュ保存中...")
-                self._save_caches_sync()
-                print("✅ 最終キャッシュ保存完了")
+                self._save_caches_sync()  # 現在は no-op（揮発性キャッシュのため）
             except Exception as e:
-                debug_logger.error(f"最終キャッシュ保存エラー: {e}")
+                debug_logger.error(f"キャッシュ保存スキップ処理エラー: {e}")
             
             # バックグラウンドスレッドの終了を待機（最大3秒）
             for thread in self._background_threads:
@@ -5911,27 +5909,30 @@ class UltraFastFullCompliantSearchSystem:
             debug_logger.error(f"シャットダウンエラー: {e}")
 
     def _save_caches_sync(self):
-        """同期的なキャッシュ保存（シャットダウン時専用）"""
-        try:
-            cache_dir = self.project_root / "cache"
-            cache_dir.mkdir(exist_ok=True)
-            
-            # 高速層キャッシュのみ保存（即座層は揮発性）
-            if self.hot_cache:
-                cache_file = cache_dir / "hot_cache.json"
-                with open(cache_file, 'w', encoding='utf-8') as f:
-                    json.dump(dict(self.hot_cache), f, ensure_ascii=False, indent=2)
-                    
-        except Exception as e:
-            debug_logger.error(f"同期キャッシュ保存エラー: {e}")
+        """同期的なキャッシュ保存（シャットダウン時専用）。
+
+        即座層・高速層はセッション限りの揮発性キャッシュとし永続化しない
+        （完全層DBが全件の永続的な真実を保持する）。次回起動時の残存と
+        3層カウントの不整合を避けるため、何も保存しない。
+        """
+        return
 
     def save_caches(self):
-        """キャッシュ永続化（並列処理版）- 即座層は除外"""
+        """キャッシュ永続化 - 即座層/高速層はセッション限りのため永続化しない。
+
+        以前は高速層を hot_cache.json へ書き出していたが、次回起動時の残存と
+        3層カウントの水増し（高速層>即座層）の原因となるため無効化した。
+        全件の永続的な真実は完全層(DB)が保持する。
+        """
+        return
+
+    def _save_caches_disabled(self):
+        """（旧実装・未使用）並列キャッシュ永続化。参照用に残置。"""
         try:
             # シャットダウン中は処理をスキップ
             if self.shutdown_requested:
                 return
-                
+
             # プロジェクトルートのcacheディレクトリを使用
             cache_dir = self.project_root / "cache"
             cache_dir.mkdir(exist_ok=True)
@@ -5990,103 +5991,37 @@ class UltraFastFullCompliantSearchSystem:
                 print(f"⚠️ キャッシュ保存エラー: {e}")
 
     def load_caches(self):
-        """キャッシュ復元（並列処理版）- 即座層は起動時に空で開始"""
+        """キャッシュ初期化 - 即座層/高速層はともにセッション限り（起動時に空で開始）。
+
+        即座層・高速層は揮発性のセッションキャッシュとして扱う。永続化された
+        前回分を復元すると 3層レイヤー状況のカウントが前回分で水増しされ
+        （高速層>即座層）、起動直後にも残存して見えるため復元しない。
+        全件の永続的な真実は完全層(DB)が保持しているので、再起動後も検索は
+        完全に機能する。
+        """
         try:
-            # プロジェクトルートのcacheディレクトリを使用
             cache_dir = self.project_root / "cache"
-            
-            # 即座層は常に空で開始（揮発性キャッシュ）
+
+            # 即座層・高速層はともに常に空で開始（揮発性セッションキャッシュ）
             self.immediate_cache = {}
-            
-            # 並列処理でキャッシュファイル読み込み
-            def load_cache_file(filename):
-                """並列処理用のキャッシュファイル読み込み"""
+            self.hot_cache = {}
+
+            # 古い永続キャッシュファイルがあれば削除（起動時の残存・復活を防ぐ）
+            for stale_name in ("immediate_cache.json", "hot_cache.json"):
                 try:
-                    cache_file = cache_dir / filename
-                    if cache_file.exists():
-                        with open(cache_file, 'r', encoding='utf-8') as f:
-                            return json.load(f), filename
-                    return {}, filename
-                except Exception as e:
-                    debug_logger.error(f"キャッシュファイル読み込みエラー {filename}: {e}")
-                    return {}, filename
-            
-            # Hot層キャッシュの並列読み込み
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                future_tasks = [
-                    executor.submit(load_cache_file, "hot_cache.json")
-                ]
-                
-                # 結果の収集
-                loaded_hot_cache = {}
-                for future in as_completed(future_tasks):
-                    try:
-                        cache_data, filename = future.result(timeout=5.0)
-                        if filename == "hot_cache.json":
-                            loaded_hot_cache = cache_data
-                    except Exception as e:
-                        debug_logger.error(f"キャッシュ読み込みタスクエラー: {e}")
-            
-            # 古いキャッシュエントリをクリーンアップ（7日以上古い）
-            if loaded_hot_cache:
-                def cleanup_cache_entry(items):
-                    """並列処理用のキャッシュクリーンアップ"""
-                    current_time = time.time()
-                    cache_expiry_seconds = 7 * 24 * 3600  # 7日間
-                    cleaned_items = {}
-                    expired_count = 0
-                    
-                    for file_path, cache_data in items:
-                        cache_time = cache_data.get('moved_from_immediate', 
-                                                   cache_data.get('indexed_time', 0))
-                        
-                        if current_time - cache_time < cache_expiry_seconds:
-                            cleaned_items[file_path] = cache_data
-                        else:
-                            expired_count += 1
-                    
-                    return cleaned_items, expired_count
-                
-                # キャッシュアイテムを分割して並列処理
-                items = list(loaded_hot_cache.items())
-                chunk_size = max(1, len(items) // 4)
-                chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
-                
-                with ThreadPoolExecutor(max_workers=min(len(chunks), 4)) as executor:
-                    futures = [executor.submit(cleanup_cache_entry, chunk) for chunk in chunks]
-                    
-                    cleaned_cache = {}
-                    total_expired = 0
-                    
-                    for future in as_completed(futures):
-                        try:
-                            chunk_cleaned, chunk_expired = future.result(timeout=5.0)
-                            cleaned_cache.update(chunk_cleaned)
-                            total_expired += chunk_expired
-                        except Exception as e:
-                            debug_logger.error(f"キャッシュクリーンアップエラー: {e}")
-                
-                self.hot_cache = cleaned_cache
-                
-                if total_expired > 0:
-                    debug_logger.info(f"高速層期限切れキャッシュクリーンアップ: {total_expired}件削除")
-                    print(f"🧹 高速層クリーンアップ: {total_expired}件の古いキャッシュを削除")
-            else:
-                self.hot_cache = {}
-            
-            # 古い即座層キャッシュファイルがあれば削除
-            immediate_cache_file = cache_dir / "immediate_cache.json"
-            if immediate_cache_file.exists():
-                immediate_cache_file.unlink()
-                debug_logger.info("古い即座層キャッシュファイルを削除")
-            
-            debug_logger.info(f"並列キャッシュ復元完了: immediate=0 (新規), hot={len(self.hot_cache)}")
-            print(f"💾 並列キャッシュ復元完了: immediate=0 (新規), hot={len(self.hot_cache)}")
-            
+                    stale_file = cache_dir / stale_name
+                    if stale_file.exists():
+                        stale_file.unlink()
+                        debug_logger.info(f"古いキャッシュファイルを削除: {stale_name}")
+                except Exception as unlink_err:
+                    debug_logger.warning(f"古いキャッシュ削除スキップ {stale_name}: {unlink_err}")
+
+            debug_logger.info("キャッシュ初期化完了: immediate=0 / hot=0 (セッション限り)")
+            print("💾 キャッシュ初期化完了: 即座層=0 / 高速層=0 (セッション限り・完全層DBが永続)")
+
         except Exception as e:
-            debug_logger.error(f"キャッシュ復元エラー: {e}")
-            print(f"⚠️ キャッシュ復元エラー: {e}")
-            # エラー時は空のキャッシュで開始
+            debug_logger.error(f"キャッシュ初期化エラー: {e}")
+            print(f"⚠️ キャッシュ初期化エラー: {e}")
             self.immediate_cache = {}
             self.hot_cache = {}
 

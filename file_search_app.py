@@ -2031,6 +2031,21 @@ class UltraFastFullCompliantSearchSystem:
             if self._query_result_cache:
                 self._query_result_cache.clear()
 
+    def get_file_content_for_preview(self, file_path: str, max_chars: int = 3000) -> str:
+        """プレビューペイン用に、対象ファイルの本文先頭を該当シャードDBから取得する。"""
+        if not file_path:
+            return ""
+        try:
+            db_index = self._get_db_index_for_file(file_path)
+            conn = self._get_search_connection(db_index)
+            row = conn.execute(
+                "SELECT substr(content, 1, ?) FROM documents WHERE file_path = ? LIMIT 1",
+                (max_chars, file_path)).fetchone()
+            return row[0] if row and row[0] else ""
+        except Exception as e:
+            debug_logger.debug(f"プレビュー本文取得エラー: {e}")
+            return ""
+
     def _make_preview_snippet(self, content_head: str, query: str,
                               before: int = 40, after: int = 150) -> str:
         """検索結果プレビューを「一致キーワード中心＋前後の文」のスニペットにする。
@@ -2612,11 +2627,9 @@ class UltraFastFullCompliantSearchSystem:
                 debug_logger.debug(f"システムファイルをスキップ: {file_path_obj.name}")
                 return False
 
-            # 画像ファイルをスキップ（検索対象外）
+            # 画像ファイル(.tif等)はOCRで本文を検索対象にする。一括時は遅延OCRで
+            # 背景処理されるため、ここではスキップしない。
             image_extensions = {'.tif', '.tiff', '.jpg', '.jpeg', '.png', '.gif', '.bmp'}
-            if file_path_obj.suffix.lower() in image_extensions:
-                debug_logger.debug(f"画像ファイルをスキップ: {file_path_obj.name}")
-                return False
 
             if not file_path_obj.exists():
                 debug_logger.warning(f"ファイルが存在しません: {file_path}")
@@ -2677,9 +2690,9 @@ class UltraFastFullCompliantSearchSystem:
                 if _ext_dt > 0.5:
                     debug_logger.warning(
                         f"🔬 抽出が遅いファイル({_ext_dt*1000:.0f}ms, {file_size/1024:.0f}KB): {file_path}")
-                # 🚀 遅延OCR: このPDFがスキャン（OCR必要）でOCRを後回しにした場合、
-                #   保留キューへ積む。本体完了後にバックグラウンドでOCRしてDB更新する。
-                if (file_path_obj.suffix.lower() == '.pdf'
+                # 🚀 遅延OCR: スキャンPDFや画像でOCRを後回しにした場合、保留キューへ積む。
+                #   本体完了後にバックグラウンドでOCRしてDB更新する。
+                if (file_path_obj.suffix.lower() in ('.pdf',) | image_extensions
                         and getattr(self._extractor._tls, 'pdf_needs_ocr', False)):
                     with self._pending_ocr_lock:
                         self._pending_ocr.add(file_path)
@@ -4853,6 +4866,19 @@ class UltraFastCompliantUI:
         self.results_tree.bind("<Motion>", self._on_tree_motion)
         self.results_tree.bind("<Leave>", self._on_tree_leave)
 
+        # 🔎 プレビューペイン: 選択行の本文を表示し、一致キーワードを色付き強調する
+        preview_frame = ttk.LabelFrame(main_frame, text="🔎 プレビュー（一致キーワードを強調）", padding=6)
+        preview_frame.pack(fill=tk.X, pady=(0, 10))
+        self.preview_text = tk.Text(preview_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
+        pv_scroll = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=self.preview_text.yview)
+        self.preview_text.configure(yscrollcommand=pv_scroll.set)
+        self.preview_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        pv_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        # 一致語ハイライト用タグ（黄色背景）
+        self.preview_text.tag_configure('kw', background='#FFE135', foreground='#000000')
+        # 行を選択するとプレビューを更新
+        self.results_tree.bind("<<TreeviewSelect>>", self._on_result_select)
+
         # 制御ボタンフレーム
         control_frame = ttk.Frame(main_frame)
         control_frame.pack(fill=tk.X)
@@ -5510,6 +5536,63 @@ class UltraFastCompliantUI:
         except Exception as e:
             debug_logger.debug(f"検索結果行の選択表示エラー: {e}")
     
+    def _on_result_select(self, event=None):
+        """選択中の検索結果の本文をプレビューペインに表示し、一致語を色付き強調する。"""
+        try:
+            sel = self.results_tree.selection()
+            if not sel:
+                return
+            values = self.results_tree.item(sel[0], 'values')
+            # columns = (layer, file_name, file_path, relevance, preview)
+            file_path = values[2] if len(values) > 2 else ''
+            query = self.search_var.get().strip()
+
+            # DBから本文の先頭を取得（無ければツリーのスニペットで代替）
+            content = self.search_system.get_file_content_for_preview(file_path, max_chars=3000)
+            if not content:
+                snippet = values[4] if len(values) > 4 else ''
+                content = snippet.replace('【', '').replace('】', '')
+
+            self.preview_text.config(state=tk.NORMAL)
+            self.preview_text.delete('1.0', tk.END)
+            self.preview_text.insert('1.0', content)
+            self._highlight_preview_matches(query)
+            self.preview_text.config(state=tk.DISABLED)
+
+            # 最初の一致箇所までスクロール
+            first = self.preview_text.tag_ranges('kw')
+            if first:
+                self.preview_text.see(first[0])
+        except Exception as e:
+            debug_logger.debug(f"プレビュー更新エラー: {e}")
+
+    def _highlight_preview_matches(self, query: str):
+        """プレビューText内の一致キーワード（元クエリ＋検索パターン）を 'kw' タグで強調。"""
+        if not query:
+            return
+        tw = self.preview_text
+        tw.tag_remove('kw', '1.0', tk.END)
+        terms = [query]
+        try:
+            _, _, _, patterns = self.search_system._get_search_patterns(query)
+            terms += [p for p in patterns if p and p.strip()]
+        except Exception:
+            pass
+        seen = set()
+        for term in terms:
+            t = term.strip()
+            if not t or t.lower() in seen:
+                continue
+            seen.add(t.lower())
+            start = '1.0'
+            while True:
+                pos = tw.search(t, start, tk.END, nocase=True)
+                if not pos:
+                    break
+                end = f"{pos}+{len(t)}c"
+                tw.tag_add('kw', pos, end)
+                start = end
+
     def _get_file_type_tag(self, file_ext: str) -> str:
         """ファイル拡張子に基づいてタグを決定"""
         file_type_map = {

@@ -1376,6 +1376,14 @@ class UltraFastFullCompliantSearchSystem:
         self._ocr_cache = {}  # OCRキャッシュ（重複処理防止）
         self._extractor = _FileContentExtractor()
 
+        # 🚀 OCR後回し（遅延OCR）用の保留キュー。
+        #   一括インデックスではテキスト層のみ即座に索引し、スキャンPDF（OCR必要）は
+        #   ここへ積む。本体完了後にバックグラウンドでOCRしてDBを更新するため、
+        #   インデックス本体は高速のまま、スキャン文書の本文も後から検索可能になる。
+        self._pending_ocr: "set[str]" = set()
+        self._pending_ocr_lock = threading.Lock()
+        self._ocr_bg_thread = None
+
         self.initialize_database()
         
         total_startup_time = time.time() - startup_timer
@@ -2846,9 +2854,20 @@ class UltraFastFullCompliantSearchSystem:
                 if _ext_dt > 0.5:
                     debug_logger.warning(
                         f"🔬 抽出が遅いファイル({_ext_dt*1000:.0f}ms, {file_size/1024:.0f}KB): {file_path}")
+                # 🚀 遅延OCR: このPDFがスキャン（OCR必要）でOCRを後回しにした場合、
+                #   保留キューへ積む。本体完了後にバックグラウンドでOCRしてDB更新する。
+                if (file_path_obj.suffix.lower() == '.pdf'
+                        and getattr(self._extractor._tls, 'pdf_needs_ocr', False)):
+                    with self._pending_ocr_lock:
+                        self._pending_ocr.add(file_path)
             if not content:
-                debug_logger.warning(f"コンテンツが空または抽出失敗: {file_path}")
-                return False
+                # スキャンPDFはテキスト層が空でもOCR保留対象。ファイル名で最低限
+                # 索引しておき（検索でヒット可能に）、本文は後でOCRが追記する。
+                if file_path in self._pending_ocr:
+                    content = file_path_obj.name
+                else:
+                    debug_logger.warning(f"コンテンツが空または抽出失敗: {file_path}")
+                    return False
 
             debug_logger.info(f"コンテンツ抽出成功: {file_path} ({len(content)}文字)")
             return self._store_indexed_content(file_path, content, file_size, modified_time)
@@ -3110,6 +3129,70 @@ class UltraFastFullCompliantSearchSystem:
             except Exception:
                 pass
             self._flush_executor = None
+
+    def run_pending_ocr(self, progress_cb=None, cancel_check=None) -> int:
+        """保留キューのスキャンPDFをOCRし、本文をDBへ追記する（バックグラウンドOCRパス）。
+
+        一括インデックス本体の完了後に呼ぶ。本体ではテキスト層のみで高速に索引し、
+        スキャンPDFはここで遅れてOCRすることで、本体スループットをOCRに律速させず
+        かつスキャン文書の本文も検索可能にする。
+
+        差分スキップを避けるため live_progressive_index_file は通さず、抽出→保存を
+        直接行う（本体で記録した mtime と一致してスキップされるのを防ぐ）。
+        """
+        with self._pending_ocr_lock:
+            paths = list(self._pending_ocr)
+        if not paths:
+            return 0
+
+        total = len(paths)
+        done = 0
+        # 背景パスではページ内OCR並列を絞る（bulk_mode=Trueで2）一方、実際にOCRする
+        # ため defer_ocr=False にする。ファイル並列は控えめにしUIとCPUを守る。
+        ext = self._extractor
+        prev_bulk, prev_defer = ext.bulk_mode, ext.defer_ocr
+        ext.bulk_mode = True
+        ext.defer_ocr = False
+        cpu = os.cpu_count() or 4
+        workers = max(1, min(4, cpu // 2 or 1))
+
+        def _ocr_one(path: str):
+            try:
+                if cancel_check and cancel_check():
+                    return None
+                if not os.path.exists(path):
+                    return None
+                stat = os.stat(path)
+                content = ext._extract_file_content(path)
+                if content:
+                    self._store_indexed_content(path, content, stat.st_size, stat.st_mtime)
+                return path
+            except Exception as e:
+                debug_logger.warning(f"遅延OCRエラー {path}: {e}")
+                return None
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_ocr_one, p): p for p in paths}
+                for fut in concurrent.futures.as_completed(futures):
+                    p = futures[fut]
+                    done += 1
+                    with self._pending_ocr_lock:
+                        self._pending_ocr.discard(p)
+                    if progress_cb:
+                        try:
+                            progress_cb(done, total)
+                        except Exception:
+                            pass
+                    if cancel_check and cancel_check():
+                        break
+        finally:
+            ext.bulk_mode, ext.defer_ocr = prev_bulk, prev_defer
+            try:
+                self.flush_complete_buffer()
+            except Exception:
+                pass
+        return done
 
     def _move_to_complete_layer(self, file_path: str, content: str, file_hash: str):
         """🔄 完全層移動（高速層から移動 - 重複削除）"""
@@ -8175,10 +8258,15 @@ class UltraFastCompliantUI:
             # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
             self.search_system._bulk_indexing = True
             # 抽出側にもバルクを通知（ページ内OCR並列を絞りオーバーサブスクリプション抑制）
+            #   ＋遅延OCRを有効化（本体はテキスト層のみで高速に索引し、OCRは後回し）
             try:
                 self.search_system._extractor.bulk_mode = True
+                self.search_system._extractor.defer_ocr = True
             except Exception:
                 pass
+            # 前回の保留分が残っていてもこの実行で積み直すためクリア
+            with self.search_system._pending_ocr_lock:
+                self.search_system._pending_ocr.clear()
             # 🔬 性能診断カウンタをリセット
             self.search_system._perf_reset()
 
@@ -8426,6 +8514,8 @@ class UltraFastCompliantUI:
             self.search_system._bulk_indexing = False
             try:
                 self.search_system._extractor.bulk_mode = False
+                # 遅延OCRを解除（以降のバックグラウンドOCRはインライン実行される）
+                self.search_system._extractor.defer_ocr = False
             except Exception:
                 pass
             try:
@@ -8449,9 +8539,35 @@ class UltraFastCompliantUI:
             except Exception:
                 pass
 
-            # 処理完了
-            safe_ui_update(f"完了: {total_processed:,}ファイル処理済み", force=True)
-            print(f"✅ インデックス処理完了: {total_processed:,}/{total_files:,}ファイル")
+            # 処理完了（本体）
+            with self.search_system._pending_ocr_lock:
+                pending_ocr_count = len(self.search_system._pending_ocr)
+            elapsed = time.time() - start_time
+            fps = total_processed / elapsed if elapsed > 0 else 0
+            safe_ui_update(
+                f"完了: {total_processed:,}ファイル ({fps:.0f} files/s)" +
+                (f" / OCR待ち{pending_ocr_count:,}件は背景処理" if pending_ocr_count else ""),
+                force=True)
+            print(f"✅ インデックス本体完了: {total_processed:,}/{total_files:,}ファイル "
+                  f"({fps:.0f} files/s, {elapsed:.1f}s) / OCR保留={pending_ocr_count:,}件")
+
+            # 🚀 遅延OCR: 保留中のスキャンPDFをバックグラウンドでOCRしてDB更新。
+            #   本体は既に完了しており検索可能。スキャン文書の本文も遅れて検索可能になる。
+            if pending_ocr_count:
+                def _background_ocr():
+                    def _prog(d, t):
+                        safe_ui_update(f"背景OCR: {d:,}/{t:,}件")
+                    def _cancel():
+                        return getattr(self.search_system, 'indexing_cancelled', False)
+                    try:
+                        n = self.search_system.run_pending_ocr(progress_cb=_prog, cancel_check=_cancel)
+                        safe_ui_update(f"背景OCR完了: {n:,}件のスキャン文書を本文索引", force=True)
+                        print(f"✅ 背景OCR完了: {n:,}件")
+                    except Exception as ocr_err:
+                        print(f"⚠️ 背景OCRエラー: {ocr_err}")
+                self.search_system._ocr_bg_thread = threading.Thread(
+                    target=_background_ocr, daemon=True, name='background-ocr')
+                self.search_system._ocr_bg_thread.start()
 
         except Exception as e:
             safe_ui_update(f"エラー: {str(e)}", force=True)

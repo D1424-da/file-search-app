@@ -180,6 +180,9 @@ class _FileContentExtractor:
         # 絞って Tesseract のオーバーサブスクリプション（CPUコア超過の奪い合い）
         # を防ぐ。bulk_index_worker 開始/終了時に切り替える。
         self.bulk_mode: bool = False
+        # 遅延OCR: True の間はスキャンPDFのOCRを実行せず needs_ocr で通知のみ。
+        # 一括インデックス本体をOCRに律速させないため、本体中だけ True にする。
+        self.defer_ocr: bool = False
         # 🔬 PDFのテキスト層抽出時間/OCR時間をスレッドセーフに記録する。
         #   live 経路では複数スレッドが同一 extractor を共有するため、インスタンス
         #   属性に直書きすると別ファイルの計測値と競合する。スレッドローカルに置く。
@@ -834,6 +837,9 @@ class _FileContentExtractor:
         #   親プロセス/呼び出し側が pdf_text_secs/pdf_ocr_secs を読み取り、性能診断へ集約。
         self._tls.pdf_text_secs = 0.0
         self._tls.pdf_ocr_secs = 0.0
+        # 遅延OCR用フラグ: このPDFがOCR必要（スキャンページあり）だが、今回は
+        # OCRを後回しにした場合に True。呼び出し側が保留キューへ積む判断に使う。
+        self._tls.pdf_needs_ocr = False
         try:
             # ファイル存在とアクセス権限チェック
             if not os.path.exists(file_path):
@@ -945,6 +951,14 @@ class _FileContentExtractor:
                     f"テキスト層={_text_pages}p OCR対象={len(ocr_target_pages)}p "
                     f"テキスト抽出={_t_text_elapsed:.2f}s"
                 )
+                # 🚀 遅延OCR: 一括インデックス中（defer_ocr=True）はOCRを実行せず、
+                #   テキスト層のみで即座に索引する。OCRが必要なら needs_ocr を立てて
+                #   呼び出し側に通知し、本体完了後のバックグラウンドパスでOCRさせる。
+                #   これによりインデックス本体のスループットがOCRに律速されなくなる。
+                if ocr_target_pages and getattr(self, 'defer_ocr', False):
+                    self._tls.pdf_needs_ocr = True
+                    ocr_target_pages = []  # 今回はOCRしない（後回し）
+
                 _t_ocr_start = time.time()
                 if ocr_target_pages:
                     ocr_results = self._ocr_pdf_pages(doc, ocr_target_pages, file_path)

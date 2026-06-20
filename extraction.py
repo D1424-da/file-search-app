@@ -872,8 +872,12 @@ class _FileContentExtractor:
                         try:
                             page = doc[page_num]
                             # 最も高速な方法を優先（失敗時のみフォールバック）
+                            #   sort=False: テキストブロックの幾何学的並べ替え
+                            #   （読み順への整列・O(n log n)）を省く。全文検索は
+                            #   FTS5 がトークン分割するため語順に依存せず、電子発行
+                            #   （テキスト層あり）PDFの抽出が目に見えて速くなる。
                             try:
-                                page_text = page.get_text("text", sort=True)
+                                page_text = page.get_text("text", sort=False)
                                 if page_text and len(page_text.strip()) > 10:
                                     return ' '.join(page_text.split())
                             except:
@@ -902,7 +906,8 @@ class _FileContentExtractor:
                     for page_num in range(max_pages):
                         try:
                             page = doc[page_num]
-                            page_text = page.get_text("text", sort=True)
+                            # sort=False: 読み順整列を省いて高速化（検索品質は不変）
+                            page_text = page.get_text("text", sort=False)
                             if page_text and page_text.strip():
                                 normalized = ' '.join(page_text.split())
                                 if len(normalized) > 0:

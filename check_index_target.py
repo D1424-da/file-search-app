@@ -18,17 +18,16 @@ import os
 import sys
 from pathlib import Path
 
-# --- file_search_app.py の bulk_index_worker と同一の定義 ---
-TARGET_EXTENSIONS = [
-    '.txt', '.doc', '.docx', '.pdf', '.xls', '.xlsx', '.ppt', '.pptx',
-    '.rtf', '.odt', '.ods', '.odp', '.csv', '.json', '.log',
-    '.tif', '.tiff',
-    '.dot', '.dotx', '.dotm', '.docm',
-    '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',
-    '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',
-    '.zip',
-]
+# --- 対象拡張子は extraction の正準定義を import（手書きコピーの乖離を防ぐ）---
+#   extraction は GUI/tkinter に依存しない軽量モジュールのため安全に import できる。
+from extraction import TARGET_EXTENSIONS
 
+# --- 除外ディレクトリ判定はローカル定義のまま ---
+#   本体(file_search_app.py)から import したいが、同モジュールは import 時に
+#   tkinter のロードやロガー/OCR初期化など重い副作用を伴う（GUI起動自体は
+#   __main__ ガードで防がれるが、tkinter 未導入環境では import 自体が失敗する）。
+#   診断ツールを単体で確実に動かすため、ここでは本体と同一内容の skip 定義を
+#   ローカルに保持する（SKIP_DIR_NAMES/SKIP_DIR_PREFIXES と完全一致判定）。
 SKIP_DIR_NAMES = {'system32', 'windows', 'pagefile', 'temp', 'tmp',
                   '.git', 'node_modules', '__pycache__',
                   'cache', 'log', 'logs', 'backup', 'trash'}

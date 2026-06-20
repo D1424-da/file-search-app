@@ -197,6 +197,16 @@ def path_has_skip_component(path: str, skip_names=None, skip_prefixes=None) -> b
     return False
 
 
+def _fts_quote(s: str) -> str:
+    """FTS5 MATCH 用に文字列を安全な引用フレーズへ変換する。
+
+    生の文字列補間でMATCH式を組むと、パターンに二重引用符やFTS演算子が
+    含まれた際に構文エラー(OperationalError)となり、握り潰されて0件になる。
+    FTS5の引用規則に従い、内部の " を "" にエスケープして全体を " で囲む。
+    """
+    return '"' + s.replace('"', '""') + '"'
+
+
 def is_temp_or_lock_file(file_name: str) -> bool:
     """Office等が作る一時/ロックファイルかどうか判定（インデックス対象外）。
 
@@ -1103,6 +1113,8 @@ from extraction import (
     _worker_extract,
     normalize_extracted_text,
     safe_truncate_utf8,
+    IMAGE_OCR_EXTENSIONS,
+    TARGET_EXTENSIONS,
 )
 import extraction as _extraction_mod
 # メインプロセスのログを統一（設定済み debug_logger を抽出モジュールへ注入）
@@ -1158,6 +1170,11 @@ class UltraFastFullCompliantSearchSystem:
         # ワーカースレッドと接続を使い回す。
         self._search_executor = None
         self._search_conn_local = threading.local()
+        # 🚀 スレッドローカル検索接続の全レジストリ。スレッドローカルは生成元
+        #   スレッドからしか辿れず shutdown() で閉じられないため（ハンドル/WALリーク、
+        #   Windowsではファイルロック残留）、生成した接続を集中管理して終了時に閉じる。
+        self._all_search_conns = []
+        self._all_search_conns_lock = threading.Lock()
 
         # 3層レイヤー構造（重複削除・役割明確化版）
         # 即座層: 検索キャッシュ専用（短時間保持・プレビューのみ）
@@ -1921,6 +1938,9 @@ class UltraFastFullCompliantSearchSystem:
             conn.execute('PRAGMA cache_size=20000')
             conn.execute('PRAGMA temp_store=MEMORY')
             conns[db_index] = conn
+            # 終了時に確実に閉じられるよう全接続レジストリへ登録
+            with self._all_search_conns_lock:
+                self._all_search_conns.append(conn)
         return conn
 
     def _update_average_search_time(self):
@@ -2193,14 +2213,21 @@ class UltraFastFullCompliantSearchSystem:
                             
                             # 基本的な検索パターンのみを使用（精度重視）
                             if len(pattern) >= 3:  # 3文字以上の場合のみFTS検索実行
-                                # ファイルパスを除外してコンテンツとファイル名のみで検索
+                                # ファイルパスを除外してコンテンツとファイル名のみで検索。
+                                # パターンに " やFTS演算子が含まれてもMATCH式が壊れないよう、
+                                # _fts_quote() で必ずエスケープ済みの引用フレーズにする。
+                                quoted = _fts_quote(pattern)
                                 search_queries = [
-                                    f'content:"{pattern}" OR file_name:"{pattern}"',  # フレーズ検索（最優先）
-                                    f'content:{pattern} OR file_name:{pattern}',  # 基本検索
+                                    f'content:{quoted} OR file_name:{quoted}',  # フレーズ検索（エスケープ済）
                                 ]
-                                
-                                # 3文字以上の場合は前方一致も追加
-                                search_queries.append(f'content:{pattern}* OR file_name:{pattern}*')  # 前方一致検索
+
+                                # 3文字以上かつ空白を含まない場合のみ前方一致を追加。
+                                #   FTS5の前方一致は "phrase"* の形式（閉じ引用符の直後に *）。
+                                #   空白入りのフレーズに対する前方一致は構文的に成立しないため除外。
+                                if ' ' not in pattern:
+                                    pat_esc = pattern.replace('"', '""')
+                                    prefix_q = f'content:"{pat_esc}"* OR file_name:"{pat_esc}"*'
+                                    search_queries.append(prefix_q)  # 前方一致検索
 
                             for search_query in search_queries:
                                 try:
@@ -2224,11 +2251,16 @@ class UltraFastFullCompliantSearchSystem:
                                         base_score = row[4] if len(row) > 4 and row[4] else 0.5
                                         pattern_bonus = 0.1 * (len(query_patterns) - idx)
 
-                                        # 検索クエリタイプによるボーナス
-                                        if search_query.startswith('"') and search_query.endswith('"'):
+                                        # 検索クエリタイプによるボーナス。
+                                        #   全クエリは 'content:' 始まりなので startswith('"') では
+                                        #   フレーズ検索を判定できない（旧コードは常にFalse=死にコード）。
+                                        #   前方一致は末尾の引用符を除いた直後が * で終わる形。
+                                        is_prefix = search_query.rstrip('"').endswith('*')
+                                        is_phrase = ('"' in search_query) and not is_prefix
+                                        if is_phrase:
                                             # フレーズ検索は最高スコア
                                             query_bonus = 2.0
-                                        elif search_query.endswith('*'):
+                                        elif is_prefix:
                                             # 前方一致検索は中程度スコア
                                             query_bonus = 1.0
                                         else:
@@ -2630,7 +2662,7 @@ class UltraFastFullCompliantSearchSystem:
             # 画像ファイル(.tif等)はOCRで本文を検索対象にする。一括時は遅延OCRで
             # 背景処理されるため、ここではスキップしない。
             # 画像はtiff(.tif/.tiff)のみをOCR/検索対象とする。
-            image_extensions = {'.tif', '.tiff'}
+            image_extensions = IMAGE_OCR_EXTENSIONS
 
             if not file_path_obj.exists():
                 debug_logger.warning(f"ファイルが存在しません: {file_path}")
@@ -2668,7 +2700,11 @@ class UltraFastFullCompliantSearchSystem:
                 return False
             
             # 🚀 3MB以上のファイルはファイル名のみインデックス（超高速処理）
-            if file_size >= 3 * 1024 * 1024:
+            #   ただしOCR対象(スキャンPDF/TIFF)は多くが数MB超のため、ここで
+            #   ファイル名のみに切り詰めると本文検索から永久に除外されてしまう。
+            #   OCR対象は通常抽出（より大きな独自サイズ上限とOCR遅延を持つ）へ回す。
+            ocr_eligible = file_path_obj.suffix.lower() in ({'.pdf'} | IMAGE_OCR_EXTENSIONS)
+            if file_size >= 3 * 1024 * 1024 and not ocr_eligible:
                 debug_logger.info(f"大容量ファイル - ファイル名のみインデックス: {file_path} ({file_size/(1024*1024):.1f}MB)")
                 # ファイル名とメタデータのみインデックス
                 content = file_path_obj.name  # ファイル名のみ
@@ -2693,7 +2729,7 @@ class UltraFastFullCompliantSearchSystem:
                         f"🔬 抽出が遅いファイル({_ext_dt*1000:.0f}ms, {file_size/1024:.0f}KB): {file_path}")
                 # 🚀 遅延OCR: スキャンPDFや画像でOCRを後回しにした場合、保留キューへ積む。
                 #   本体完了後にバックグラウンドでOCRしてDB更新する。
-                if (file_path_obj.suffix.lower() in ({'.pdf'} | image_extensions)
+                if (file_path_obj.suffix.lower() in ({'.pdf'} | IMAGE_OCR_EXTENSIONS)
                         and getattr(self._extractor._tls, 'pdf_needs_ocr', False)):
                     with self._pending_ocr_lock:
                         self._pending_ocr.add(file_path)
@@ -2986,6 +3022,16 @@ class UltraFastFullCompliantSearchSystem:
 
     def _write_db_group(self, db_index: int, group_data: List[Dict[str, Any]]):
         """単一シャード(DB)へのバルクインサート。(成功件数, 失敗件数) を返す。"""
+        # 🚀 バッチ内重複の排除: 同一バッチに同じ file_path が複数含まれると、
+        #   ループ内の SELECT は未コミット行を見られないため両方が INSERT され、
+        #   file_path UNIQUE 制約に違反して executemany が失敗→バッチ全体が
+        #   ロールバックされてしまう。事前に file_path で重複排除し、最後の
+        #   （最新の）エントリのみを残す。挿入順は維持する。
+        if group_data:
+            _dedup = {}
+            for _fd in group_data:
+                _dedup[_fd['file_path']] = _fd  # 同一パスは後勝ち（最新を保持）
+            group_data = list(_dedup.values())
         conn = None
         _shard_t0 = time.time()
         try:
@@ -3417,7 +3463,7 @@ class UltraFastFullCompliantSearchSystem:
         #   ・差分インデックス（未更新ファイルのスキップ）
         #   ・500MB超のスキップ / 3MB以上のファイル名のみインデックス
         #   を ProcessPool 経由でも維持する。
-        image_extensions = {'.tif', '.tiff'}
+        image_extensions = IMAGE_OCR_EXTENSIONS
         extract_targets = []  # (path_str, size, mtime) 実際に本文抽出が要るファイル
 
         for fp in prioritized_files:
@@ -3478,9 +3524,14 @@ class UltraFastFullCompliantSearchSystem:
         debug_logger.info(f"バッチ処理開始: {len(extract_targets)}ファイル抽出 (ProcessPool)")
 
         try:
-            # 抽出をワーカープロセスへ投入（本文抽出のみ）
+            # 🚀 遅延OCRの意図はメインプロセスの _extractor に設定されるが、ワーカー
+            #   プロセスはそれを共有しないため、submit時に明示的に引数で渡す必要がある。
+            #   メインプロセスと同じ意図を一度だけ読み取りワーカーへ伝搬する。
+            defer = getattr(self._extractor, 'defer_ocr', False)
+            bulk = getattr(self._extractor, 'bulk_mode', False)
+            # 抽出をワーカープロセスへ投入（本文抽出のみ・遅延OCRフラグ付き）
             future_to_path = {
-                proc_pool.submit(_worker_extract, fp_str, size, mtime): fp_str
+                proc_pool.submit(_worker_extract, fp_str, size, mtime, defer, bulk): fp_str
                 for (fp_str, size, mtime) in extract_targets
             }
 
@@ -3488,7 +3539,7 @@ class UltraFastFullCompliantSearchSystem:
                 fp_str = future_to_path[future]
                 try:
                     (file_path_str, content, file_size, modified_time, extract_secs,
-                     pdf_text_secs, pdf_ocr_secs) = future.result(timeout=300)
+                     pdf_text_secs, pdf_ocr_secs, pdf_needs_ocr) = future.result(timeout=300)
                     # 抽出時間を性能診断へ記録（ボトルネック計測の継続性を維持）
                     self._perf_add('extract', extract_secs)
                     self._perf_add_ext(Path(file_path_str).suffix.lower() or '(なし)', extract_secs)
@@ -3496,6 +3547,15 @@ class UltraFastFullCompliantSearchSystem:
                     if pdf_text_secs or pdf_ocr_secs:
                         self._perf_add('pdf_text', pdf_text_secs)
                         self._perf_add('pdf_ocr', pdf_ocr_secs)
+                    # 🚀 遅延OCR: ワーカーがOCRを後回しにした場合は保留キューへ積む。
+                    #   本体完了後にバックグラウンドOCRが本文を追記する。
+                    if pdf_needs_ocr:
+                        with self._pending_ocr_lock:
+                            self._pending_ocr.add(file_path_str)
+                        # 本文が空でもファイル名で最低限索引しておく（live経路と同様）。
+                        #   検索でヒット可能にし、後でOCRが本文を埋める。
+                        if not content:
+                            content = os.path.basename(file_path_str)
                     if content:
                         ok = self._store_indexed_content(
                             file_path_str, content, file_size, modified_time)
@@ -3814,7 +3874,7 @@ class UltraFastFullCompliantSearchSystem:
 
         try:
             # 画像ファイル(.tif/.tiff)はテキスト処理経路から除外（OCRは別経路で処理）
-            image_extensions = ['.tif', '.tiff']
+            image_extensions = IMAGE_OCR_EXTENSIONS
             excluded_count = 0
             text_files = []
             
@@ -4270,7 +4330,17 @@ class UltraFastFullCompliantSearchSystem:
             for thread in self._background_threads:
                 if thread.is_alive():
                     thread.join(timeout=3.0)
-            
+
+            # 🚀 スレッドローカル検索接続をすべて閉じる（ハンドル/WALリーク防止、
+            #   Windowsのファイルロック残留防止）。Executor停止・スレッド合流の後に行う。
+            with self._all_search_conns_lock:
+                for _sconn in self._all_search_conns:
+                    try:
+                        _sconn.close()
+                    except Exception as e:
+                        debug_logger.warning(f"検索接続クローズエラー: {e}")
+                self._all_search_conns.clear()
+
             print("✅ アプリケーションシャットダウン完了")
             debug_logger.info("アプリケーションシャットダウン完了")
             
@@ -7360,18 +7430,14 @@ class UltraFastCompliantUI:
                 processed_files = 0
                 max_check_files = 5000  # 最大5000ファイルまでチェック（UI応答性重視）
                 
-                target_extensions = ['.txt', '.doc', '.docx', '.pdf', '.xls', '.xlsx', '.ppt', '.pptx', 
-                                   '.rtf', '.odt', '.ods', '.odp', '.csv', '.json', '.log',
-                                   '.tif', '.tiff',
-                                   '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
-                                   '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
-                                   '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',  # CAD/図面ファイル追加
-                                   '.jwc', '.dxf', '.sfc', '.jww',  # CAD/図面ファイル追加
-                                   '.zip']  # ZIPファイル追加
-                
+                # 拡張子集合は extraction の正準定義を使用（重複/乖離を排除）
+                target_extensions = TARGET_EXTENSIONS
+
                 for root, dirs, files in os.walk(folder_path):
-                    # システムフォルダーをスキップ（高速化）
-                    dirs[:] = [d for d in dirs if not d.lower().startswith(('.git', 'node_modules', '__pycache__', 'cache'))]
+                    # システムフォルダーをスキップ（高速化）。
+                    #   実インデクサと同じ完全一致ベースの判定(path_has_skip_component)を
+                    #   使い、推定と実体の乖離・部分一致誤除外（例: 'cache_v2'）を防ぐ。
+                    dirs[:] = [d for d in dirs if not path_has_skip_component(d)]
                     
                     for file in files:
                         if is_temp_or_lock_file(file):
@@ -7680,14 +7746,9 @@ class UltraFastCompliantUI:
             safe_ui_update("⚡ 即座開始中...", force=True)
             
             # ファイル収集（メモリ使用量制限版）
-            target_extensions = ['.txt', '.doc', '.docx', '.pdf', '.xls', '.xlsx', '.ppt', '.pptx', 
-                               '.rtf', '.odt', '.ods', '.odp', '.csv', '.json', '.log',
-                               '.tif', '.tiff',
-                               '.dot', '.dotx', '.dotm', '.docm',  # Word関連追加
-                               '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',  # Excel関連追加
-                               '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt', '.mpp', '.mpz',  # CAD/図面ファイル追加
-                               '.zip']  # ZIPファイル追加
-            
+            # 拡張子集合は extraction の正準定義を使用（重複/乖離を排除）
+            target_extensions = TARGET_EXTENSIONS
+
             all_files = []
             processed_count = 0
             max_files_in_memory = 100000  # メモリ制限：最大10万ファイル（2000ファイル/秒対応）

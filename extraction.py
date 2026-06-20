@@ -107,6 +107,35 @@ if not debug_logger.handlers:
     debug_logger.addHandler(logging.NullHandler())
 
 
+# === エクスポートする正規（カノニカル）定数 ===
+#   OCR対象の画像拡張子・索引対象の全拡張子は複数ファイルで重複していたため、
+#   このモジュールを単一の真実の源（single source of truth）とする。
+#   他モジュールはここを参照し、リテラル集合の複製を持たないこと。
+
+# OCRで本文抽出する画像拡張子（TIFF）
+IMAGE_OCR_EXTENSIONS = {'.tif', '.tiff'}
+
+# 索引対象の全拡張子（file_search_app.py の2箇所のリストの和集合・重複排除）。
+#   オフィス文書/CAD・図面/プロジェクト/画像/アーカイブを網羅する。
+TARGET_EXTENSIONS = frozenset({
+    # テキスト/オフィス文書
+    '.txt', '.doc', '.docx', '.pdf', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.rtf', '.odt', '.ods', '.odp', '.csv', '.json', '.log',
+    # Word関連
+    '.dot', '.dotx', '.dotm', '.docm',
+    # Excel関連
+    '.xlt', '.xltx', '.xltm', '.xlsm', '.xlsb',
+    # CAD/図面
+    '.jwc', '.dxf', '.sfc', '.jww', '.dwg', '.dwt',
+    # プロジェクト
+    '.mpp', '.mpz',
+    # 画像（OCR対象）
+    '.tif', '.tiff',
+    # アーカイブ
+    '.zip',
+})
+
+
 def safe_truncate_utf8(text: str, max_length: int) -> str:
     """UTF-8文字列を安全に切り取る（日本語・マルチバイト文字対応）"""
     if not text or len(text) <= max_length:
@@ -225,7 +254,7 @@ class _FileContentExtractor:
                 return self._extract_pdf_content(file_path)
             elif extension == '.zip':  # ZIPファイル内のテキストファイルを処理
                 return self._extract_zip_content(file_path)
-            elif extension in ['.tif', '.tiff']:
+            elif extension in IMAGE_OCR_EXTENSIONS:
                 # 画像ファイル: OCRで本文抽出。一括インデックス中(defer_ocr)は本体を
                 # 高速に保つためOCRを後回しにし、needs_ocr で通知のみ行う。
                 self._tls.pdf_needs_ocr = False
@@ -977,7 +1006,13 @@ class _FileContentExtractor:
 
                 # PyMuPDFでPDF開く
                 doc = fitz.open(normalized_path)
-                
+
+                # 🔒 PyMuPDF は単一 Document の並行アクセスがスレッドセーフでない
+                #   （セグフォルト/文字化けの原因）。doc への全アクセスをこのロックで
+                #   直列化する。OCRの重い image_to_string はロック外で実行し、別ページ
+                #   のOCRが並列に走るようにする（_ocr_pdf_pages 側で同ロックを共有）。
+                doc_lock = threading.Lock()
+
                 # 🚀 ページ数に応じた処理戦略
                 total_pages = doc.page_count
                 max_pages = min(total_pages, 200)  # 最大200ページ（500→200で高速化）
@@ -992,20 +1027,24 @@ class _FileContentExtractor:
                     def extract_single_page(page_num: int) -> str:
                         """単一ページ抽出（並列処理用）"""
                         try:
-                            page = doc[page_num]
                             # 最も高速な方法を優先（失敗時のみフォールバック）
                             #   sort=False: テキストブロックの幾何学的並べ替え
                             #   （読み順への整列・O(n log n)）を省く。全文検索は
                             #   FTS5 がトークン分割するため語順に依存せず、電子発行
                             #   （テキスト層あり）PDFの抽出が目に見えて速くなる。
+                            #   🔒 doc へのアクセスは doc_lock で直列化する。
                             try:
-                                page_text = page.get_text("text", sort=False)
+                                with doc_lock:
+                                    page = doc[page_num]
+                                    page_text = page.get_text("text", sort=False)
                                 if page_text and len(page_text.strip()) > 10:
                                     return ' '.join(page_text.split())
                             except:
                                 pass
                             # フォールバック: ブロック単位抽出
-                            blocks = page.get_text("blocks")
+                            with doc_lock:
+                                page = doc[page_num]
+                                blocks = page.get_text("blocks")
                             block_texts = [block[4].strip() for block in blocks if len(block) >= 5 and block[4].strip()]
                             return ' '.join(block_texts)
                         except Exception as e:
@@ -1027,9 +1066,11 @@ class _FileContentExtractor:
                     # 少ないページは従来の同期処理
                     for page_num in range(max_pages):
                         try:
-                            page = doc[page_num]
-                            # sort=False: 読み順整列を省いて高速化（検索品質は不変）
-                            page_text = page.get_text("text", sort=False)
+                            # 🔒 doc アクセスを直列化（_ocr_pdf_pages と同ロックを共有）
+                            with doc_lock:
+                                page = doc[page_num]
+                                # sort=False: 読み順整列を省いて高速化（検索品質は不変）
+                                page_text = page.get_text("text", sort=False)
                             if page_text and page_text.strip():
                                 normalized = ' '.join(page_text.split())
                                 if len(normalized) > 0:
@@ -1063,7 +1104,7 @@ class _FileContentExtractor:
 
                 _t_ocr_start = time.time()
                 if ocr_target_pages:
-                    ocr_results = self._ocr_pdf_pages(doc, ocr_target_pages, file_path)
+                    ocr_results = self._ocr_pdf_pages(doc, ocr_target_pages, file_path, doc_lock)
                     for page_num, ocr_text in ocr_results.items():
                         if not ocr_text:
                             continue
@@ -1136,13 +1177,20 @@ class _FileContentExtractor:
             print(f"⚠️ PDF抽出エラー: {e}")
             return ""
 
-    def _ocr_pdf_pages(self, doc, page_nums, file_path: str) -> dict:
+    def _ocr_pdf_pages(self, doc, page_nums, file_path: str, doc_lock=None) -> dict:
         """テキスト層の無いPDFページを画像化してOCR抽出
 
         スキャン（画像ベース）PDF対応。各ページをPyMuPDFでレンダリングし、
         pytesseractでテキスト抽出する。
         戻り値: {ページ番号: 抽出テキスト}
+
+        doc_lock: 呼び出し側が保持する threading.Lock。PyMuPDF は単一 Document の
+            並行アクセスがスレッドセーフでないため、doc への全アクセス（get_pixmap
+            等）をこのロックで直列化する。重い image_to_string はロック外で実行し、
+            別ページのOCRを並列に走らせる。None の場合は内部で生成する。
         """
+        if doc_lock is None:
+            doc_lock = threading.Lock()
         results = {}
         try:
             # OCRライブラリの利用可能性チェック
@@ -1189,9 +1237,14 @@ class _FileContentExtractor:
                 as_completed 側で計測すると既に完了済みのため 0 になってしまう。
                 """
                 _ps = time.time()
-                page = doc[page_num]
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                image = Image.open(io.BytesIO(pix.tobytes("png")))
+                # 🔒 doc アクセス（get_pixmap）はロック内で直列化し、PNGバイト列まで
+                #   取り出してからロックを解放する。重いOCR(image_to_string)はロック外で
+                #   実行し、別ページのOCRが並列に走るようにする。
+                with doc_lock:
+                    page = doc[page_num]
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)
+                    png_bytes = pix.tobytes("png")
+                image = Image.open(io.BytesIO(png_bytes))
 
                 # グレースケール化（OCR精度向上・高速化）
                 if image.mode not in ('L', '1'):
@@ -1282,18 +1335,30 @@ class _FileContentExtractor:
                 print(f"⚠️ .tif画像ファイルが大きすぎます ({file_path}): {file_size/1024/1024:.1f}MB")
                 return ""
             
-            # 🚀 超高速画像読み込み・検証
-            try:
-                image = Image.open(file_path)
-                
+            # 🚀 超高速OCR設定（速度最優先）
+            # 文字ホワイトリストは廃止: 漢字・カタカナが全て脱落して日本語OCRが
+            # 破損するため。文字網羅はTesseractの言語(jpn)に委ねる。
+            ultra_fast_config = r'--oem 1 --psm 6'
+
+            # ファイル名から言語をヒント取得（処理の最適化）
+            filename_lower = os.path.basename(file_path).lower()
+            likely_japanese = any(hint in filename_lower for hint in ['日本語', 'japanese', 'jpn', '図面', '設計'])
+
+            def _ocr_one_frame(frame_image) -> str:
+                """単一フレーム（1ページ）をOCRしてテキストを返す。
+
+                マルチページTIFFの各フレームに対し、モード変換・動的リサイズ・
+                （任意の）cv2前処理・段階的OCRを適用する。単一フレームTIFFでも
+                従来と同一の処理になる。
+                """
                 # 画像フォーマット・モード最適化チェック
-                if image.mode not in ['L', 'RGB', 'RGBA', '1']:
-                    image = image.convert('RGB')
-                
+                if frame_image.mode not in ['L', 'RGB', 'RGBA', '1']:
+                    frame_image = frame_image.convert('RGB')
+
                 # 画像サイズチェックと超高速最適化
-                width, height = image.size
+                width, height = frame_image.size
                 total_pixels = width * height
-                
+
                 # 🔥 動的解像度調整: ファイルサイズに応じて最適な画素数を選択
                 # 小さいファイル: 高解像度でOCR精度向上
                 # 大きいファイル: 低解像度で処理速度優先
@@ -1303,90 +1368,96 @@ class _FileContentExtractor:
                     max_pixels = 1000000  # 100万画素（バランス）
                 else:  # 5MB以上
                     max_pixels = 600000   # 60万画素（速度優先）
-                
+
                 if total_pixels > max_pixels:
                     scale_factor = (max_pixels / total_pixels) ** 0.5
                     new_width = int(width * scale_factor)
                     new_height = int(height * scale_factor)
                     # 高速リサイズアルゴリズム使用
-                    image = image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+                    frame_image = frame_image.resize((new_width, new_height), Image.Resampling.BILINEAR)
                     total_pixels = new_width * new_height
                     debug_logger.debug(f"動的リサイズ ({os.path.basename(file_path)}): {width}x{height} -> {new_width}x{new_height}")
-                
+
                 # 小さすぎる画像はスキップ
                 if total_pixels < 10000:  # 100x100未満はスキップ
                     return ""
-                
+
+                # 🔥 適応型前処理: 画像特性に応じて最適な前処理を選択
+                processed_image = frame_image
+
+                # 前処理が必要な条件: カラー画像かつ中規模サイズ
+                needs_preprocessing = (frame_image.mode != 'L' and
+                                      total_pixels < 500000 and
+                                      file_size > 500 * 1024)  # 500KB以上
+
+                if CV2_AVAILABLE and needs_preprocessing:
+                    try:
+                        import numpy as np
+                        image_array = np.array(frame_image)
+
+                        # グレースケール変換（最も効果的な前処理）
+                        if len(image_array.shape) == 3:
+                            gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+
+                            # 小さいファイルのみ二値化を追加（OCR精度向上）
+                            if file_size < 2 * 1024 * 1024:
+                                # 適応的二値化: 照明ムラに強い
+                                gray = cv2.adaptiveThreshold(
+                                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 11, 2)
+
+                            processed_image = Image.fromarray(gray)
+                    except Exception:
+                        processed_image = frame_image
+
+                # 🚀 超高速OCR実行（段階的最適化 + 言語検出）
+                frame_text = ""
+
+                # Phase 1: 超高速英数字のみ（最も高速）
+                try:
+                    if not likely_japanese:  # 日本語の可能性が低い場合のみ
+                        # 文字ホワイトリストは廃止（漢字・カタカナ脱落の原因）。
+                        fast_config = r'--oem 1 --psm 6'
+                        frame_text = pytesseract.image_to_string(processed_image, lang='eng', config=fast_config).strip()
+
+                    # Phase 2: 結果が不十分な場合のみ通常英語OCR
+                    if len(frame_text) < 5:
+                        frame_text = pytesseract.image_to_string(processed_image, lang='eng', config='--oem 1 --psm 6').strip()
+
+                    # Phase 3: 最後の手段として日本語（処理時間が増加）
+                    # 小さいファイルまたは日本語の可能性が高い場合のみ試行
+                    if (len(frame_text) < 3 and file_size < 5 * 1024 * 1024) or likely_japanese:
+                        try:
+                            jp_text = pytesseract.image_to_string(processed_image, lang='jpn', config='--oem 1 --psm 6').strip()
+                            if len(jp_text) > len(frame_text):
+                                frame_text = jp_text
+                        except pytesseract.TesseractError:
+                            pass
+
+                except pytesseract.TesseractError as te:
+                    try:
+                        # 最終フォールバック：最小設定
+                        frame_text = pytesseract.image_to_string(processed_image, config='--psm 6').strip()
+                    except pytesseract.TesseractError:
+                        print(f"⚠️ OCR実行完全失敗 ({os.path.basename(file_path)}): {te}")
+                        return ""
+
+                return frame_text.strip()
+
+            # 🚀 超高速画像読み込み・検証（マルチページTIFF対応: 全フレームをOCR）
+            from PIL import ImageSequence
+            try:
+                page_texts: list[str] = []
+                for frame in ImageSequence.Iterator(Image.open(file_path)):
+                    # 各フレーム（ページ）を個別にOCRし、改行で連結する
+                    frame_text = _ocr_one_frame(frame)
+                    if frame_text:
+                        page_texts.append(frame_text)
+                text = '\n'.join(page_texts)
             except Exception as e:
                 print(f"⚠️ 画像読み込みエラー ({file_path}): {e}")
                 return ""
-            
-            # 🚀 超高速OCR設定（速度最優先）
-            ultra_fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん'  # 文字制限で高速化
-            
-            # 🔥 適応型前処理: 画像特性に応じて最適な前処理を選択
-            processed_image = image
-            
-            # 前処理が必要な条件: カラー画像かつ中規模サイズ
-            needs_preprocessing = (image.mode != 'L' and 
-                                  total_pixels < 500000 and 
-                                  file_size > 500 * 1024)  # 500KB以上
-            
-            if CV2_AVAILABLE and needs_preprocessing:
-                try:
-                    import numpy as np
-                    image_array = np.array(image)
-                    
-                    # グレースケール変換（最も効果的な前処理）
-                    if len(image_array.shape) == 3:
-                        gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-                        
-                        # 小さいファイルのみ二値化を追加（OCR精度向上）
-                        if file_size < 2 * 1024 * 1024:
-                            # 適応的二値化: 照明ムラに強い
-                            gray = cv2.adaptiveThreshold(
-                                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 11, 2)
-                        
-                        processed_image = Image.fromarray(gray)
-                except Exception:
-                    processed_image = image
-            
-            # 🚀 超高速OCR実行（段階的最適化 + 言語検出）
-            text = ""
-            
-            # ファイル名から言語をヒント取得（処理の最適化）
-            filename_lower = os.path.basename(file_path).lower()
-            likely_japanese = any(hint in filename_lower for hint in ['日本語', 'japanese', 'jpn', '図面', '設計'])
-            
-            # Phase 1: 超高速英数字のみ（最も高速）
-            try:
-                if not likely_japanese:  # 日本語の可能性が低い場合のみ
-                    fast_config = r'--oem 1 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
-                    text = pytesseract.image_to_string(processed_image, lang='eng', config=fast_config).strip()
-                
-                # Phase 2: 結果が不十分な場合のみ通常英語OCR
-                if len(text) < 5:
-                    text = pytesseract.image_to_string(processed_image, lang='eng', config='--oem 1 --psm 6').strip()
-                
-                # Phase 3: 最後の手段として日本語（処理時間が増加）
-                # 小さいファイルまたは日本語の可能性が高い場合のみ試行
-                if (len(text) < 3 and file_size < 5 * 1024 * 1024) or likely_japanese:
-                    try:
-                        jp_text = pytesseract.image_to_string(processed_image, lang='jpn', config='--oem 1 --psm 6').strip()
-                        if len(jp_text) > len(text):
-                            text = jp_text
-                    except pytesseract.TesseractError:
-                        pass
-                        
-            except pytesseract.TesseractError as te:
-                try:
-                    # 最終フォールバック：最小設定
-                    text = pytesseract.image_to_string(processed_image, config='--psm 6').strip()
-                except pytesseract.TesseractError:
-                    print(f"⚠️ OCR実行完全失敗 ({os.path.basename(file_path)}): {te}")
-                    return ""
-            
+
             # 🔥 結果検証と最適化
             text = text.strip()
             
@@ -1461,19 +1532,35 @@ def _init_extraction_worker() -> None:
             pass
 
 
-def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tuple:
+def _worker_extract(file_path: str, file_size: int, modified_time: float,
+                    defer_ocr: bool = False, bulk_mode: bool = False) -> tuple:
     """ワーカープロセスで呼ばれる抽出関数（CPUバウンドな本文抽出のみを担当）
 
     前処理（隠しファイル/差分スキップ/サイズ判定）は親プロセスで実施済みである
     ことを前提とし、ここでは純粋に本文抽出だけを行う。
 
-    戻り値: (file_path, content, file_size, modified_time, extract_seconds,
-             pdf_text_seconds, pdf_ocr_seconds)
-    エラー時: content=None。PDF以外では pdf_* は 0.0。
+    Args:
+        file_path: 抽出対象ファイルのパス
+        file_size: ファイルサイズ（バイト）
+        modified_time: 更新時刻（mtime）
+        defer_ocr: True の間はスキャンPDF/画像のOCRを実行せず、OCRが必要な場合は
+            pdf_needs_ocr=True で呼び出し側へ通知のみ行う（一括インデックス本体を
+            OCRに律速させないため）。
+        bulk_mode: 一括インデックス中はページ内並列を絞り、Tesseract の
+            オーバーサブスクリプションを防ぐ。
+
+    戻り値（8タプル）:
+        (file_path, content, file_size, modified_time, extract_seconds,
+         pdf_text_seconds, pdf_ocr_seconds, pdf_needs_ocr)
+    エラー時: content=None、pdf_* は 0.0、pdf_needs_ocr は False。
+             PDF以外では pdf_* は 0.0。
     """
     global _proc_extractor
     if _proc_extractor is None:
         _proc_extractor = _FileContentExtractor()
+    # 呼び出し側の指定を抽出器へ反映（_extract_file_content より前に設定する）
+    _proc_extractor.defer_ocr = bool(defer_ocr)
+    _proc_extractor.bulk_mode = bool(bulk_mode)
     _t0 = time.time()
     import os as _os
     _ext = Path(file_path).suffix.lower()
@@ -1481,11 +1568,13 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
     # PDFのテキスト/OCR内訳はスレッドローカルに残る（PDF以外なら0のまま）
     _proc_extractor._tls.pdf_text_secs = 0.0
     _proc_extractor._tls.pdf_ocr_secs = 0.0
+    _proc_extractor._tls.pdf_needs_ocr = False
     try:
         content = _proc_extractor._extract_file_content(file_path)
         _elapsed = time.time() - _t0
         _pdf_text = getattr(_proc_extractor._tls, 'pdf_text_secs', 0.0)
         _pdf_ocr = getattr(_proc_extractor._tls, 'pdf_ocr_secs', 0.0)
+        pdf_needs_ocr = bool(getattr(_proc_extractor._tls, 'pdf_needs_ocr', False))
         if _elapsed > 5.0:
             print(
                 f"[抽出診断] pid={_pid} ext={_ext} {_elapsed:.2f}s "
@@ -1494,8 +1583,8 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
                 f"{os.path.basename(file_path)}"
             )
         return (file_path, content, file_size, modified_time, _elapsed,
-                _pdf_text, _pdf_ocr)
+                _pdf_text, _pdf_ocr, pdf_needs_ocr)
     except Exception as _e:
         _elapsed = time.time() - _t0
         print(f"[抽出診断] pid={_pid} ext={_ext} ERROR {_elapsed:.2f}s {file_path}: {_e}")
-        return (file_path, None, file_size, modified_time, _elapsed, 0.0, 0.0)
+        return (file_path, None, file_size, modified_time, _elapsed, 0.0, 0.0, False)

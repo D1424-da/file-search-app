@@ -3715,8 +3715,25 @@ class UltraFastFullCompliantSearchSystem:
                 'flush_t': 0.0, 'flush_files': 0, 'flush_batches': 0, 'flush_max': 0.0,
                 'shard_t': 0.0, 'shard_n': 0,
                 'sem_wait_t': 0.0, 'sem_wait_n': 0,
+                'extract_by_ext': {},  # 拡張子別の抽出コスト内訳 {ext: [合計秒, 件数, 最大秒]}
                 'wall_start': time.time(),
             }
+
+    def _perf_add_ext(self, ext: str, dt: float):
+        """拡張子別の抽出時間/件数を集計（ボトルネック種別の特定用）。"""
+        try:
+            with self._perf_lock:
+                by = self._perf.setdefault('extract_by_ext', {})
+                rec = by.get(ext)
+                if rec is None:
+                    by[ext] = [dt, 1, dt]
+                else:
+                    rec[0] += dt
+                    rec[1] += 1
+                    if dt > rec[2]:
+                        rec[2] = dt
+        except Exception:
+            pass
 
     def _perf_add(self, key, dt, n=1):
         """累積時間と件数を加算（key_t に時間、key_n に件数）。"""
@@ -3739,18 +3756,35 @@ class UltraFastFullCompliantSearchSystem:
         fl_files = p.get('flush_files', 0)
         fl_batches = p.get('flush_batches', 0) or 1
         sh_n = p.get('shard_n', 0) or 1
+
+        # 拡張子別の抽出コスト内訳（合計時間の降順＝削減効果の大きい順）
+        by_ext = p.get('extract_by_ext', {}) or {}
+        ext_lines = ""
+        if by_ext:
+            total_ext_t = sum(v[0] for v in by_ext.values()) or 1e-6
+            ranked = sorted(by_ext.items(), key=lambda kv: kv[1][0], reverse=True)
+            ext_lines = "  抽出コスト内訳(拡張子別・合計時間降順):\n"
+            for ext, (t, n, mx) in ranked[:12]:
+                ext_lines += (
+                    f"    {ext:<8} 合計={t:7.1f}s ({t/total_ext_t*100:4.1f}%) "
+                    f"件数={n:>6,} 平均={t/max(1,n)*1000:6.1f}ms 最大={mx*1000:6.0f}ms\n"
+                )
+
         return (
             "🔬 性能診断:\n"
             f"  経過時間            : {wall:.1f}s\n"
             f"  抽出: 件数={p.get('extract_n',0):,} 合計={p.get('extract_t',0):.1f}s "
             f"平均={p.get('extract_t',0)/ex_n*1000:.1f}ms 最大={p.get('extract_max',0)*1000:.0f}ms\n"
             f"  抽出スループット理論値: {p.get('extract_n',0)/max(1e-6,p.get('extract_t',0)):.1f} files/s (抽出のみ・並列考慮前)\n"
+            + ext_lines +
             f"  完全層書込: 件数={fl_files:,} バッチ={p.get('flush_batches',0)} 合計={p.get('flush_t',0):.1f}s "
             f"平均バッチ={p.get('flush_t',0)/fl_batches*1000:.0f}ms 最大={p.get('flush_max',0)*1000:.0f}ms\n"
             f"  シャード書込: 回数={p.get('shard_n',0)} 合計={p.get('shard_t',0):.1f}s 平均={p.get('shard_t',0)/sh_n*1000:.0f}ms\n"
             f"  書込待ち(背圧): 回数={p.get('sem_wait_n',0)} 合計={p.get('sem_wait_t',0):.1f}s "
             f"（大きいほど書込が律速）\n"
-            f"  実効スループット    : {fl_files/wall:.1f} files/s"
+            f"  実効スループット    : {fl_files/wall:.1f} files/s\n"
+            f"  実効並列度(抽出合計÷経過): {p.get('extract_t',0)/wall:.1f}x "
+            f"（≒同時に使えているコア数。論理コア数に近ければコア律速）"
         )
 
     def _verify_layers_persisted(self, sample: int = 30) -> str:
@@ -4915,12 +4949,14 @@ class UltraFastFullCompliantSearchSystem:
             #   バッチごとに生成・破棄すると、特に Windows(spawn) ではワーカーが
             #   重いモジュールを毎回 re-import するため致命的なオーバーヘッドになる。
             import os as _os
-            cpu_count = max(1, (_os.cpu_count() or 4) - 1)  # UI に 1 コア残す
+            total_cores = _os.cpu_count() or 4
+            cpu_count = max(1, total_cores - 1)  # UI に 1 コア残す
             pool_workers = min(cpu_count, 16)
             extract_pool = concurrent.futures.ProcessPoolExecutor(
                 max_workers=pool_workers,
                 initializer=_init_extraction_worker)
-            print(f"🚀 抽出ProcessPool起動: {pool_workers}プロセス (GIL回避・全コア活用)")
+            print(f"🚀 抽出ProcessPool起動: {pool_workers}プロセス "
+                  f"(論理コア数={total_cores} / 上限16) ※抽出はコア数律速")
 
             try:
                 for i in range(0, total_files, batch_size):
@@ -5089,6 +5125,7 @@ class UltraFastFullCompliantSearchSystem:
                     file_path_str, content, file_size, modified_time, extract_secs = future.result(timeout=300)
                     # 抽出時間を性能診断へ記録（ボトルネック計測の継続性を維持）
                     self._perf_add('extract', extract_secs)
+                    self._perf_add_ext(Path(file_path_str).suffix.lower() or '(なし)', extract_secs)
                     if content:
                         ok = self._store_indexed_content(
                             file_path_str, content, file_size, modified_time)

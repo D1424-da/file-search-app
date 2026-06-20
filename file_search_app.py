@@ -1351,6 +1351,9 @@ class UltraFastFullCompliantSearchSystem:
         self._flush_executor = None
         # 書き込みが抽出に追いつかない時のバックプレッシャ（保留バッチ数を上限4に制限しメモリ膨張を防ぐ）
         self._flush_semaphore = threading.BoundedSemaphore(4)
+        # 🔬 インデックス性能診断用カウンタ（ボトルネック特定）
+        self._perf_lock = threading.Lock()
+        self._perf = {}
         self.new_files_buffer = []  # 新規ファイル一時保存
         self.max_buffer_size = 200  # バッファサイズを倍増
         self.incremental_scan_interval = 10  # 10秒に短縮（より頻繁にスキャン）
@@ -2598,6 +2601,112 @@ class UltraFastFullCompliantSearchSystem:
 
         return unique_results
 
+    def _perf_reset(self):
+        """性能診断カウンタをリセット。"""
+        with self._perf_lock:
+            self._perf = {
+                'extract_t': 0.0, 'extract_n': 0, 'extract_max': 0.0,
+                'flush_t': 0.0, 'flush_files': 0, 'flush_batches': 0, 'flush_max': 0.0,
+                'shard_t': 0.0, 'shard_n': 0,
+                'sem_wait_t': 0.0, 'sem_wait_n': 0,
+                'wall_start': time.time(),
+            }
+
+    def _perf_add(self, key, dt, n=1):
+        """累積時間と件数を加算（key_t に時間、key_n に件数）。"""
+        try:
+            with self._perf_lock:
+                self._perf[key + '_t'] = self._perf.get(key + '_t', 0.0) + dt
+                self._perf[key + '_n'] = self._perf.get(key + '_n', 0) + n
+                mk = key + '_max'
+                if dt > self._perf.get(mk, 0.0):
+                    self._perf[mk] = dt
+        except Exception:
+            pass
+
+    def _perf_summary(self) -> str:
+        """診断サマリ文字列を生成。"""
+        with self._perf_lock:
+            p = dict(self._perf)
+        wall = max(1e-6, time.time() - p.get('wall_start', time.time()))
+        ex_n = p.get('extract_n', 0) or 1
+        fl_files = p.get('flush_files', 0)
+        fl_batches = p.get('flush_batches', 0) or 1
+        sh_n = p.get('shard_n', 0) or 1
+        return (
+            "🔬 性能診断:\n"
+            f"  経過時間            : {wall:.1f}s\n"
+            f"  抽出: 件数={p.get('extract_n',0):,} 合計={p.get('extract_t',0):.1f}s "
+            f"平均={p.get('extract_t',0)/ex_n*1000:.1f}ms 最大={p.get('extract_max',0)*1000:.0f}ms\n"
+            f"  抽出スループット理論値: {p.get('extract_n',0)/max(1e-6,p.get('extract_t',0)):.1f} files/s (抽出のみ・並列考慮前)\n"
+            f"  完全層書込: 件数={fl_files:,} バッチ={p.get('flush_batches',0)} 合計={p.get('flush_t',0):.1f}s "
+            f"平均バッチ={p.get('flush_t',0)/fl_batches*1000:.0f}ms 最大={p.get('flush_max',0)*1000:.0f}ms\n"
+            f"  シャード書込: 回数={p.get('shard_n',0)} 合計={p.get('shard_t',0):.1f}s 平均={p.get('shard_t',0)/sh_n*1000:.0f}ms\n"
+            f"  書込待ち(背圧): 回数={p.get('sem_wait_n',0)} 合計={p.get('sem_wait_t',0):.1f}s "
+            f"（大きいほど書込が律速）\n"
+            f"  実効スループット    : {fl_files/wall:.1f} files/s"
+        )
+
+    def _verify_layers_persisted(self, sample: int = 30) -> str:
+        """即座層/高速層に残るファイルが完全層(DB)に保存されているか検証して文字列で返す。
+
+        各層の最新サンプルを取り出し、対応するシャードDBに file_path が存在するか照合。
+        インデックス完了後に呼び、3層の整合性を診断する。
+        """
+        try:
+            imm_keys = list(self.immediate_cache.keys())
+            hot_keys = list(self.hot_cache.keys())
+
+            # 完全層(DB)の総件数
+            complete_total = 0
+            for db_path in self.complete_db_paths:
+                try:
+                    if os.path.exists(db_path) and os.path.getsize(db_path) > 1024:
+                        conn = sqlite3.connect(str(db_path), timeout=5.0)
+                        complete_total += conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+                        conn.close()
+                except Exception:
+                    pass
+
+            def check_membership(keys):
+                """最新サンプルが完全層に存在するか (found, missing_list) を返す。"""
+                targets = keys[-sample:] if len(keys) > sample else keys
+                found = 0
+                missing = []
+                for fp in targets:
+                    try:
+                        db_index = self._get_db_index_for_file(fp)
+                        conn = sqlite3.connect(str(self.complete_db_paths[db_index]), timeout=5.0)
+                        row = conn.execute(
+                            "SELECT 1 FROM documents WHERE file_path = ? LIMIT 1", (fp,)).fetchone()
+                        conn.close()
+                        if row:
+                            found += 1
+                        else:
+                            missing.append(fp)
+                    except Exception as e:
+                        missing.append(f"{fp} (照合エラー: {e})")
+                return found, missing, len(targets)
+
+            imm_found, imm_missing, imm_checked = check_membership(imm_keys)
+            hot_found, hot_missing, hot_checked = check_membership(hot_keys)
+
+            lines = [
+                "🔬 3層整合性チェック（完全層への保存確認）:",
+                f"  即座層: {len(imm_keys):,}件 / 高速層: {len(hot_keys):,}件 / 完全層(DB): {complete_total:,}件",
+                f"  即座層サンプル照合: {imm_found}/{imm_checked} がDBに存在",
+                f"  高速層サンプル照合: {hot_found}/{hot_checked} がDBに存在",
+            ]
+            if imm_missing or hot_missing:
+                lines.append(f"  ⚠️ 未保存サンプル(即座層{len(imm_missing)}/高速層{len(hot_missing)}):")
+                for m in (imm_missing + hot_missing)[:5]:
+                    lines.append(f"     - {m}")
+            else:
+                lines.append("  ✅ サンプルは全て完全層(DB)に保存済み")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"🔬 3層整合性チェック失敗: {e}"
+
     def _load_index_mtime_cache(self):
         """差分インデックス用に、全DBの (file_path -> modified_time) をメモリへ読み込む。
 
@@ -2680,9 +2789,15 @@ class UltraFastFullCompliantSearchSystem:
                 # ファイル名とメタデータのみインデックス
                 content = file_path_obj.name  # ファイル名のみ
             else:
-                # ファイル内容抽出
+                # ファイル内容抽出（性能診断のため時間計測）
                 debug_logger.debug(f"コンテンツ抽出開始: {file_path}")
+                _ext_t0 = time.time()
                 content = self._extract_file_content(file_path)
+                _ext_dt = time.time() - _ext_t0
+                self._perf_add('extract', _ext_dt)
+                if _ext_dt > 0.5:
+                    debug_logger.warning(
+                        f"🔬 抽出が遅いファイル({_ext_dt*1000:.0f}ms, {file_size/1024:.0f}KB): {file_path}")
             if not content:
                 debug_logger.warning(f"コンテンツが空または抽出失敗: {file_path}")
                 return False
@@ -2814,7 +2929,17 @@ class UltraFastFullCompliantSearchSystem:
         if not batch:
             return
         try:
+            _fl_t0 = time.time()
             self._bulk_add_to_complete_layer(batch)
+            _fl_dt = time.time() - _fl_t0
+            self._perf_add('flush', _fl_dt, n=0)
+            with self._perf_lock:
+                self._perf['flush_files'] = self._perf.get('flush_files', 0) + len(batch)
+                self._perf['flush_batches'] = self._perf.get('flush_batches', 0) + 1
+                if _fl_dt > self._perf.get('flush_max', 0.0):
+                    self._perf['flush_max'] = _fl_dt
+            debug_logger.info(f"🔬 フラッシュ: {len(batch)}件 / {_fl_dt*1000:.0f}ms "
+                              f"({len(batch)/max(1e-6,_fl_dt):.0f} files/s)")
             # 完全層が更新されたのでクエリ結果キャッシュを無効化（古い結果を返さない）
             self._invalidate_query_cache()
         except Exception as e:
@@ -2836,7 +2961,9 @@ class UltraFastFullCompliantSearchSystem:
         if not batch:
             return
         # 保留バッチが上限に達していれば acquire がブロック→抽出スレッドに自然なバックプレッシャ
+        _sem_t0 = time.time()
         self._flush_semaphore.acquire()
+        self._perf_add('sem_wait', time.time() - _sem_t0)
         try:
             self._get_flush_executor().submit(self._run_flush_batch, batch)
         except Exception:
@@ -3016,6 +3143,7 @@ class UltraFastFullCompliantSearchSystem:
     def _write_db_group(self, db_index: int, group_data: List[Dict[str, Any]]):
         """単一シャード(DB)へのバルクインサート。(成功件数, 失敗件数) を返す。"""
         conn = None
+        _shard_t0 = time.time()
         try:
             complete_db_path = self.complete_db_paths[db_index]
             conn = sqlite3.connect(str(complete_db_path), timeout=120.0, check_same_thread=False)
@@ -3084,8 +3212,9 @@ class UltraFastFullCompliantSearchSystem:
 
             conn.commit()
             conn.close()
-            debug_logger.info(f"バルクインサート成功: DB{db_index}, {len(group_data)}件")
-            print(f"✅ DB{db_index}バルク完全層移行完了: {len(group_data)}件")
+            self._perf_add('shard', time.time() - _shard_t0)
+            debug_logger.info(f"バルクインサート成功: DB{db_index}, {len(group_data)}件 "
+                              f"({(time.time()-_shard_t0)*1000:.0f}ms)")
             return (len(group_data), 0)
 
         except Exception as e:
@@ -4784,6 +4913,8 @@ class UltraFastFullCompliantSearchSystem:
         self.indexing_results_ready = False
         # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
         self._bulk_indexing = True
+        # 🔬 性能診断カウンタをリセット
+        self._perf_reset()
         
         print(f"⚡ 最適化バルクインデックス開始: {directory}")
         
@@ -5319,6 +5450,22 @@ class UltraFastFullCompliantSearchSystem:
                 self.flush_complete_buffer()
             except Exception as flush_err:
                 print(f"⚠️ 完全層最終フラッシュエラー: {flush_err}")
+
+            # 🔬 性能診断サマリを出力
+            try:
+                summary = self._perf_summary()
+                print(summary)
+                debug_logger.info(summary)
+            except Exception:
+                pass
+
+            # 🔬 3層整合性チェック（即座層/高速層のファイルが完全層に保存されたか）
+            try:
+                verify = self._verify_layers_persisted()
+                print(verify)
+                debug_logger.info(verify)
+            except Exception:
+                pass
 
             # インデックス完了状態に設定
             self.indexing_in_progress = False
@@ -9100,6 +9247,8 @@ class UltraFastCompliantUI:
 
             # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
             self.search_system._bulk_indexing = True
+            # 🔬 性能診断カウンタをリセット
+            self.search_system._perf_reset()
 
             # UI応答性を確保するための高頻度チェック
             self._ui_update_counter = 0
@@ -9347,6 +9496,22 @@ class UltraFastCompliantUI:
                 self.search_system.flush_complete_buffer()
             except Exception as flush_err:
                 print(f"⚠️ 完全層最終フラッシュエラー: {flush_err}")
+
+            # 🔬 性能診断サマリを出力（ボトルネック特定用）
+            try:
+                summary = self.search_system._perf_summary()
+                print(summary)
+                debug_logger.info(summary)
+            except Exception:
+                pass
+
+            # 🔬 3層整合性チェック（即座層/高速層のファイルが完全層に保存されたか）
+            try:
+                verify = self.search_system._verify_layers_persisted()
+                print(verify)
+                debug_logger.info(verify)
+            except Exception:
+                pass
 
             # 処理完了
             safe_ui_update(f"完了: {total_processed:,}ファイル処理済み", force=True)

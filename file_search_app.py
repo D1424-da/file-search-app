@@ -4755,13 +4755,6 @@ class UltraFastCompliantUI:
         layer_info_frame = ttk.Frame(layer_frame)
         layer_info_frame.pack(fill=tk.X)
 
-        # クエリキャッシュ（繰り返し検索の高速化用LRU）
-        immediate_frame = ttk.Frame(layer_info_frame)
-        immediate_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        ttk.Label(immediate_frame, text="🔵 クエリキャッシュ", foreground="blue", font=("", 10, "bold")).pack()
-        self.immediate_label = ttk.Label(immediate_frame, text="0 件")
-        self.immediate_label.pack()
-
         # OCR待ち（背景でOCR中のスキャンPDF件数）
         hot_frame = ttk.Frame(layer_info_frame)
         hot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
@@ -5081,12 +5074,9 @@ class UltraFastCompliantUI:
 
             debug_logger.debug("GUI統計更新開始")
 
-            # 軽量統計（即座取得）: クエリキャッシュ件数とOCR待ち件数
-            query_cache_count = len(getattr(self.search_system, '_query_result_cache', {}))
+            # 軽量統計（即座取得）: OCR待ち件数
             with self.search_system._pending_ocr_lock:
                 pending_ocr_count = len(self.search_system._pending_ocr)
-
-            debug_logger.debug(f"統計: query_cache={query_cache_count}, pending_ocr={pending_ocr_count}")
 
             # インデックス状況の取得
             indexing_status = ""
@@ -5095,11 +5085,10 @@ class UltraFastCompliantUI:
             elif self.search_system.indexing_results_ready:
                 indexing_status = " ✅ [インデックス完了]"
 
-            # クエリキャッシュ・OCR待ちは即座に更新
-            self.immediate_label.config(text=f"{query_cache_count:,} 件")
+            # OCR待ちを即座に更新
             self.hot_label.config(text=f"{pending_ocr_count:,} 件")
 
-            debug_logger.debug("クエリキャッシュ・OCR待ちUI更新完了")
+            debug_logger.debug("OCR待ちUI更新完了")
 
             # 完全層統計はバックグラウンドで取得（8並列データベース対応）
             self._update_complete_layer_stats_async(indexing_status)
@@ -5203,9 +5192,6 @@ class UltraFastCompliantUI:
             self.complete_label.config(text=f"{complete_count:,} ファイル")
 
             # 総合統計更新
-            immediate_count = len(self.search_system.immediate_cache)
-            hot_count = len(self.search_system.hot_cache)
-            
             total_unique_files = complete_count  # 完全層が実際のユニークファイル数
             parallel_info = f" | 並列処理: {self.search_system.optimal_threads}スレッド"
             cache_search_info = ""
@@ -5228,8 +5214,7 @@ class UltraFastCompliantUI:
             self.stats_label.config(
                 text=f"総インデックス数: {total_unique_files:,} ファイル{indexing_status}{parallel_info}{cache_search_info}{incremental_info}")
 
-            debug_logger.debug(
-                f"UI統計更新完了: 即座層={immediate_count}, 高速層={hot_count}, 完全層={complete_count}")
+            debug_logger.debug(f"UI統計更新完了: 完全層(DB)={complete_count}")
 
         except Exception as e:
             logging.error(f"UI統計更新エラー: {e}")
@@ -5255,12 +5240,10 @@ class UltraFastCompliantUI:
     def _lightweight_statistics_update(self):
         """軽量統計更新（UI応答性重視版）"""
         try:
-            # クエリキャッシュ件数とOCR待ち件数のみ更新（重いDB統計は省略）
-            query_cache_count = len(getattr(self.search_system, '_query_result_cache', {}))
+            # OCR待ち件数のみ更新（重いDB統計は省略）
             with self.search_system._pending_ocr_lock:
                 pending_ocr_count = len(self.search_system._pending_ocr)
 
-            self.immediate_label.config(text=f"{query_cache_count:,} 件")
             self.hot_label.config(text=f"{pending_ocr_count:,} 件")
 
             # インデックス状況表示（軽量版）
@@ -5273,16 +5256,14 @@ class UltraFastCompliantUI:
             # 完全層(実ファイル数=緑ラベル)もバックグラウンドで更新する。
             # 従来は完全層ラベルが定期更新されず「0 ファイル」のまま動かなかった。
             self._update_complete_layer_stats_async(indexing_status)
-            
+
             # 軽量統計表示
             parallel_info = f" | 並列: {getattr(self.search_system, 'optimal_threads', 8)}スレッド"
-            cache_info = f" | キャッシュ: 即座{immediate_count}+高速{hot_count}"
-            
+            ocr_info = f" | OCR待ち: {pending_ocr_count:,}件" if pending_ocr_count else ""
+
             self.stats_label.config(
-                text=f"軽量統計{indexing_status}{parallel_info}{cache_info}")
-            
-            debug_logger.debug(f"軽量統計更新完了: 即座層={immediate_count}, 高速層={hot_count}")
-            
+                text=f"軽量統計{indexing_status}{parallel_info}{ocr_info}")
+
         except Exception as e:
             logging.error(f"軽量統計更新エラー: {e}")
             self.stats_label.config(text="軽量統計エラー")

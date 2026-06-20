@@ -176,20 +176,21 @@ class _FileContentExtractor:
     def __init__(self):
         self._encoding_cache: dict = {}
         self._ocr_cache: dict = {}
-        # 🚀 バルクモード（ProcessPool 抽出）では外側のプロセス並列だけでコアが
-        #   埋まるため、PDF内のページ並列（テキスト抽出/OCR）は 1 に落として
-        #   オーバーサブスクリプション（8プロセス×4スレッド=32 が 8コアを奪い合う）
-        #   を解消する。ライブ単一ファイル処理では従来どおり 4 並列でページを処理。
-        #   ※OCRの解像度・言語・前処理は変えないので認識精度は完全に同一。
-        self._bulk_mode: bool = False
         # 🔬 PDFのテキスト層抽出時間/OCR時間をスレッドセーフに記録する。
         #   live 経路では複数スレッドが同一 extractor を共有するため、インスタンス
         #   属性に直書きすると別ファイルの計測値と競合する。スレッドローカルに置く。
         self._tls = threading.local()
 
     def _page_workers(self) -> int:
-        """PDFページ処理（テキスト抽出/OCR）の並列スレッド数を返す。"""
-        return 1 if self._bulk_mode else 4
+        """PDFページ処理（テキスト抽出/OCR）の並列スレッド数を返す。
+
+        4 が実測で最良。実際のバルク経路（bulk_index_worker）はファイル単位で
+        既に多並列（最大14）に走るため、ここを 1 に絞ると大型スキャンPDF
+        （例: 22ページ）の各ページが逐次化して終盤に長い尻尾を作り、かえって
+        全体が遅くなることを確認済み。各PDF内も 4 ページ並列を維持して大型PDFの
+        ページOCRを並列化し、尻尾を短くする。
+        """
+        return 4
 
     def _extract_file_content(self, file_path: str) -> str:
         """ファイル内容抽出 - 全形式対応（画像OCR含む）"""
@@ -1310,9 +1311,6 @@ def _init_extraction_worker() -> None:
     import multiprocessing
     multiprocessing.current_process().name  # 確認用
     _proc_extractor = _FileContentExtractor()
-    # ProcessPool ワーカー = バルク抽出。PDFページ並列を1に落として
-    # 外側プロセス並列とのオーバーサブスクリプションを解消する（精度は不変）。
-    _proc_extractor._bulk_mode = True
 
     # 🔬 診断ログ出力先の設定（重要）
     #   抽出は spawn された子プロセスで走るため、親プロセスでの
@@ -1347,7 +1345,6 @@ def _worker_extract(file_path: str, file_size: int, modified_time: float) -> tup
     global _proc_extractor
     if _proc_extractor is None:
         _proc_extractor = _FileContentExtractor()
-        _proc_extractor._bulk_mode = True  # ProcessPool 抽出はバルク扱い
     _t0 = time.time()
     import os as _os
     _ext = Path(file_path).suffix.lower()

@@ -1301,6 +1301,12 @@ class UltraFastFullCompliantSearchSystem:
         self._index_mtime_cache: Dict[str, float] = {}
         self._index_mtime_lock = threading.Lock()
 
+        # 🚀 同一バルク実行中に同じファイルを二重処理（二重OCR）しないためのガード。
+        #   先行処理(quick start)と本処理が同じファイルを並行して処理する、あるいは
+        #   バッチ重複でUNIQUE制約エラー＋無駄なOCRが起きるのを防ぐ。実行ごとにリセット。
+        self._processed_paths: set = set()
+        self._processed_lock = threading.Lock()
+
         # 🚀 クエリ結果キャッシュ（同一検索の再実行を回避）。
         #   即座層(file_path→メタデータ)とはスキーマが異なるため別dictで管理する。
         self._query_result_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -2579,8 +2585,13 @@ class UltraFastFullCompliantSearchSystem:
                 'shard_t': 0.0, 'shard_n': 0,
                 'sem_wait_t': 0.0, 'sem_wait_n': 0,
                 'extract_by_ext': {},  # 拡張子別の抽出コスト内訳 {ext: [合計秒, 件数, 最大秒]}
+                'diff_skip_n': 0,  # 差分インデックスで未更新スキップした件数
+                'dup_skip_n': 0,   # 同一ファイルの二重処理を防いだ件数（先行処理重複等）
                 'wall_start': time.time(),
             }
+        # 同一ファイルの二重OCRを防ぐための「本処理で着手済みパス」集合もリセット
+        with self._processed_lock:
+            self._processed_paths = set()
 
     def _perf_add_ext(self, ext: str, dt: float):
         """拡張子別の抽出時間/件数を集計（ボトルネック種別の特定用）。"""
@@ -2641,7 +2652,9 @@ class UltraFastFullCompliantSearchSystem:
             f"  抽出スループット理論値: {p.get('extract_n',0)/max(1e-6,p.get('extract_t',0)):.1f} files/s (抽出のみ・並列考慮前)\n"
             + ext_lines +
             f"  PDF内訳: テキスト層={p.get('pdf_text_t',0):.1f}s / OCR={p.get('pdf_ocr_t',0):.1f}s "
-            f"（OCRが支配的ならスキャンPDFが律速）\n" +
+            f"（OCRが支配的ならスキャンPDFが律速）\n"
+            f"  スキップ: 差分(未更新)={p.get('diff_skip_n',0):,}件 / 二重処理ガード={p.get('dup_skip_n',0):,}件 "
+            f"（差分が多いほど再インデックスが速い）\n" +
             f"  完全層書込: 件数={fl_files:,} バッチ={p.get('flush_batches',0)} 合計={p.get('flush_t',0):.1f}s "
             f"平均バッチ={p.get('flush_t',0)/fl_batches*1000:.0f}ms 最大={p.get('flush_max',0)*1000:.0f}ms\n"
             f"  シャード書込: 回数={p.get('shard_n',0)} 合計={p.get('shard_t',0):.1f}s 平均={p.get('shard_t',0)/sh_n*1000:.0f}ms\n"
@@ -2781,7 +2794,19 @@ class UltraFastFullCompliantSearchSystem:
             cached_mtime = self._index_mtime_cache.get(file_path)
             if cached_mtime is not None and abs(cached_mtime - modified_time) <= 1.0:
                 debug_logger.debug(f"未更新のため差分スキップ: {file_path}")
+                self._perf_add('diff_skip', 0.0, n=1)
                 return True
+
+            # 🚀 二重処理ガード: このバルク実行で既に着手済みのパスは再抽出しない。
+            #   先行処理(quick start)と本処理が同一ファイルを並行OCRする無駄を防ぐ。
+            #   パスは一意なので「同一パス＝同一ファイル」とみなして安全にスキップできる。
+            if getattr(self, '_bulk_indexing', False):
+                with self._processed_lock:
+                    if file_path in self._processed_paths:
+                        debug_logger.debug(f"二重処理ガードでスキップ: {file_path}")
+                        self._perf_add('dup_skip', 0.0, n=1)
+                        return True
+                    self._processed_paths.add(file_path)
 
             # 🔥 大容量ファイルの早期スキップ（500MB以上）
             if file_size > 500 * 1024 * 1024:
@@ -8141,14 +8166,6 @@ class UltraFastCompliantUI:
 
             # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
             self.search_system._bulk_indexing = True
-            # 🚀 バルク時はPDFページ並列を1に落としてオーバーサブスクリプション解消。
-            #   この経路は複数スレッドが同時にファイル処理するため、各PDFがさらに
-            #   4ページ並列を張ると 8スレッド×4=32 がコアを奪い合う。外側の
-            #   ファイル並列だけでコアを埋め、内側は逐次にする（精度は不変）。
-            try:
-                self.search_system._extractor._bulk_mode = True
-            except Exception:
-                pass
             # 🔬 性能診断カウンタをリセット
             self.search_system._perf_reset()
 
@@ -8394,11 +8411,6 @@ class UltraFastCompliantUI:
             
             # 一括インデックスモード解除＋完全層バッファの最終フラッシュ（バルク書き込み）
             self.search_system._bulk_indexing = False
-            # バルク用のページ並列1モードを解除（ライブ単一処理は4並列に戻す）
-            try:
-                self.search_system._extractor._bulk_mode = False
-            except Exception:
-                pass
             try:
                 self.search_system.flush_complete_buffer()
             except Exception as flush_err:

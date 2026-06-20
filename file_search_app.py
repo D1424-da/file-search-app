@@ -8141,14 +8141,6 @@ class UltraFastCompliantUI:
 
             # 一括インデックスモード: 即座層/高速層をスキップしスループット優先
             self.search_system._bulk_indexing = True
-            # 🚀 バルク時はPDFページ並列を1に落としてオーバーサブスクリプション解消。
-            #   この経路は複数スレッドが同時にファイル処理するため、各PDFがさらに
-            #   4ページ並列を張ると 8スレッド×4=32 がコアを奪い合う。外側の
-            #   ファイル並列だけでコアを埋め、内側は逐次にする（精度は不変）。
-            try:
-                self.search_system._extractor._bulk_mode = True
-            except Exception:
-                pass
             # 🔬 性能診断カウンタをリセット
             self.search_system._perf_reset()
 
@@ -8394,11 +8386,6 @@ class UltraFastCompliantUI:
             
             # 一括インデックスモード解除＋完全層バッファの最終フラッシュ（バルク書き込み）
             self.search_system._bulk_indexing = False
-            # バルク用のページ並列1モードを解除（ライブ単一処理は4並列に戻す）
-            try:
-                self.search_system._extractor._bulk_mode = False
-            except Exception:
-                pass
             try:
                 self.search_system.flush_complete_buffer()
             except Exception as flush_err:

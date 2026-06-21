@@ -1434,9 +1434,9 @@ class _FileContentExtractor:
         return results
 
     def _extract_image_content(self, file_path: str) -> str:
-        """.tifファイルからOCRでテキスト抽出（超高速最適化版・キャッシュ強化）"""
+        """.tif/.tiffファイルからOCRでテキスト抽出（jpn+eng 1パス版）"""
         try:
-            # 🚀 キャッシュチェック（最優先）
+            # キャッシュチェック（最優先）
             if hasattr(self, '_ocr_cache'):
                 cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
                 if cache_key in self._ocr_cache:
@@ -1456,130 +1456,85 @@ class _FileContentExtractor:
             except pytesseract.TesseractNotFoundError:
                 return ""
 
-            # 🔥 超高速スキップ条件（ファイルサイズ最適化）
             file_size = os.path.getsize(file_path)
             if file_size < 1024:  # 1KB未満は処理しない
                 return ""
-            if file_size > 30 * 1024 * 1024:  # 30MB以上は処理しない（より厳格）
+            if file_size > 30 * 1024 * 1024:  # 30MB以上は処理しない
                 print(f"⚠️ .tif画像ファイルが大きすぎます ({file_path}): {file_size/1024/1024:.1f}MB")
                 return ""
-            
-            # 🚀 超高速OCR設定（速度最優先）
-            # 文字ホワイトリストは廃止: 漢字・カタカナが全て脱落して日本語OCRが
-            # 破損するため。文字網羅はTesseractの言語(jpn)に委ねる。
-            ultra_fast_config = r'--oem 1 --psm 6'
 
-            # ファイル名から言語をヒント取得（処理の最適化）
-            filename_lower = os.path.basename(file_path).lower()
-            likely_japanese = any(hint in filename_lower for hint in ['日本語', 'japanese', 'jpn', '図面', '設計'])
+            # OCR言語: jpn+eng の1パスで日英両方を認識する（PDF OCRと同方式）。
+            # jpn言語データが無い場合のみ eng へ恒久的に退避する。
+            # ファイル名からの言語推測による段階的OCRは廃止: 英語OCR結果が
+            # 3文字以上になると日本語OCRが実行されず、日本語文書のテキストが
+            # 一切取れないバグの原因だった。
+            if getattr(self, '_tif_ocr_lang', None) is None:
+                self._tif_ocr_lang = 'jpn+eng'
+
+            ocr_config = '--oem 1 --psm 6'
 
             def _ocr_one_frame(frame_image) -> str:
-                """単一フレーム（1ページ）をOCRしてテキストを返す。
+                """単一フレーム（1ページ）をOCRしてテキストを返す（マルチページTIFF対応）"""
+                # グレースケールに統一（OCR精度向上・高速化）
+                if frame_image.mode not in ('L', '1'):
+                    frame_image = frame_image.convert('L')
 
-                マルチページTIFFの各フレームに対し、モード変換・動的リサイズ・
-                （任意の）cv2前処理・段階的OCRを適用する。単一フレームTIFFでも
-                従来と同一の処理になる。
-                """
-                # 画像フォーマット・モード最適化チェック
-                if frame_image.mode not in ['L', 'RGB', 'RGBA', '1']:
-                    frame_image = frame_image.convert('RGB')
-
-                # 画像サイズチェックと超高速最適化
                 width, height = frame_image.size
                 total_pixels = width * height
 
-                # 🔥 動的解像度調整: ファイルサイズに応じて最適な画素数を選択
-                # 小さいファイル: 高解像度でOCR精度向上
-                # 大きいファイル: 低解像度で処理速度優先
-                if file_size < 2 * 1024 * 1024:  # 2MB未満
-                    max_pixels = 1500000  # 150万画素（精度優先）
-                elif file_size < 5 * 1024 * 1024:  # 5MB未満
-                    max_pixels = 1000000  # 100万画素（バランス）
-                else:  # 5MB以上
-                    max_pixels = 600000   # 60万画素（速度優先）
+                # 動的解像度調整: ファイルサイズに応じて最適な画素数を選択
+                if file_size < 2 * 1024 * 1024:
+                    max_pixels = 1500000  # 精度優先
+                elif file_size < 5 * 1024 * 1024:
+                    max_pixels = 1000000  # バランス
+                else:
+                    max_pixels = 600000   # 速度優先
 
                 if total_pixels > max_pixels:
                     scale_factor = (max_pixels / total_pixels) ** 0.5
-                    new_width = int(width * scale_factor)
-                    new_height = int(height * scale_factor)
-                    # 高速リサイズアルゴリズム使用
+                    new_width = max(1, int(width * scale_factor))
+                    new_height = max(1, int(height * scale_factor))
                     frame_image = frame_image.resize((new_width, new_height), Image.Resampling.BILINEAR)
                     total_pixels = new_width * new_height
                     debug_logger.debug(f"動的リサイズ ({os.path.basename(file_path)}): {width}x{height} -> {new_width}x{new_height}")
 
-                # 小さすぎる画像はスキップ
                 if total_pixels < 10000:  # 100x100未満はスキップ
                     return ""
 
-                # 🔥 適応型前処理: 画像特性に応じて最適な前処理を選択
-                processed_image = frame_image
-
-                # 前処理が必要な条件: カラー画像かつ中規模サイズ
-                needs_preprocessing = (frame_image.mode != 'L' and
-                                      total_pixels < 500000 and
-                                      file_size > 500 * 1024)  # 500KB以上
-
-                if CV2_AVAILABLE and needs_preprocessing:
+                # cv2が利用可能なら適応的二値化でOCR精度を上げる
+                if CV2_AVAILABLE:
                     try:
                         import numpy as np
-                        image_array = np.array(frame_image)
-
-                        # グレースケール変換（最も効果的な前処理）
-                        if len(image_array.shape) == 3:
-                            gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-
-                            # 小さいファイルのみ二値化を追加（OCR精度向上）
-                            if file_size < 2 * 1024 * 1024:
-                                # 適応的二値化: 照明ムラに強い
-                                gray = cv2.adaptiveThreshold(
-                                    gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 11, 2)
-
-                            processed_image = Image.fromarray(gray)
+                        arr = np.array(frame_image)
+                        if len(arr.shape) == 2:  # グレースケール確認
+                            arr = cv2.adaptiveThreshold(
+                                arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                cv2.THRESH_BINARY, 11, 2)
+                            frame_image = Image.fromarray(arr)
                     except Exception:
-                        processed_image = frame_image
+                        pass
 
-                # 🚀 超高速OCR実行（段階的最適化 + 言語検出）
-                frame_text = ""
-
-                # Phase 1: 超高速英数字のみ（最も高速）
                 try:
-                    if not likely_japanese:  # 日本語の可能性が低い場合のみ
-                        # 文字ホワイトリストは廃止（漢字・カタカナ脱落の原因）。
-                        fast_config = r'--oem 1 --psm 6'
-                        frame_text = pytesseract.image_to_string(processed_image, lang='eng', config=fast_config).strip()
-
-                    # Phase 2: 結果が不十分な場合のみ通常英語OCR
-                    if len(frame_text) < 5:
-                        frame_text = pytesseract.image_to_string(processed_image, lang='eng', config='--oem 1 --psm 6').strip()
-
-                    # Phase 3: 最後の手段として日本語（処理時間が増加）
-                    # 小さいファイルまたは日本語の可能性が高い場合のみ試行
-                    if (len(frame_text) < 3 and file_size < 5 * 1024 * 1024) or likely_japanese:
-                        try:
-                            jp_text = pytesseract.image_to_string(processed_image, lang='jpn', config='--oem 1 --psm 6').strip()
-                            if len(jp_text) > len(frame_text):
-                                frame_text = jp_text
-                        except pytesseract.TesseractError:
-                            pass
-
-                except pytesseract.TesseractError as te:
+                    text = pytesseract.image_to_string(
+                        frame_image, lang=self._tif_ocr_lang, config=ocr_config).strip()
+                except pytesseract.TesseractError:
+                    # jpn言語データが無い等の場合は eng のみへ恒久的に退避
+                    self._tif_ocr_lang = 'eng'
                     try:
-                        # 最終フォールバック：最小設定
-                        frame_text = pytesseract.image_to_string(processed_image, config='--psm 6').strip()
-                    except pytesseract.TesseractError:
-                        print(f"⚠️ OCR実行完全失敗 ({os.path.basename(file_path)}): {te}")
+                        text = pytesseract.image_to_string(
+                            frame_image, lang='eng', config=ocr_config).strip()
+                    except pytesseract.TesseractError as te:
+                        print(f"⚠️ OCR実行失敗 ({os.path.basename(file_path)}): {te}")
                         return ""
 
-                return frame_text.strip()
+                return text
 
-            # 🚀 超高速画像読み込み・検証（マルチページTIFF対応: 全フレームをOCR）
+            # マルチページTIFF対応: 全フレームをOCRして連結
             from PIL import ImageSequence
             try:
                 page_texts: list[str] = []
                 for frame in ImageSequence.Iterator(Image.open(file_path)):
-                    # 各フレーム（ページ）を個別にOCRし、改行で連結する
-                    frame_text = _ocr_one_frame(frame)
+                    frame_text = _ocr_one_frame(frame.copy())
                     if frame_text:
                         page_texts.append(frame_text)
                 text = '\n'.join(page_texts)
@@ -1587,39 +1542,31 @@ class _FileContentExtractor:
                 print(f"⚠️ 画像読み込みエラー ({file_path}): {e}")
                 return ""
 
-            # 🔥 結果検証と最適化
             text = text.strip()
-            
+
             # 無意味な結果をフィルタリング
-            if len(text) < 2:
-                result = ""
-            elif len(set(text.replace(' ', '').replace('\n', ''))) < 3:  # 文字種類が少なすぎる
+            if len(text) < 2 or len(set(text.replace(' ', '').replace('\n', ''))) < 3:
                 result = ""
             else:
-                # テキスト正規化（高速版）
-                text = ' '.join(text.split())  # 余分な空白を削除
-                result = text[:5000]  # 最大5000文字に制限
-            
-            # 🚀 キャッシュに保存（成功・失敗を問わず）
+                result = normalize_extracted_text(text, max_length=50000)
+
+            # キャッシュに保存
             cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
             self._ocr_cache[cache_key] = result
-            
+
             # キャッシュサイズ制限
             if len(self._ocr_cache) > 1000:
-                # 古いエントリを削除（LRU的）
                 oldest_keys = list(self._ocr_cache.keys())[:100]
                 for key in oldest_keys:
                     del self._ocr_cache[key]
-            
-            # 結果表示（成功時のみ）
+
             if result and len(result) > 10:
-                print(f"✅ 超高速OCR成功 ({os.path.basename(file_path)}): {len(result)}文字")
-            
+                print(f"✅ OCR成功 ({os.path.basename(file_path)}): {len(result)}文字")
+
             return result
-            
+
         except Exception as e:
-            print(f"⚠️ 超高速OCR処理エラー {os.path.basename(file_path)}: {e}")
-            # エラーもキャッシュして再試行を防ぐ
+            print(f"⚠️ OCR処理エラー {os.path.basename(file_path)}: {e}")
             if hasattr(self, '_ocr_cache'):
                 cache_key = f"{file_path}_{os.path.getmtime(file_path)}"
                 self._ocr_cache[cache_key] = ""

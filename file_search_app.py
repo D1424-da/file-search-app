@@ -2067,12 +2067,17 @@ class UltraFastFullCompliantSearchSystem:
             return ""
 
     def _make_preview_snippet(self, content_head: str, query: str,
-                              before: int = 40, after: int = 150) -> str:
+                              before: int = 8, after: int = 180) -> str:
         """検索結果プレビューを「一致キーワード中心＋前後の文」のスニペットにする。
 
         一致語は 【】 で囲んで目立たせる。旧実装は本文先頭200字を出すだけで一致語を
         含まないことが多く「なぜヒットしたか分からない」状態だった。一致が先頭
         （取得済みの content_head 範囲）に無い場合は従来どおり先頭を返す。
+
+        before(一致語の前文脈)は小さくする。プレビュー列は幅が狭く先頭の十数文字
+        しか見えないため、before が大きいと一致語が列からはみ出して「前文脈だけ」が
+        表示され、肝心の一致語(例:【中森】)が見えない。before を短くして一致語を
+        列の先頭付近に出し、後続文脈(after)を長めに取る。
         """
         if not content_head:
             return ""
@@ -2101,7 +2106,7 @@ class UltraFastFullCompliantSearchSystem:
         end = min(len(text), pos + len(matched) + after)
         snippet = text[start:end]
         try:
-            snippet = re.sub('(' + re.escape(matched) + ')', r'【\1】',
+            snippet = re.sub('(' + re.escape(matched) + ')', r'▶\1◀',
                              snippet, count=1, flags=re.IGNORECASE)
         except Exception:
             pass
@@ -5638,31 +5643,27 @@ class UltraFastCompliantUI:
             debug_logger.debug(f"プレビュー更新エラー: {e}")
 
     def _highlight_preview_matches(self, query: str):
-        """プレビューText内の一致キーワード（元クエリ＋検索パターン）を 'kw' タグで強調。"""
+        """プレビューText内の一致キーワードを 'kw' タグで強調。
+
+        元クエリの完全一致のみをハイライトする（部分一致パターンは対象外）。
+        検索ヒット理由の可視化が目的なので、ユーザーが入力した語が本文中で
+        どこに出てくるかを正確に示せれば十分。
+        """
         if not query:
             return
         tw = self.preview_text
         tw.tag_remove('kw', '1.0', tk.END)
-        terms = [query]
-        try:
-            _, _, _, patterns = self.search_system._get_search_patterns(query)
-            terms += [p for p in patterns if p and p.strip()]
-        except Exception:
-            pass
-        seen = set()
-        for term in terms:
-            t = term.strip()
-            if not t or t.lower() in seen:
-                continue
-            seen.add(t.lower())
-            start = '1.0'
-            while True:
-                pos = tw.search(t, start, tk.END, nocase=True)
-                if not pos:
-                    break
-                end = f"{pos}+{len(t)}c"
-                tw.tag_add('kw', pos, end)
-                start = end
+        term = query.strip()
+        if not term:
+            return
+        start = '1.0'
+        while True:
+            pos = tw.search(term, start, tk.END, nocase=True)
+            if not pos:
+                break
+            end = f"{pos}+{len(term)}c"
+            tw.tag_add('kw', pos, end)
+            start = end
 
     def _get_file_type_tag(self, file_ext: str) -> str:
         """ファイル拡張子に基づいてタグを決定"""

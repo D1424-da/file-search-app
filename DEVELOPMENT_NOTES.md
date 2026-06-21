@@ -74,16 +74,37 @@ print(repr(ext._extract_image_content(r"C:\path\to\problem.tif")))
 
 ---
 
-## 2. ✅ 実装済み: 手動更新ボタン（🔄 手動更新）
+## 2. ✅ 実装済み: 自動監視（増分インデックス）＋手動更新
 
-- インデックス後に追加/更新されたファイルを手動で差分インデックスする機能。
-- UI: インデックス制御行に「🔄 手動更新」ボタンを追加（`setup_ui`）。
-- 仕組み: `start_bulk_indexing` で `self.last_index_path` を記憶し、
-  `manual_update_index()` が同じパスを `bulk_index_worker` で再スキャン。
-- `bulk_index_worker` 内の差分判定（`_index_mtime_cache`）により、
-  **未更新ファイルは再抽出されずスキップ**される（高速）。
+### 自動監視（ポーリング方式・外部依存なし）
+- かつて `start_incremental_scanning()` は**未定義**で、UIは `hasattr` ガード越しに
+  呼ぶだけの no-op だった（README/ステータスの「自動監視」は虚偽表示だった）。
+  → 実体を `UltraFastFullCompliantSearchSystem` に実装した。
+- 仕組み: `start_incremental_scanning()` が daemon スレッドを起動し、
+  `incremental_scan_interval`(既定10秒)ごとに `_incremental_scan_loop` →
+  `_scan_watched_roots_once(roots)` を回す。各ルートを `os.walk` し、
+  `TARGET_EXTENSIONS` のファイルのみ、差分キャッシュ `_index_mtime_cache` と
+  mtime 比較して**新規/更新だけ** `live_progressive_index_file()` で索引する。
+- 監視対象 `watched_roots` は `start_bulk_indexing` 時に `add_watched_root()` で登録し、
+  `data_storage/watched_roots.json` に永続化（**アプリ再起動後も監視継続**）。
+- 一括インデックス実行中(`indexing_in_progress`/`_bulk_indexing`)は監視を休む。
+- 起動時に `_load_index_mtime_cache()` を一度実行し、初回スキャンで全ファイルを
+  「新規」と誤判定して再インデックスするのを防ぐ。
+- 停止は `stop_incremental_scanning()`（`shutdown()` から呼ぶ）。
+- watchdog 等は**未使用**（依存を増やさないためポーリング採用）。大規模ドライブで
+  重い場合は `incremental_scan_interval` を延ばす、または将来 watchdog 化を検討。
+
+### 手動更新ボタン（🔄 手動更新）
+- 自動監視を待たず即座に差分を取り込む手段。`manual_update_index()` が
+  `last_index_path` を `bulk_index_worker` で再スキャン（差分スキップ込み）。
 - ⚠️ 上記課題1の検証では、この差分スキップのせいで「修正したのに変わらない」
   と誤認しやすい。検証時はファイルのmtime更新かDB再構築を行うこと。
+
+### コードレビュー指摘の修正（このセッションで対応済み）
+- UIバグ#1/#2: UI復元は `bulk_index_worker` の finally を**単一責任点**に統一。
+  手動更新成功後にボタン文言が「🔄 更新中...」のまま固まる/二重復元する問題を解消。
+- 一貫性#3: TIFF OCRの言語キャッシュを PDF OCR と共有(`_ocr_lang`)。別環境事実を
+  二重に持たないようにし、jpn欠如検知を双方で引き継ぐ。
 
 ---
 
@@ -97,10 +118,13 @@ print(repr(ext._extract_image_content(r"C:\path\to\problem.tif")))
   - `IMAGE_OCR_EXTENSIONS = {'.tif', '.tiff'}` / `TARGET_EXTENSIONS`
 - `file_search_app.py`
   - `setup_tesseract_path()` … Tesseractパス解決
-  - `bulk_index_worker()` … 一括インデックス本体
+  - `bulk_index_worker()` … 一括インデックス本体（UI復元の単一責任点=finally）
   - `_pending_ocr` / `_ocr_bg_*` … 遅延・背景OCRの制御
-  - `manual_update_index()` / `_on_manual_update_done()` … 手動更新
-  - `last_index_path` … 手動更新の対象パス
+  - `start_incremental_scanning()` / `_incremental_scan_loop()` /
+    `_scan_watched_roots_once()` … 自動監視（増分インデックス）
+  - `add_watched_root()` / `_load_watched_roots()` / `_save_watched_roots()` /
+    `watched_roots` / `watched_roots.json` … 監視対象の管理・永続化
+  - `manual_update_index()` … 手動更新（`last_index_path` を再スキャン）
 
 ---
 

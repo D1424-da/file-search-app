@@ -1464,12 +1464,15 @@ class _FileContentExtractor:
                 return ""
 
             # OCR言語: jpn+eng の1パスで日英両方を認識する（PDF OCRと同方式）。
-            # jpn言語データが無い場合のみ eng へ恒久的に退避する。
+            # 言語キャッシュは PDF OCR(_ocr_pdf_pages)と共有する(_ocr_lang)。
+            #   jpn言語データの有無は環境共通の事実なので、PDF/TIFFで別々に
+            #   持つ意味がない。PDF側で jpn 欠如を検知して eng へ退避済みなら、
+            #   TIFF側も同じ判断を引き継ぐ（二重の失敗を避ける）。
             # ファイル名からの言語推測による段階的OCRは廃止: 英語OCR結果が
             # 3文字以上になると日本語OCRが実行されず、日本語文書のテキストが
             # 一切取れないバグの原因だった。
-            if getattr(self, '_tif_ocr_lang', None) is None:
-                self._tif_ocr_lang = 'jpn+eng'
+            if getattr(self, '_ocr_lang', None) is None:
+                self._ocr_lang = 'jpn+eng'
 
             ocr_config = '--oem 1 --psm 6'
 
@@ -1531,10 +1534,11 @@ class _FileContentExtractor:
 
                 try:
                     text = pytesseract.image_to_string(
-                        frame_image, lang=self._tif_ocr_lang, config=ocr_config).strip()
+                        frame_image, lang=self._ocr_lang, config=ocr_config).strip()
                 except pytesseract.TesseractError:
                     # jpn言語データが無い等の場合は eng のみへ恒久的に退避
-                    self._tif_ocr_lang = 'eng'
+                    # （PDF OCRと共有する _ocr_lang を更新）。
+                    self._ocr_lang = 'eng'
                     try:
                         text = pytesseract.image_to_string(
                             frame_image, lang='eng', config=ocr_config).strip()

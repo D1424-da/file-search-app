@@ -1317,6 +1317,20 @@ class UltraFastFullCompliantSearchSystem:
         self.incremental_indexing_enabled = True
         self.last_full_scan_time = 0
         self.indexed_files_registry = {}  # {file_path: last_modified_time}
+
+        # 📡 増分監視（自動インデックス）用の状態。
+        #   インデックス済みのルート(フォルダ/ドライブ)を記憶し、バックグラウンドで
+        #   定期的に再スキャンして「新規・更新ファイル」だけを自動でインデックスへ
+        #   追加する。watchdog 等の外部依存は増やさず、既存の差分キャッシュ
+        #   (_index_mtime_cache) を使ったポーリング方式とする（未更新は mtime 比較で
+        #   即スキップするため軽量）。watched_roots はアプリ再起動後も監視を継続できる
+        #   よう data_storage に永続化する。
+        self.watched_roots: set = set()
+        self._watched_roots_lock = threading.Lock()
+        self._watched_roots_file = self.project_root / "data_storage" / "watched_roots.json"
+        self._incremental_thread = None
+        self._incremental_stop = threading.Event()
+        self._load_watched_roots()
         # 🚀 差分インデックス用キャッシュ: {file_path: modified_time}
         # 既にインデックス済みで未更新のファイルを再抽出せずスキップし、再インデックスを高速化する
         self._index_mtime_cache: Dict[str, float] = {}
@@ -2646,6 +2660,142 @@ class UltraFastFullCompliantSearchSystem:
         with self._index_mtime_lock:
             self._index_mtime_cache = cache
         print(f"🗂️ 差分インデックス: 既存 {len(cache):,} 件の更新時刻を読み込み（未更新はスキップ）")
+
+    # === 📡 増分監視（自動インデックス）===
+    def _load_watched_roots(self):
+        """監視対象ルートを data_storage から読み込む（再起動後も監視継続）。"""
+        try:
+            if self._watched_roots_file.exists():
+                with open(self._watched_roots_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                roots = data.get('roots', []) if isinstance(data, dict) else []
+                with self._watched_roots_lock:
+                    self.watched_roots = {os.path.normpath(r) for r in roots if r}
+                if self.watched_roots:
+                    print(f"📡 増分監視対象を {len(self.watched_roots)} 件読み込み")
+        except Exception as e:
+            debug_logger.warning(f"監視対象ルート読み込みエラー: {e}")
+
+    def _save_watched_roots(self):
+        """監視対象ルートを data_storage へ保存する。"""
+        try:
+            self._watched_roots_file.parent.mkdir(parents=True, exist_ok=True)
+            with self._watched_roots_lock:
+                roots = sorted(self.watched_roots)
+            with open(self._watched_roots_file, 'w', encoding='utf-8') as f:
+                json.dump({'roots': roots}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            debug_logger.warning(f"監視対象ルート保存エラー: {e}")
+
+    def add_watched_root(self, path: str):
+        """インデックスしたルートを監視対象に登録する（重複は無視）。"""
+        if not path:
+            return
+        p = os.path.normpath(path)
+        with self._watched_roots_lock:
+            if p in self.watched_roots:
+                return
+            self.watched_roots.add(p)
+        self._save_watched_roots()
+        print(f"📡 増分監視に登録: {p}")
+
+    def start_incremental_scanning(self):
+        """増分監視スレッドを開始する（多重起動防止）。
+
+        一定間隔(incremental_scan_interval)で監視対象ルートを再スキャンし、
+        新規・更新ファイルだけを自動でインデックスへ追加する。
+        """
+        if not self.incremental_indexing_enabled:
+            return
+        if self._incremental_thread is not None and self._incremental_thread.is_alive():
+            return
+        # 既存インデックスの更新時刻をロードしておく（未ロードだと初回スキャンで
+        #   全ファイルを「新規」とみなして再インデックスしてしまうため）。
+        try:
+            if not self._index_mtime_cache:
+                self._load_index_mtime_cache()
+        except Exception as e:
+            debug_logger.warning(f"増分監視: mtimeキャッシュ事前ロード失敗: {e}")
+        self._incremental_stop.clear()
+        self._incremental_thread = threading.Thread(
+            target=self._incremental_scan_loop, daemon=True)
+        self._incremental_thread.start()
+        print(f"📡 増分監視を開始（{self.incremental_scan_interval}秒間隔・自動インデックス）")
+
+    def stop_incremental_scanning(self):
+        """増分監視スレッドを停止する。"""
+        self._incremental_stop.set()
+        t = self._incremental_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3.0)
+
+    def _incremental_scan_loop(self):
+        """増分監視のメインループ（バックグラウンドスレッド）。"""
+        # 起動直後は初期処理と競合しないよう、最初の間隔ぶん待ってから始める。
+        while not self._incremental_stop.wait(self.incremental_scan_interval):
+            try:
+                if getattr(self, 'shutdown_requested', False):
+                    break
+                # 一括インデックス実行中は監視を休む（CPU/IOの奪い合いを避ける）。
+                if getattr(self, 'indexing_in_progress', False) or getattr(self, '_bulk_indexing', False):
+                    continue
+                with self._watched_roots_lock:
+                    roots = list(self.watched_roots)
+                if not roots:
+                    continue
+                self._scan_watched_roots_once(roots)
+            except Exception as e:
+                debug_logger.warning(f"増分監視スキャンエラー: {e}")
+
+    def _scan_watched_roots_once(self, roots):
+        """監視対象ルートを1回走査し、新規・更新ファイルをインデックスする。"""
+        target_extensions = TARGET_EXTENSIONS
+        new_or_changed = []
+        for root in roots:
+            if self._incremental_stop.is_set():
+                return
+            if not os.path.isdir(root):
+                continue  # 取り外されたドライブ・削除フォルダはスキップ
+            for dirpath, dirnames, filenames in os.walk(root):
+                if path_has_skip_component(dirpath):
+                    dirnames[:] = []
+                    continue
+                for fn in filenames:
+                    if is_temp_or_lock_file(fn):
+                        continue
+                    if Path(fn).suffix.lower() not in target_extensions:
+                        continue
+                    fp = os.path.join(dirpath, fn)
+                    try:
+                        mtime = os.path.getmtime(fp)
+                    except OSError:
+                        continue
+                    cached = self._index_mtime_cache.get(fp)
+                    if cached is not None and abs(cached - mtime) <= 1.0:
+                        continue  # 既にインデックス済みで未更新
+                    new_or_changed.append(fp)
+
+        if not new_or_changed:
+            return
+
+        print(f"📡 増分監視: 新規/更新 {len(new_or_changed)} 件を検出、自動インデックス開始")
+        indexed = 0
+        for fp in new_or_changed:
+            if self._incremental_stop.is_set():
+                break
+            # 監視中に一括インデックスが始まったら譲る
+            if getattr(self, 'indexing_in_progress', False) or getattr(self, '_bulk_indexing', False):
+                break
+            try:
+                if self.live_progressive_index_file(fp):
+                    indexed += 1
+            except Exception as e:
+                debug_logger.warning(f"増分監視インデックスエラー {fp}: {e}")
+
+        if indexed:
+            self.stats["incremental_updates"] = self.stats.get("incremental_updates", 0) + 1
+            self.stats["files_added_incrementally"] = self.stats.get("files_added_incrementally", 0) + indexed
+            print(f"📡 増分監視: {indexed} ファイルを自動インデックスに追加しました")
 
     def live_progressive_index_file(self, file_path: str) -> bool:
         """ライブプログレッシブファイルインデックス（デバッグログ強化）"""
@@ -4338,7 +4488,13 @@ class UltraFastFullCompliantSearchSystem:
             
             # シャットダウンフラグを設定
             self.shutdown_requested = True
-            
+
+            # 📡 増分監視スレッドを停止
+            try:
+                self.stop_incremental_scanning()
+            except Exception as e:
+                debug_logger.warning(f"増分監視停止エラー: {e}")
+
             # アクティブなExecutorを停止
             for executor in self._active_executors:
                 try:
@@ -4863,6 +5019,16 @@ class UltraFastCompliantUI:
             pass
         self.on_target_type_changed()
 
+        # 前回までに監視登録されたルートがあれば、手動更新ボタンを起動時から有効化する
+        #   （再起動後も手動更新できるように）。対象は監視ルートのいずれか1つ。
+        try:
+            existing_roots = sorted(getattr(self.search_system, 'watched_roots', set()))
+            if existing_roots and not self.last_index_path:
+                self.last_index_path = existing_roots[0]
+                self.manual_update_btn.config(state="normal")
+        except Exception:
+            pass
+
         # 検索フレーム
         search_frame = ttk.LabelFrame(main_frame, text="🔍 超高速ライブ検索", padding=10)
         search_frame.pack(fill=tk.X, pady=(0, 10))
@@ -5372,10 +5538,13 @@ class UltraFastCompliantUI:
             if hasattr(self.search_system, 'incremental_indexing_enabled') and self.search_system.incremental_indexing_enabled:
                 incremental_updates = self.search_system.stats.get('incremental_updates', 0)
                 files_added = self.search_system.stats.get('files_added_incrementally', 0)
-                if incremental_updates > 0:
-                    incremental_info = f" | 増分更新: {incremental_updates}回 ({files_added}ファイル)"
+                watched_n = len(getattr(self.search_system, 'watched_roots', set()))
+                if files_added > 0:
+                    incremental_info = f" | 自動監視: {watched_n}対象 / 追加{files_added}ファイル"
+                elif watched_n > 0:
+                    incremental_info = f" | 自動監視: {watched_n}対象 監視中"
                 else:
-                    incremental_info = " | 増分監視: 有効"
+                    incremental_info = " | 自動監視: 対象なし（インデックス後に有効）"
             
             if self.search_system.indexing_in_progress:
                 cache_search_info = " | 検索: DB（インデックス中も反映）"
@@ -7604,6 +7773,12 @@ class UltraFastCompliantUI:
         # 最後にインデックスしたパスを記憶（手動更新ボタン用）
         self.last_index_path = target_path
 
+        # 📡 増分監視に登録（以後この配下の新規・更新ファイルを自動インデックス）
+        try:
+            self.search_system.add_watched_root(target_path)
+        except Exception as e:
+            print(f"⚠️ 増分監視登録エラー: {e}")
+
         # インデックス即座開始（準備時間最小化）
         self.bulk_indexing_active = True
         self.indexing_cancelled = False  # キャンセルフラグリセット
@@ -7698,24 +7873,16 @@ class UltraFastCompliantUI:
         print(f"🔄 手動更新開始: {target_path}")
 
         def update_worker():
+            # UI復元は bulk_index_worker の finally が単一責任で行う（ボタン状態・
+            #   文言・bulk_indexing_active を含む）。ここでは二重復元しない。
             try:
                 self.bulk_index_worker(target_path, target_name)
             except Exception as e:
                 print(f"❌ 手動更新エラー: {e}")
                 self.root.after(0, lambda: messagebox.showerror("エラー", f"手動更新エラー: {e}"))
-                self.bulk_indexing_active = False
-                self.root.after(0, self._on_manual_update_done)
 
         self.current_indexing_thread = threading.Thread(target=update_worker, daemon=True)
         self.current_indexing_thread.start()
-
-    def _on_manual_update_done(self):
-        """手動更新完了後のUI復元"""
-        self.bulk_index_btn.config(state="normal")
-        self.cancel_index_btn.config(state="disabled")
-        self.manual_update_btn.config(state="normal", text="🔄 手動更新")
-        self.bulk_progress_var.set("✅ 手動更新完了")
-        print("✅ 手動更新完了")
 
     def _start_immediate_indexing(self, file_list: List[str]):
         """即座インデックス処理（背景で並列実行）"""
@@ -8272,14 +8439,16 @@ class UltraFastCompliantUI:
             # 進捗ウィンドウを閉じる
             self.root.after(0, lambda: self.progress_window.destroy() if self.progress_window and self.progress_window.winfo_exists() else None)
             
-            # UI復元（確実に実行）
+            # UI復元（確実に実行）。bulk_index_worker は通常インデックスと手動更新の
+            #   両方から呼ばれるため、ここがUI復元の単一の責任点になる。手動更新で
+            #   変更したボタン文言("🔄 更新中...")も必ず元に戻す。
             self.bulk_indexing_active = False
             self.indexing_cancelled = False  # キャンセルフラグリセット
             self.root.after(0, lambda: self.bulk_index_btn.config(state="normal", text="🚀 インデックス開始"))
             self.root.after(0, lambda: self.cancel_index_btn.config(state="disabled"))  # キャンセルボタン無効化
-            # インデックス済みパスがあれば手動更新ボタンを有効化
+            # インデックス済みパスがあれば手動更新ボタンを有効化（文言も復帰）
             if self.last_index_path:
-                self.root.after(0, lambda: self.manual_update_btn.config(state="normal"))
+                self.root.after(0, lambda: self.manual_update_btn.config(state="normal", text="🔄 手動更新"))
             print("🔧 リアルタイム進捗インデックス処理完了、UI復元完了")
 
     def on_closing(self):

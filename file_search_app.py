@@ -1400,6 +1400,11 @@ class UltraFastFullCompliantSearchSystem:
         self._pending_ocr: "set[str]" = set()
         self._pending_ocr_lock = threading.Lock()
         self._ocr_bg_thread = None
+        # 背景OCRの停止フラグ。新しいインデックスを開始する際、前回実行で起動した
+        #   背景OCR(Tesseract)がまだ走っていると本体処理とCPUを奪い合い、本体
+        #   スループットが半減する。新インデックス開始時にこれをセットして走行中の
+        #   背景OCRを速やかに止め、本体に全CPUを使わせる。
+        self._ocr_bg_cancel = threading.Event()
 
         self.initialize_database()
         
@@ -2971,6 +2976,8 @@ class UltraFastFullCompliantSearchSystem:
 
         def _ocr_one(path: str):
             try:
+                if self._ocr_bg_cancel.is_set():
+                    return None
                 if cancel_check and cancel_check():
                     return None
                 if not os.path.exists(path):
@@ -2997,7 +3004,7 @@ class UltraFastFullCompliantSearchSystem:
                             progress_cb(done, total)
                         except Exception:
                             pass
-                    if cancel_check and cancel_check():
+                    if self._ocr_bg_cancel.is_set() or (cancel_check and cancel_check()):
                         break
         finally:
             ext.bulk_mode, ext.defer_ocr = prev_bulk, prev_defer
@@ -7722,6 +7729,24 @@ class UltraFastCompliantUI:
             start_time = time.time()  # 処理時間計測開始
             print(f"⚡ 即座インデックス開始: {target_name}")
 
+            # 🚀 前回実行の背景OCRが走行中なら停止してから始める。
+            #   背景OCR(Tesseract)は重く、本体処理と同時に走ると互いにCPUを奪い合って
+            #   本体スループットが半減する。新インデックスでは保留キューを積み直すため、
+            #   ここで古い背景OCRを止めて本体に全CPUを使わせる。
+            ocr_carryover: "set[str]" = set()
+            prev_ocr = getattr(self.search_system, '_ocr_bg_thread', None)
+            if prev_ocr is not None and prev_ocr.is_alive():
+                print("⏹️ 前回の背景OCRを停止して本体に専念します")
+                self.search_system._ocr_bg_cancel.set()
+                prev_ocr.join(timeout=30)
+                # 途中停止で未OCRのまま残ったファイル（ファイル名のみ索引済み）は
+                #   差分スキップで本体から再投入されない。引き継いで今回の本体完了後の
+                #   背景OCRで確実に本文化する。
+                with self.search_system._pending_ocr_lock:
+                    ocr_carryover = set(self.search_system._pending_ocr)
+            # 本体実行中は背景OCRを動かさないのでフラグはクリアしておく
+            self.search_system._ocr_bg_cancel.clear()
+
             # 🚀 差分インデックス: 既存DBの更新時刻を読み込み、未更新ファイルをスキップする
             try:
                 self.search_system._load_index_mtime_cache()
@@ -7737,9 +7762,11 @@ class UltraFastCompliantUI:
                 self.search_system._extractor.defer_ocr = True
             except Exception:
                 pass
-            # 前回の保留分が残っていてもこの実行で積み直すためクリア
+            # 前回の保留分はクリアしつつ、停止した背景OCRの未処理分だけは引き継ぐ
+            #   （差分スキップで本体から再投入されないため取りこぼし防止）。
             with self.search_system._pending_ocr_lock:
                 self.search_system._pending_ocr.clear()
+                self.search_system._pending_ocr.update(ocr_carryover)
             # 🔬 性能診断カウンタをリセット
             self.search_system._perf_reset()
 

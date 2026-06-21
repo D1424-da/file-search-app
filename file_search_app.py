@@ -2067,12 +2067,17 @@ class UltraFastFullCompliantSearchSystem:
             return ""
 
     def _make_preview_snippet(self, content_head: str, query: str,
-                              before: int = 40, after: int = 150) -> str:
+                              before: int = 8, after: int = 180) -> str:
         """検索結果プレビューを「一致キーワード中心＋前後の文」のスニペットにする。
 
         一致語は 【】 で囲んで目立たせる。旧実装は本文先頭200字を出すだけで一致語を
         含まないことが多く「なぜヒットしたか分からない」状態だった。一致が先頭
         （取得済みの content_head 範囲）に無い場合は従来どおり先頭を返す。
+
+        before(一致語の前文脈)は小さくする。プレビュー列は幅が狭く先頭の十数文字
+        しか見えないため、before が大きいと一致語が列からはみ出して「前文脈だけ」が
+        表示され、肝心の一致語(例:【中森】)が見えない。before を短くして一致語を
+        列の先頭付近に出し、後続文脈(after)を長めに取る。
         """
         if not content_head:
             return ""

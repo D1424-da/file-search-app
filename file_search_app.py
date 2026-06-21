@@ -2106,7 +2106,7 @@ class UltraFastFullCompliantSearchSystem:
         end = min(len(text), pos + len(matched) + after)
         snippet = text[start:end]
         try:
-            snippet = re.sub('(' + re.escape(matched) + ')', r'【\1】',
+            snippet = re.sub('(' + re.escape(matched) + ')', r'▶\1◀',
                              snippet, count=1, flags=re.IGNORECASE)
         except Exception:
             pass
@@ -5643,31 +5643,27 @@ class UltraFastCompliantUI:
             debug_logger.debug(f"プレビュー更新エラー: {e}")
 
     def _highlight_preview_matches(self, query: str):
-        """プレビューText内の一致キーワード（元クエリ＋検索パターン）を 'kw' タグで強調。"""
+        """プレビューText内の一致キーワードを 'kw' タグで強調。
+
+        元クエリの完全一致のみをハイライトする（部分一致パターンは対象外）。
+        検索ヒット理由の可視化が目的なので、ユーザーが入力した語が本文中で
+        どこに出てくるかを正確に示せれば十分。
+        """
         if not query:
             return
         tw = self.preview_text
         tw.tag_remove('kw', '1.0', tk.END)
-        terms = [query]
-        try:
-            _, _, _, patterns = self.search_system._get_search_patterns(query)
-            terms += [p for p in patterns if p and p.strip()]
-        except Exception:
-            pass
-        seen = set()
-        for term in terms:
-            t = term.strip()
-            if not t or t.lower() in seen:
-                continue
-            seen.add(t.lower())
-            start = '1.0'
-            while True:
-                pos = tw.search(t, start, tk.END, nocase=True)
-                if not pos:
-                    break
-                end = f"{pos}+{len(t)}c"
-                tw.tag_add('kw', pos, end)
-                start = end
+        term = query.strip()
+        if not term:
+            return
+        start = '1.0'
+        while True:
+            pos = tw.search(term, start, tk.END, nocase=True)
+            if not pos:
+                break
+            end = f"{pos}+{len(term)}c"
+            tw.tag_add('kw', pos, end)
+            start = end
 
     def _get_file_type_tag(self, file_ext: str) -> str:
         """ファイル拡張子に基づいてタグを決定"""

@@ -1475,38 +1475,53 @@ class _FileContentExtractor:
 
             def _ocr_one_frame(frame_image) -> str:
                 """単一フレーム（1ページ）をOCRしてテキストを返す（マルチページTIFF対応）"""
-                # グレースケールに統一（OCR精度向上・高速化）
-                if frame_image.mode not in ('L', '1'):
+                # 元が白黒2値(mode "1")かどうかを記録（既に二値化済みなので
+                # 後段の適応的二値化を省ける）。FAX/スキャン文書の多くはこの形式。
+                was_bilevel = frame_image.mode == '1'
+
+                # OCR前に必ずグレースケール(L)へ統一する。
+                #   mode "1" のままだと
+                #     1) Image.resize の BILINEAR が効かず最近傍縮小になり、
+                #        2866x2026 のような文書スキャンを縮小すると日本語の
+                #        細い線が潰れてOCR不能になる
+                #     2) np.array(mode="1") がブール配列になり cv2.adaptiveThreshold
+                #        が uint8 を要求して失敗する
+                #   ため、L へ変換してから処理する。
+                if frame_image.mode != 'L':
                     frame_image = frame_image.convert('L')
 
                 width, height = frame_image.size
                 total_pixels = width * height
 
-                # 動的解像度調整: ファイルサイズに応じて最適な画素数を選択
+                # 動的解像度調整: 文書スキャン(例: A4 300dpi ≒ 8.7MP)は高解像度を
+                # 保たないと日本語OCRが破綻するため、上限を大きく取る。極端に巨大な
+                # 画像のみ縮小して速度を確保する。
                 if file_size < 2 * 1024 * 1024:
-                    max_pixels = 1500000  # 精度優先
+                    max_pixels = 4000000  # 精度優先
                 elif file_size < 5 * 1024 * 1024:
-                    max_pixels = 1000000  # バランス
+                    max_pixels = 3000000  # バランス
                 else:
-                    max_pixels = 600000   # 速度優先
+                    max_pixels = 2000000  # 速度優先
 
                 if total_pixels > max_pixels:
                     scale_factor = (max_pixels / total_pixels) ** 0.5
                     new_width = max(1, int(width * scale_factor))
                     new_height = max(1, int(height * scale_factor))
-                    frame_image = frame_image.resize((new_width, new_height), Image.Resampling.BILINEAR)
+                    frame_image = frame_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
                     total_pixels = new_width * new_height
                     debug_logger.debug(f"動的リサイズ ({os.path.basename(file_path)}): {width}x{height} -> {new_width}x{new_height}")
 
                 if total_pixels < 10000:  # 100x100未満はスキップ
                     return ""
 
-                # cv2が利用可能なら適応的二値化でOCR精度を上げる
-                if CV2_AVAILABLE:
+                # cv2が利用可能なら適応的二値化でOCR精度を上げる。
+                # 元が白黒2値(was_bilevel)の画像は既にクリーンな二値画像なので、
+                # ここで再二値化するとかえってノイズを増やすため適用しない。
+                if CV2_AVAILABLE and not was_bilevel:
                     try:
                         import numpy as np
                         arr = np.array(frame_image)
-                        if len(arr.shape) == 2:  # グレースケール確認
+                        if arr.dtype == np.uint8 and arr.ndim == 2:  # グレースケール(uint8)確認
                             arr = cv2.adaptiveThreshold(
                                 arr, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                 cv2.THRESH_BINARY, 11, 2)

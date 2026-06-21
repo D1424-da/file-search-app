@@ -4738,6 +4738,7 @@ class UltraFastCompliantUI:
         self.drive_info = {}
         self.bulk_indexing_active = False
         self.selected_folder_path = None
+        self.last_index_path = None  # 最後にインデックスしたパス（手動更新用）
 
         # 進捗トラッキング
         self.progress_tracker = ProgressTracker()
@@ -4839,10 +4840,15 @@ class UltraFastCompliantUI:
         self.bulk_index_btn.pack(side=tk.LEFT, padx=(0, 5))
         
         # インデックス キャンセルボタン
-        self.cancel_index_btn = ttk.Button(control_row, text="❌ キャンセル", 
+        self.cancel_index_btn = ttk.Button(control_row, text="❌ キャンセル",
                                           command=self.cancel_indexing, width=12, state="disabled")
         self.cancel_index_btn.pack(side=tk.LEFT, padx=(0, 10))
-        
+
+        # 手動更新ボタン（インデックス後に追加されたファイルを手動でインデックスに追加）
+        self.manual_update_btn = ttk.Button(control_row, text="🔄 手動更新",
+                                            command=self.manual_update_index, width=12, state="disabled")
+        self.manual_update_btn.pack(side=tk.LEFT, padx=(0, 10))
+
         # 進捗表示
         self.bulk_progress_var = tk.StringVar(value="待機中...")
         ttk.Label(control_row, textvariable=self.bulk_progress_var, font=("", 9)).pack(side=tk.LEFT)
@@ -7595,6 +7601,9 @@ class UltraFastCompliantUI:
         if not messagebox.askyesno("インデックス開始", message, default="yes"):
             return
         
+        # 最後にインデックスしたパスを記憶（手動更新ボタン用）
+        self.last_index_path = target_path
+
         # インデックス即座開始（準備時間最小化）
         self.bulk_indexing_active = True
         self.indexing_cancelled = False  # キャンセルフラグリセット
@@ -7645,6 +7654,8 @@ class UltraFastCompliantUI:
             self.bulk_indexing_active = False
             self.bulk_index_btn.config(state="normal", text="🚀 インデックス開始")
             self.cancel_index_btn.config(state="disabled")
+            if self.last_index_path:
+                self.manual_update_btn.config(state="normal")
             self.bulk_progress_var.set("キャンセルしました")
             
             # プログレスウィンドウを閉じる
@@ -7660,6 +7671,52 @@ class UltraFastCompliantUI:
             print(f"❌ キャンセル処理エラー: {e}")
             messagebox.showerror("エラー", f"キャンセル処理エラー: {e}")
     
+    def manual_update_index(self):
+        """手動更新: 最後にインデックスしたフォルダ/ドライブを差分スキャンして新規・更新ファイルを追加"""
+        if self.bulk_indexing_active:
+            messagebox.showwarning("警告", "既にインデックス処理が実行中です")
+            return
+
+        target_path = self.last_index_path
+        if not target_path:
+            messagebox.showwarning("手動更新", "インデックスをまだ実行していません。\n先にインデックスを実行してください。")
+            return
+
+        target_name = Path(target_path).name or target_path
+        if not messagebox.askyesno("手動更新確認",
+                                   f"「{target_name}」を差分スキャンして\n新しく追加・更新されたファイルをインデックスに追加しますか？",
+                                   default="yes"):
+            return
+
+        self.bulk_indexing_active = True
+        self.indexing_cancelled = False
+        self.bulk_index_btn.config(state="disabled")
+        self.cancel_index_btn.config(state="normal")
+        self.manual_update_btn.config(state="disabled", text="🔄 更新中...")
+        self.bulk_progress_var.set("🔄 差分スキャン中...")
+
+        print(f"🔄 手動更新開始: {target_path}")
+
+        def update_worker():
+            try:
+                self.bulk_index_worker(target_path, target_name)
+            except Exception as e:
+                print(f"❌ 手動更新エラー: {e}")
+                self.root.after(0, lambda: messagebox.showerror("エラー", f"手動更新エラー: {e}"))
+                self.bulk_indexing_active = False
+                self.root.after(0, self._on_manual_update_done)
+
+        self.current_indexing_thread = threading.Thread(target=update_worker, daemon=True)
+        self.current_indexing_thread.start()
+
+    def _on_manual_update_done(self):
+        """手動更新完了後のUI復元"""
+        self.bulk_index_btn.config(state="normal")
+        self.cancel_index_btn.config(state="disabled")
+        self.manual_update_btn.config(state="normal", text="🔄 手動更新")
+        self.bulk_progress_var.set("✅ 手動更新完了")
+        print("✅ 手動更新完了")
+
     def _start_immediate_indexing(self, file_list: List[str]):
         """即座インデックス処理（背景で並列実行）"""
         def immediate_worker():
@@ -8220,6 +8277,9 @@ class UltraFastCompliantUI:
             self.indexing_cancelled = False  # キャンセルフラグリセット
             self.root.after(0, lambda: self.bulk_index_btn.config(state="normal", text="🚀 インデックス開始"))
             self.root.after(0, lambda: self.cancel_index_btn.config(state="disabled"))  # キャンセルボタン無効化
+            # インデックス済みパスがあれば手動更新ボタンを有効化
+            if self.last_index_path:
+                self.root.after(0, lambda: self.manual_update_btn.config(state="normal"))
             print("🔧 リアルタイム進捗インデックス処理完了、UI復元完了")
 
     def on_closing(self):

@@ -1,3 +1,4 @@
+# --- 本文抽出・検索に必須 ---
 chardet==5.2.0
 docx2txt==0.9
 et_xmlfile==2.0.0
@@ -14,3 +15,13 @@ pytesseract==0.3.13
 python-docx==1.2.0
 typing_extensions==4.15.0
 xlrd==2.0.2
+
+# --- OCR前処理（任意・未導入でも動作する） ---
+# opencv/numpy はカラー画像の二値化など OCR 前処理に使用する。
+# 未インストールでも extraction.py は CV2_AVAILABLE=False で素通りするため、
+# OCR自体は Pillow + Tesseract で動作する。精度向上のために推奨。
+numpy==2.1.3
+opencv-python==4.10.0.84
+
+# 注意: 別途 Tesseract 本体 + 日本語データ(jpn) のインストールが必要。
+#   https://github.com/UB-Mannheim/tesseract/wiki （Japanese を選択）

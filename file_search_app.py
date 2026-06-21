@@ -2703,7 +2703,22 @@ class UltraFastFullCompliantSearchSystem:
             if file_size > 500 * 1024 * 1024:
                 debug_logger.warning(f"超大容量ファイルをスキップ: {file_path} ({file_size/(1024*1024):.1f}MB)")
                 return False
-            
+
+            # 🚀 一括インデックス中(defer_ocr=True)のTIFF早期処理:
+            #   TIFFはTesseract OCRが必須で1枚数秒〜数十秒かかる。defer_ocr=True の間は
+            #   _extract_file_content を呼ぶとTLSを通じてフラグを立てて return "" するだけだが、
+            #   その呼び出しコスト自体とスレッド間TLS競合を避けるため、ここで直接
+            #   ファイル名のみ索引して _pending_ocr に積み、本文はバックグラウンドOCRで埋める。
+            if (file_path_obj.suffix.lower() in IMAGE_OCR_EXTENSIONS
+                    and getattr(self, '_extractor', None)
+                    and getattr(self._extractor, 'defer_ocr', False)):
+                with self._pending_ocr_lock:
+                    self._pending_ocr.add(file_path)
+                content = file_path_obj.name
+                if content:
+                    self._store_indexed_content(file_path, content, file_size, modified_time)
+                return True
+
             # 🚀 3MB以上のファイルはファイル名のみインデックス（超高速処理）
             #   ただしOCR対象(スキャンPDF/TIFF)は多くが数MB超のため、ここで
             #   ファイル名のみに切り詰めると本文検索から永久に除外されてしまう。

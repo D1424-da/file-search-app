@@ -54,10 +54,19 @@ dist\ファイル検索アプリ.exe
 
 ## 注意事項
 
+### extraction.py の同梱について
+本文抽出ロジックは `extraction.py` に分離されており、`file_search_app.py` から
+import される。PyInstaller は import を自動追跡するため通常は spec の変更は不要だが、
+ProcessPool ワーカーが別プロセスで `extraction._worker_extract` を呼ぶ構成のため、
+ビルド後に **OCR/抽出が動かない場合は `extraction` が hiddenimports に含まれているか**
+を確認すること（`file_search_app.spec` の `hiddenimports` に `'extraction'` を追加）。
+
 ### OCR機能について
 OCR機能を使用する場合、Tesseract-OCRを別途インストールする必要があります:
 - ダウンロード: https://github.com/UB-Mannheim/tesseract/wiki
+- インストール時に **日本語データ(Japanese / jpn)** を必ず選択する
 - インストール後、パスを設定ファイルで指定
+- OCRは `jpn+eng` の1パスで実行されるため、jpn データが無いと日本語が抽出されない
 
 ### ウイルス対策ソフトの警告
 初回実行時にウイルス対策ソフトから警告が出る場合があります。これは、
